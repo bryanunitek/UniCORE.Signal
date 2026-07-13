@@ -25,13 +25,13 @@ The full CC BY 4.0 licence text is available at [https://creativecommons.org/lic
 
 ## Dual-licence note
 
-This repository contains an **upstream open-source codebase** licensed under AGPL-3.0 (see [`LICENSE.upstream.md`](LICENSE.upstream.md)). The upstream codebase retains its original licence. UniCORE code additions carry the same copyleft licence; UniCORE documentation additions sit under CC BY 4.0.
+This repository contains an **upstream open-source codebase** licensed under AGPL-3.0 (see [`LICENSE.upstream.md`](https://git.unitek-systems.com/UniCORE/UniCORE.Signal/src/branch/main/LICENSE.upstream.md) (mirror: [GitHub](https://github.com/bryanunitek/UniCORE.Signal/blob/main/LICENSE.upstream.md))). The upstream codebase retains its original licence. UniCORE code additions carry the same copyleft licence; UniCORE documentation additions sit under CC BY 4.0.
 
-- **Upstream files** carry the upstream copyright header and are governed by [`LICENSE.upstream.md`](LICENSE.upstream.md).
+- **Upstream files** carry the upstream copyright header and are governed by [`LICENSE.upstream.md`](https://git.unitek-systems.com/UniCORE/UniCORE.Signal/src/branch/main/LICENSE.upstream.md) (mirror: [GitHub](https://github.com/bryanunitek/UniCORE.Signal/blob/main/LICENSE.upstream.md)).
 - **UniCORE-authored code files** carry a `Copyright (c) Bryan Fred, Unitek Systems Limited` header and are governed by AGPL-3.0 (this file).
 - **UniCORE-authored documentation files** carry a `Copyright (c) Bryan Fred, Unitek Systems Limited` header and are governed by CC BY 4.0 (this file).
 
-For the operational discipline that maintains this boundary across upstream merges, see [`UPSTREAM-MERGE-DISCIPLINE.md`](UPSTREAM-MERGE-DISCIPLINE.md).
+For the operational discipline that maintains this boundary across upstream merges, see [`UPSTREAM-MERGE-DISCIPLINE.md`](https://git.unitek-systems.com/UniCORE/UniCORE.Signal/src/branch/main/UPSTREAM-MERGE-DISCIPLINE.md) (mirror: [GitHub](https://github.com/bryanunitek/UniCORE.Signal/blob/main/UPSTREAM-MERGE-DISCIPLINE.md)).
 
 ---
 
