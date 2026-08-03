@@ -9,7 +9,6 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -54,9 +53,8 @@ class ReportMessageManagerTest {
     reporterUuid = UUID.randomUUID();
 
     sourceAccount = mock(Account.class);
-    when(sourceAccount.getUuid()).thenReturn(sourceAci);
-    when(sourceAccount.getNumber()).thenReturn(sourceNumber);
-    when(sourceAccount.getPhoneNumberIdentifier()).thenReturn(sourcePni);
+    when(sourceAccount.getAccountIdentifier()).thenReturn(sourceAci);
+    when(sourceAccount.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(sourcePni));
   }
 
   @Test
@@ -82,16 +80,16 @@ class ReportMessageManagerTest {
 
     when(reportMessageDynamoDb.remove(any())).thenReturn(false);
     reportMessageManager.report(Optional.of(sourceNumber), Optional.of(sourceAci), Optional.of(sourcePni), messageGuid,
-        reporterUuid, Optional.empty(), "user-agent");
+        reporterUuid, Optional.empty(), "user-agent", false);
 
     assertEquals(0, reportMessageManager.getRecentReportCount(sourceAccount));
 
     when(reportMessageDynamoDb.remove(any())).thenReturn(true);
     reportMessageManager.report(Optional.of(sourceNumber), Optional.of(sourceAci), Optional.of(sourcePni), messageGuid,
-        reporterUuid, Optional.empty(), "user-agent");
+        reporterUuid, Optional.empty(), "user-agent", false);
 
     assertEquals(1, reportMessageManager.getRecentReportCount(sourceAccount));
-    verify(listener).handleMessageReported(sourceNumber, messageGuid, reporterUuid, Optional.empty());
+    verify(listener).handleMessageReported(Optional.of(sourceNumber), messageGuid, reporterUuid, Optional.empty(), false);
   }
 
   @Test
@@ -101,7 +99,7 @@ class ReportMessageManagerTest {
 
     for (int i = 0; i < 100; i++) {
       reportMessageManager.report(Optional.of(sourceNumber), Optional.of(sourceAci), Optional.of(sourcePni),
-          messageGuid, UUID.randomUUID(), Optional.empty(), "user-agent");
+          messageGuid, UUID.randomUUID(), Optional.empty(), "user-agent", false);
     }
 
     assertTrue(reportMessageManager.getRecentReportCount(sourceAccount) > 10);
@@ -115,7 +113,7 @@ class ReportMessageManagerTest {
     for (int i = 0; i < 100; i++) {
       reportMessageManager.report(Optional.of(sourceNumber), Optional.of(sourceAci), Optional.of(sourcePni),
           messageGuid,
-          reporterUuid, Optional.empty(), "user-agent");
+          reporterUuid, Optional.empty(), "user-agent", false);
     }
 
     assertEquals(1, reportMessageManager.getRecentReportCount(sourceAccount));
@@ -128,11 +126,11 @@ class ReportMessageManagerTest {
 
     for (int i = 0; i < 100; i++) {
       reportMessageManager.report(Optional.empty(), Optional.of(sourceAci), Optional.of(sourcePni),
-          messageGuid, UUID.randomUUID(), Optional.empty(), "user-agent");
+          messageGuid, UUID.randomUUID(), Optional.empty(), "user-agent", false);
     }
 
     reportMessageManager.report(Optional.empty(), Optional.of(sourceAci), Optional.empty(),
-        messageGuid, UUID.randomUUID(), Optional.empty(), "user-agent");
+        messageGuid, UUID.randomUUID(), Optional.empty(), "user-agent", false);
 
     final int recentReportCount = reportMessageManager.getRecentReportCount(sourceAccount);
     assertTrue(recentReportCount > 10);

@@ -24,6 +24,7 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -52,9 +53,11 @@ public class Account {
   private UUID uuid;
 
   @JsonProperty("pni")
+  @Nullable
   private UUID phoneNumberIdentifier;
 
   @JsonProperty
+  @Nullable
   private String number;
 
   @JsonProperty
@@ -88,6 +91,7 @@ public class Account {
   @JsonProperty("pniIdentityKey")
   @JsonSerialize(using = IdentityKeyAdapter.Serializer.class)
   @JsonDeserialize(using = IdentityKeyAdapter.Deserializer.class)
+  @Nullable
   private IdentityKey phoneNumberIdentityKey;
 
   @JsonProperty("cpv")
@@ -148,37 +152,72 @@ public class Account {
 
   public record BackupVoucher(@JsonProperty("rl") long receiptLevel, @JsonProperty("e") Instant expiration) {}
 
+  /// Returns an identifier for the given identity type for this account with the assumption that all accounts have
+  /// identifiers for all identity types.
+  ///
+  /// @param identityType the identity type for which to retrieve an account identifier
+  ///
+  /// @return the identifier for the given identity type
+  ///
+  /// @throws NoSuchElementException if the account does not have an identifier for the given identity type
+  ///
+  /// @deprecated Different identity types have significantly differing presence and staleness requirements/guarantees
+  /// for their respective account identifiers. Please use [#getAccountIdentifier()] or
+  /// [#getPhoneNumberIdentifierOptional()] instead.
+  @Deprecated
   public UUID getIdentifier(final IdentityType identityType) {
     return switch (identityType) {
-      case ACI -> getUuid();
+      case ACI -> getAccountIdentifier();
       case PNI -> getPhoneNumberIdentifier();
     };
   }
 
-  public UUID getUuid() {
+  /// Returns the core account identifier (ACI) for this account. An account's core identifier never changes.
+  ///
+  /// @return the core account identifier for this account
+  public UUID getAccountIdentifier() {
     // this is the one method that may be called on a stale account
     return uuid;
   }
 
-  public void setUuid(final UUID uuid) {
+  public void setAccountIdentifier(final UUID accountIdentifier) {
     requireNotStale();
 
-    this.uuid = uuid;
+    this.uuid = accountIdentifier;
   }
 
+  /// Returns the phone number identifier for this account.
+  ///
+  /// @throws NoSuchElementException if this account does not have a phone number identifier
+  ///
+  /// @return the phone number identifier for this account
+  ///
+  /// @deprecated Please use [#getPhoneNumberIdentifierOptional()] (which has clearer presence semantics) instead.
+  @Deprecated
   public UUID getPhoneNumberIdentifier() {
     requireNotStale();
+
+    if (phoneNumberIdentifier == null) {
+      throw new NoSuchElementException();
+    }
 
     return phoneNumberIdentifier;
   }
 
-  /**
-   * Tests whether this account's account identifier or phone number identifier (depending on the given service
-   * identifier's identity type) matches the given service identifier.
-   *
-   * @param serviceIdentifier the identifier to test
-   * @return {@code true} if this account's identifier or phone number identifier matches
-   */
+  /// Returns the phone number identifier for this account or empty if this account does not have a phone number.
+  ///
+  /// @return the phone number identifier for this account or empty if this account does not have a phone number
+  public Optional<UUID> getPhoneNumberIdentifierOptional() {
+    requireNotStale();
+
+    return Optional.ofNullable(phoneNumberIdentifier);
+  }
+
+  /// Tests whether this account's account identifier or phone number identifier (depending on the given service
+  /// identifier's identity type) matches the given service identifier.
+  ///
+  /// @param serviceIdentifier the identifier to test
+  /// @return `true` if this account's identifier or phone number identifier matches
   public boolean isIdentifiedBy(final ServiceIdentifier serviceIdentifier) {
     return switch (serviceIdentifier.identityType()) {
       case ACI -> serviceIdentifier.uuid().equals(uuid);
@@ -186,10 +225,29 @@ public class Account {
     };
   }
 
+  /// Returns the E.164-formatted phone number for this account.
+  ///
+  /// @return the E.164-formatted phone number for this account
+  ///
+  /// @throws NoSuchElementException if this account does not have a phone number
+  @Deprecated
   public String getNumber() {
     requireNotStale();
 
+    if (number == null) {
+      throw new NoSuchElementException();
+    }
+
     return number;
+  }
+
+  /// Returns the phone number for this account or empty if this account does not have a phone number.
+  ///
+  /// @return the phone number for this account or empty if this account does not have a phone number
+  public Optional<String> getNumberOptional() {
+    requireNotStale();
+
+    return Optional.ofNullable(number);
   }
 
   public void setNumber(final String number, final UUID phoneNumberIdentifier) {
@@ -320,16 +378,51 @@ public class Account {
     this.identityKey = identityKey;
   }
 
+  /// Returns an identity key for the given identity type for this account with the assumption that all accounts have
+  /// identity keys for all identity types.
+  ///
+  /// @param identityType the identity type for which to retrieve an identity key
+  ///
+  /// @return the identity key for the given identity type
+  ///
+  /// @throws NoSuchElementException if the account does not have an identifier (and therefore identity key) for the given identity type
+  ///
+  /// @deprecated Different identity types have significantly differing existence requirements/guarantees
+  /// for their respective identity keys. Please use [#getAccountIdentityKey()] or
+  /// [#getPhoneNumberIdentityKey()] instead.
+  @Deprecated
   public IdentityKey getIdentityKey(final IdentityType identityType) {
     requireNotStale();
 
     return switch (identityType) {
       case ACI -> identityKey;
-      case PNI -> phoneNumberIdentityKey;
+      case PNI -> Optional.ofNullable(phoneNumberIdentityKey).orElseThrow(NoSuchElementException::new);
     };
   }
 
+  /// Returns an identity key for the ACI identity for this account.
+  public IdentityKey getAccountIdentityKey() {
+    requireNotStale();
+    return identityKey;
+  }
+
+  /// Returns an identity key for the phone-number identity for this account, if it has such an identity.
+  ///
+  /// @return the identity key for the PNI identity for the account if it has one, or an empty `Optional` otherwise.
+  public Optional<IdentityKey> getPhoneNumberIdentityKey() {
+    requireNotStale();
+    return Optional.ofNullable(phoneNumberIdentityKey);
+  }
+
+  /// Sets the identity key for the phone-number identity of this account.
+  ///
+  /// @throws IllegalStateException if the account does not have a phone number identifier.
   public void setPhoneNumberIdentityKey(final IdentityKey phoneNumberIdentityKey) {
+    requireNotStale();
+
+    if (this.phoneNumberIdentifier == null) {
+      throw new IllegalStateException();
+    }
     this.phoneNumberIdentityKey = phoneNumberIdentityKey;
   }
 
@@ -438,6 +531,10 @@ public class Account {
   public void setRegistrationLock(final String registrationLock, final String registrationLockSalt) {
     requireNotStale();
 
+    if (number == null) {
+      throw new IllegalArgumentException("Cannot set registration lock on account with no phone number");
+    }
+
     this.registrationLock     = registrationLock;
     this.registrationLockSalt = registrationLockSalt;
   }
@@ -474,10 +571,17 @@ public class Account {
     this.unrestrictedUnidentifiedAccess = unrestrictedUnidentifiedAccess;
   }
 
+  /// Indicates whether this account may be discovered by its phone number via the contact discovery system (CDS).
+  ///
+  /// @return `true` if this account has a phone number and has opted into discovery by phone number or `false`
+  /// otherwise
+  ///
+  /// @see #getPhoneNumberIdentifierOptional()
+  /// @see #setDiscoverableByPhoneNumber(boolean)
   public boolean isDiscoverableByPhoneNumber() {
     requireNotStale();
 
-    return this.discoverableByPhoneNumber;
+    return getPhoneNumberIdentifierOptional().isPresent() && this.discoverableByPhoneNumber;
   }
 
   public void setDiscoverableByPhoneNumber(final boolean discoverableByPhoneNumber) {
@@ -528,26 +632,22 @@ public class Account {
     this.backupVoucher = backupVoucher;
   }
 
-  /**
-   * Have all this account's devices been manually locked?
-   *
-   * @see Device#hasLockedCredentials
-   *
-   * @return true if all the account's devices were locked, false otherwise.
-   */
+  /// Have all this account's devices been manually locked?
+  ///
+  /// @see Device#hasLockedCredentials
+  ///
+  /// @return true if all the account's devices were locked, false otherwise.
   public boolean hasLockedCredentials() {
     return devices.stream().allMatch(Device::hasLockedCredentials);
   }
 
-  /**
-   * Lock account by invalidating authentication tokens.
-   *
-   * We only want to do this in cases where there is a potential conflict between the
-   * phone number holder and the registration lock holder. In that case, locking the
-   * account will ensure that either the registration lock holder proves ownership
-   * of the phone number, or after 7 days the phone number holder can register a new
-   * account.
-   */
+  /// Lock account by invalidating authentication tokens.
+  ///
+  /// We only want to do this in cases where there is a potential conflict between the
+  /// phone number holder and the registration lock holder. In that case, locking the
+  /// account will ensure that either the registration lock holder proves ownership
+  /// of the phone number, or after 7 days the phone number holder can register a new
+  /// account.
   public void lockAuthTokenHash() {
     devices.forEach(Device::lockAuthTokenHash);
   }

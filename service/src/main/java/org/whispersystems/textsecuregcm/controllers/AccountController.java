@@ -166,8 +166,12 @@ public class AccountController {
   public void setRegistrationLock(@Auth AuthenticatedDevice auth, @NotNull @Valid RegistrationLock accountLock) {
     final SaltedTokenHash credentials = SaltedTokenHash.generateFor(accountLock.registrationLock());
 
-    accounts.update(auth.accountIdentifier(),
-        a -> a.setRegistrationLock(credentials.hash(), credentials.salt()));
+    try {
+      accounts.update(auth.accountIdentifier(),
+          a -> a.setRegistrationLock(credentials.hash(), credentials.salt()));
+    } catch (IllegalArgumentException _) {
+      throw new BadRequestException();
+    }
   }
 
   @DELETE
@@ -389,7 +393,7 @@ public class AccountController {
       throw new WebApplicationException(Response.status(422).build());
     }
 
-    return accounts.getByUsernameHash(hash).thenApply(maybeAccount -> maybeAccount.map(Account::getUuid)
+    return accounts.getByUsernameHash(hash).thenApply(maybeAccount -> maybeAccount.map(Account::getAccountIdentifier)
         .map(AciServiceIdentifier::new)
         .map(AccountIdentifierResponse::new)
         .orElseThrow(() -> new WebApplicationException(Status.NOT_FOUND)));

@@ -16,7 +16,6 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -62,7 +61,6 @@ import org.signal.chat.account.StaleDevices;
 import org.signal.chat.account.UsernameNotAvailable;
 import org.signal.chat.common.AccountIdentifiers;
 import org.signal.chat.errors.FailedPrecondition;
-import org.signal.chat.errors.NotFound;
 import org.signal.chat.messages.SendMessageType;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.protocol.InvalidKeyException;
@@ -73,7 +71,6 @@ import org.whispersystems.textsecuregcm.auth.InvalidRegistrationSessionException
 import org.whispersystems.textsecuregcm.auth.RecoveryPasswordVerificationFailedException;
 import org.whispersystems.textsecuregcm.auth.RegistrationLockFailureException;
 import org.whispersystems.textsecuregcm.auth.SaltedTokenHash;
-import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
 import org.whispersystems.textsecuregcm.auth.UnverifiedRegistrationSessionException;
 import org.whispersystems.textsecuregcm.auth.grpc.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.grpc.AuthenticationUtil;
@@ -174,10 +171,14 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
     final SaltedTokenHash credentials =
         SaltedTokenHash.generateFor(formatRegistrationLock(request.getRegistrationLock().toByteArray()));
 
-    accountsManager.update(AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier(),
-        account -> account.setRegistrationLock(credentials.hash(), credentials.salt()));
+    try {
+      accountsManager.update(AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier(),
+          account -> account.setRegistrationLock(credentials.hash(), credentials.salt()));
 
-    return SetRegistrationLockResponse.getDefaultInstance();
+      return SetRegistrationLockResponse.getDefaultInstance();
+    } catch (IllegalArgumentException _) {
+      throw GrpcExceptions.invalidArguments(null);
+    }
   }
 
   @Override
@@ -488,7 +489,7 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
     final AccountDataReportResponse report = new AccountDataReportResponse(UUID.randomUUID(), clock.instant(),
         new AccountDataReportResponse.AccountAndDevicesDataReport(
             new AccountDataReportResponse.AccountDataReport(
-                account.getNumber(),
+                account.getNumberOptional(),
                 account.getBadges().stream().map(AccountDataReportResponse.BadgeDataReport::new).toList(),
                 account.isUnrestrictedUnidentifiedAccess(),
                 account.isDiscoverableByPhoneNumber()),
@@ -519,9 +520,13 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
 
   private static AccountIdentifiers buildAccountIdentifiers(final Account account) {
     final AccountIdentifiers.Builder accountIdentifiersBuilder = AccountIdentifiers.newBuilder()
-        .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(account.getUuid())))
-        .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new PniServiceIdentifier(account.getPhoneNumberIdentifier())))
-        .setE164(account.getNumber());
+        .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(account.getAccountIdentifier())));
+
+    account.getPhoneNumberIdentifierOptional()
+        .map(phoneNumberIdentifier -> GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new PniServiceIdentifier(phoneNumberIdentifier)))
+        .ifPresent(accountIdentifiersBuilder::addServiceIdentifiers);
+
+    account.getNumberOptional().ifPresent(accountIdentifiersBuilder::setE164);
 
     account.getUsernameHash().ifPresent(usernameHash ->
         accountIdentifiersBuilder.setUsernameHash(ByteString.copyFrom(usernameHash)));

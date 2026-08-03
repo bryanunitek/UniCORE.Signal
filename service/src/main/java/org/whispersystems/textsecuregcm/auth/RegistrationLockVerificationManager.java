@@ -86,6 +86,9 @@ public class RegistrationLockVerificationManager {
       final PhoneVerificationRequest.VerificationType phoneVerificationType
   ) throws RateLimitExceededException, RegistrationLockFailureException {
 
+    final String phoneNumber = account.getNumberOptional()
+        .orElseThrow(() -> new IllegalArgumentException("account does not have a phone number"));
+
     final Tags expiredTags = Tags.of(UserAgentTagUtil.getPlatformTag(userAgent),
         Tag.of(REGISTRATION_LOCK_VERIFICATION_FLOW_TAG_NAME, flow.name()),
         Tag.of(PHONE_VERIFICATION_TYPE_TAG_NAME, phoneVerificationType.name())
@@ -106,10 +109,9 @@ public class RegistrationLockVerificationManager {
     }
 
     if (StringUtils.isNotEmpty(clientRegistrationLock)) {
-      rateLimiters.getPinLimiter().validate(account.getNumber());
+      rateLimiters.getPinLimiter().validate(phoneNumber);
     }
 
-    final String phoneNumber = account.getNumber();
     final boolean registrationLockMatches = existingRegistrationLock.verify(clientRegistrationLock);
     final boolean alreadyLocked = account.hasLockedCredentials();
 
@@ -154,7 +156,7 @@ public class RegistrationLockVerificationManager {
       }
 
       final List<Byte> deviceIds = updatedAccount.getDevices().stream().map(Device::getId).toList();
-      disconnectionRequestManager.requestDisconnection(updatedAccount.getUuid(), deviceIds);
+      disconnectionRequestManager.requestDisconnection(updatedAccount.getAccountIdentifier(), deviceIds);
 
       try {
         // Send a push notification that prompts the client to attempt login and fail due to locked credentials
@@ -176,7 +178,7 @@ public class RegistrationLockVerificationManager {
     if (!existingRegistrationLock.needsFailureCredentials()) {
       return null;
     }
-    return svr2CredentialGenerator.generateForUuid(account.getUuid());
+    return svr2CredentialGenerator.generateForUuid(account.getAccountIdentifier());
   }
 
 }

@@ -185,7 +185,7 @@ class AccountControllerTest {
     when(senderPinAccount.getRegistrationLock()).thenReturn(
         new StoredRegistrationLock(Optional.empty(), Optional.empty(), Instant.ofEpochMilli(System.currentTimeMillis())));
 
-    when(senderHasStorage.getUuid()).thenReturn(UUID.randomUUID());
+    when(senderHasStorage.getAccountIdentifier()).thenReturn(UUID.randomUUID());
     when(senderHasStorage.hasCapability(DeviceCapability.STORAGE)).thenReturn(true);
     when(senderHasStorage.getRegistrationLock()).thenReturn(
         new StoredRegistrationLock(Optional.empty(), Optional.empty(), Instant.ofEpochMilli(System.currentTimeMillis())));
@@ -194,12 +194,12 @@ class AccountControllerTest {
         new StoredRegistrationLock(Optional.of(registrationLockCredentials.hash()),
             Optional.of(registrationLockCredentials.salt()), Instant.ofEpochMilli(System.currentTimeMillis())));
     when(senderRegLockAccount.getLastSeen()).thenReturn(System.currentTimeMillis());
-    when(senderRegLockAccount.getUuid()).thenReturn(SENDER_REG_LOCK_UUID);
+    when(senderRegLockAccount.getAccountIdentifier()).thenReturn(SENDER_REG_LOCK_UUID);
     when(senderRegLockAccount.getNumber()).thenReturn(SENDER_REG_LOCK);
 
     when(senderTransfer.getRegistrationLock()).thenReturn(
         new StoredRegistrationLock(Optional.empty(), Optional.empty(), Instant.ofEpochMilli(System.currentTimeMillis())));
-    when(senderTransfer.getUuid()).thenReturn(SENDER_TRANSFER_UUID);
+    when(senderTransfer.getAccountIdentifier()).thenReturn(SENDER_TRANSFER_UUID);
     when(senderTransfer.getNumber()).thenReturn(SENDER_TRANSFER);
 
     when(accountsManager.getByE164(eq(SENDER_PIN))).thenReturn(Optional.of(senderPinAccount));
@@ -214,6 +214,7 @@ class AccountControllerTest {
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT));
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID_TWO)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT_TWO));
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID_3)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT_3));
+    when(accountsManager.getByAccountIdentifier(AuthHelper.NUMBERLESS_UUID)).thenReturn(Optional.of(AuthHelper.NUMBERLESS_ACCOUNT));
     when(accountsManager.getByAccountIdentifier(AuthHelper.UNDISCOVERABLE_UUID)).thenReturn(Optional.of(AuthHelper.UNDISCOVERABLE_ACCOUNT));
 
     doAnswer(invocation -> {
@@ -265,6 +266,19 @@ class AccountControllerTest {
       assertThat(pinSaltCapture.getValue()).isNotEmpty();
 
       assertThat(pinCapture.getValue().length()).isEqualTo(66);
+    }
+  }
+
+  @Test
+  void testSetRegistrationLockAccountHasNoNumber() {
+    doThrow(new IllegalArgumentException()).when(AuthHelper.NUMBERLESS_ACCOUNT).setRegistrationLock(any(), any());
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/registration_lock/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.NUMBERLESS_UUID, AuthHelper.NUMBERLESS_PASSWORD))
+        .put(Entity.json(new RegistrationLock("1234567890123456789012345678901234567890123456789012345678901234")))) {
+
+      assertThat(response.getStatus()).isEqualTo(400);
     }
   }
 
@@ -975,7 +989,7 @@ class AccountControllerTest {
   void testLookupUsername() {
     final Account account = mock(Account.class);
     final UUID uuid = UUID.randomUUID();
-    when(account.getUuid()).thenReturn(uuid);
+    when(account.getAccountIdentifier()).thenReturn(uuid);
 
     when(accountsManager.getByUsernameHash(any())).thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
     Response response = resources.getJerseyTest()

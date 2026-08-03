@@ -719,12 +719,12 @@ class MessageControllerTest {
     final UUID senderAci = UUID.randomUUID();
     final UUID senderPni = UUID.randomUUID();
     final String userAgent = "user-agent";
-    UUID messageGuid = UUID.randomUUID();
+    final UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumberOptional()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(senderPni));
 
     when(accountsManager.getByE164(senderNumber)).thenReturn(Optional.of(account));
 
@@ -739,24 +739,24 @@ class MessageControllerTest {
       assertThat(response.getStatus(), is(equalTo(202)));
 
       verify(reportMessageManager).report(Optional.of(senderNumber), Optional.of(senderAci), Optional.of(senderPni),
-          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent);
+          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent, false);
       verify(accountsManager, never()).findRecentlyDeletedPhoneNumberIdentifier(any(UUID.class));
       verify(phoneNumberIdentifiers, never()).getPhoneNumber(any());
     }
   }
 
   @Test
-  void testReportMesageByE164DeletedAccount() {
+  void testReportMessageByE164DeletedAccount() {
     final String senderNumber = "+12125550001";
     final UUID senderAci = UUID.randomUUID();
     final UUID senderPni = UUID.randomUUID();
     final String userAgent = "user-agent";
-    UUID messageGuid = UUID.randomUUID();
+    final UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumberOptional()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(senderPni));
 
     when(accountsManager.getByE164(senderNumber)).thenReturn(Optional.empty());
     when(phoneNumberIdentifiers.getPhoneNumberIdentifier(senderNumber)).thenReturn(CompletableFuture.completedFuture(senderPni));
@@ -773,7 +773,7 @@ class MessageControllerTest {
       assertThat(response.getStatus(), is(equalTo(202)));
 
       verify(reportMessageManager).report(Optional.of(senderNumber), Optional.of(senderAci), Optional.of(senderPni),
-          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent);
+          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent, true);
     }
   }
 
@@ -786,9 +786,9 @@ class MessageControllerTest {
     UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumberOptional()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(senderPni));
 
     when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.of(account));
     when(phoneNumberIdentifiers.getPhoneNumber(senderPni)).thenReturn(CompletableFuture.completedFuture(List.of(senderNumber)));
@@ -804,7 +804,7 @@ class MessageControllerTest {
       assertThat(response.getStatus(), is(equalTo(202)));
 
       verify(reportMessageManager).report(Optional.of(senderNumber), Optional.of(senderAci), Optional.of(senderPni),
-          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent);
+          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent, false);
       verify(accountsManager, never()).findRecentlyDeletedPhoneNumberIdentifier(any(UUID.class));
       verify(phoneNumberIdentifiers, never()).getPhoneNumber(any());
     }
@@ -819,9 +819,9 @@ class MessageControllerTest {
     final UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumberOptional()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(senderPni));
 
     when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.empty());
     when(accountsManager.findRecentlyDeletedPhoneNumberIdentifier(senderAci)).thenReturn(Optional.of(senderPni));
@@ -838,7 +838,7 @@ class MessageControllerTest {
       assertThat(response.getStatus(), is(equalTo(202)));
 
       verify(reportMessageManager).report(Optional.of(senderNumber), Optional.of(senderAci), Optional.of(senderPni),
-          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent);
+          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent, true);
     }
   }
 
@@ -851,9 +851,9 @@ class MessageControllerTest {
     UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumberOptional()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(senderPni));
 
     when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.of(account));
     when(accountsManager.findRecentlyDeletedPhoneNumberIdentifier(senderAci)).thenReturn(Optional.of(senderPni));
@@ -875,7 +875,8 @@ class MessageControllerTest {
           eq(messageGuid),
           eq(AuthHelper.VALID_UUID),
           argThat(maybeBytes -> maybeBytes.map(bytes -> Arrays.equals(bytes, new byte[3])).orElse(false)),
-          any());
+          any(),
+          eq(false));
       verify(accountsManager, never()).findRecentlyDeletedPhoneNumberIdentifier(any(UUID.class));
       verify(phoneNumberIdentifiers, never()).getPhoneNumber(any());
     }
@@ -900,7 +901,8 @@ class MessageControllerTest {
           eq(messageGuid),
           eq(AuthHelper.VALID_UUID),
           argThat(maybeBytes -> maybeBytes.map(bytes -> Arrays.equals(bytes, new byte[5])).orElse(false)),
-          any());
+          any(),
+          eq(true));
     }
   }
 
@@ -914,9 +916,9 @@ class MessageControllerTest {
     UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumberOptional()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(senderPni));
 
     when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.of(account));
     when(accountsManager.findRecentlyDeletedPhoneNumberIdentifier(senderAci)).thenReturn(Optional.of(senderPni));

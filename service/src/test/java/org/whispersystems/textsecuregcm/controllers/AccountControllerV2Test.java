@@ -126,13 +126,18 @@ class AccountControllerV2Test {
             final List<Device> devices = account.getDevices();
 
             final Account updatedAccount = mock(Account.class);
-            when(updatedAccount.getUuid()).thenReturn(uuid);
+            when(updatedAccount.getAccountIdentifier()).thenReturn(uuid);
             when(updatedAccount.getNumber()).thenReturn(number);
+            when(updatedAccount.getNumberOptional()).thenReturn(Optional.of(number));
             when(updatedAccount.getIdentityKey(IdentityType.PNI)).thenReturn(pniIdentityKey);
             if (number.equals(account.getNumber())) {
               when(updatedAccount.getPhoneNumberIdentifier()).thenReturn(AuthHelper.VALID_PNI);
+              when(updatedAccount.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(AuthHelper.VALID_PNI));
             } else {
-              when(updatedAccount.getPhoneNumberIdentifier()).thenReturn(UUID.randomUUID());
+              final UUID pni = UUID.randomUUID();
+
+              when(updatedAccount.getPhoneNumberIdentifier()).thenReturn(pni);
+              when(updatedAccount.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(pni));
             }
             when(updatedAccount.getDevices()).thenReturn(devices);
 
@@ -169,8 +174,8 @@ class AccountControllerV2Test {
           any(), any(), any(), any(), any(), any(), any());
 
       assertEquals(AuthHelper.VALID_UUID, accountIdentityResponse.uuid());
-      assertEquals(NEW_NUMBER, accountIdentityResponse.number());
-      assertNotEquals(AuthHelper.VALID_PNI, accountIdentityResponse.pni());
+      assertEquals(Optional.of(NEW_NUMBER), accountIdentityResponse.number());
+      assertNotEquals(Optional.of(AuthHelper.VALID_PNI), accountIdentityResponse.pni());
     }
 
     @Test
@@ -353,6 +358,28 @@ class AccountControllerV2Test {
       }
     }
 
+    @Test
+    void accountHasNoNumber() throws Exception {
+      doThrow(IllegalArgumentException.class)
+          .when(changeNumberManager).changeNumber(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+
+      try (final Response response = resources.getJerseyTest()
+          .target("/v2/accounts/number")
+          .request()
+          .header(HttpHeaders.AUTHORIZATION,
+              AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
+          .put(Entity.entity(
+              new ChangeNumberRequest(encodeSessionId("session"), null, NEW_NUMBER, "123", IDENTITY_KEY,
+                  Collections.emptyList(),
+                  Map.of(Device.PRIMARY_ID, KeysHelper.signedECPreKey(1, IDENTITY_KEY_PAIR)),
+                  Map.of(Device.PRIMARY_ID, KeysHelper.signedKEMPreKey(2, IDENTITY_KEY_PAIR)),
+                  Map.of(Device.PRIMARY_ID, 17)),
+              MediaType.APPLICATION_JSON_TYPE))) {
+
+        assertEquals(400, response.getStatus());
+      }
+    }
+
     /**
      * Valid request JSON with the give session ID and recovery password
      */
@@ -469,13 +496,13 @@ class AccountControllerV2Test {
     @ParameterizedTest
     @ArgumentsSource(AccountsTestHelper.AccountsDataReportArgumentProvider.class)
     void testGetAccountDataReport(final Account account, final String expectedTextAfterHeader) throws Exception {
-      when(AuthHelper.ACCOUNTS_MANAGER.getByAccountIdentifier(account.getUuid())).thenReturn(Optional.of(account));
-      when(accountsManager.getByAccountIdentifier(account.getUuid())).thenReturn(Optional.of(account));
+      when(AuthHelper.ACCOUNTS_MANAGER.getByAccountIdentifier(account.getAccountIdentifier())).thenReturn(Optional.of(account));
+      when(accountsManager.getByAccountIdentifier(account.getAccountIdentifier())).thenReturn(Optional.of(account));
 
       final Response response = resources.getJerseyTest()
           .target("/v2/accounts/data_report")
           .request()
-          .header("Authorization", AuthHelper.getAuthHeader(account.getUuid(), "password"))
+          .header("Authorization", AuthHelper.getAuthHeader(account.getAccountIdentifier(), "password"))
           .get();
 
       assertEquals(200, response.getStatus());
@@ -485,7 +512,7 @@ class AccountControllerV2Test {
       final AccountDataReportResponse structuredResponse = SystemMapper.jsonMapper()
           .readValue(stringResponse, AccountDataReportResponse.class);
 
-      assertEquals(account.getNumber(), structuredResponse.data().account().phoneNumber());
+      assertEquals(account.getNumberOptional(), structuredResponse.data().account().phoneNumber());
       assertEquals(account.isDiscoverableByPhoneNumber(),
           structuredResponse.data().account().findAccountByPhoneNumber());
       assertEquals(account.isUnrestrictedUnidentifiedAccess(),
