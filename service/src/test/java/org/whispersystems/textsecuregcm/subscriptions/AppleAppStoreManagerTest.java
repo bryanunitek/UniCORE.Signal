@@ -16,12 +16,15 @@ import com.apple.itunes.storekit.client.APIException;
 import com.apple.itunes.storekit.client.AppStoreServerAPIClient;
 import com.apple.itunes.storekit.model.AutoRenewStatus;
 import com.apple.itunes.storekit.model.Environment;
+import com.apple.itunes.storekit.model.InAppOwnershipType;
 import com.apple.itunes.storekit.model.JWSRenewalInfoDecodedPayload;
 import com.apple.itunes.storekit.model.JWSTransactionDecodedPayload;
 import com.apple.itunes.storekit.model.LastTransactionsItem;
 import com.apple.itunes.storekit.model.Status;
 import com.apple.itunes.storekit.model.StatusResponse;
 import com.apple.itunes.storekit.model.SubscriptionGroupIdentifierItem;
+import com.apple.itunes.storekit.model.TransactionInfoResponse;
+import com.apple.itunes.storekit.model.Type;
 import com.apple.itunes.storekit.verification.SignedDataVerifier;
 import com.apple.itunes.storekit.verification.VerificationException;
 import java.io.IOException;
@@ -38,12 +41,13 @@ import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 
 class AppleAppStoreManagerTest {
 
-  private final static long LEVEL = 123L;
   private final static String ORIGINAL_TX_ID = "originalTxIdTest";
+  private final static String TRANSACTION_ID = "txIdTest";
   private final static String SUBSCRIPTION_GROUP_ID = "subscriptionGroupIdTest";
   private final static String SIGNED_RENEWAL_INFO = "signedRenewalInfoTest";
   private final static String SIGNED_TX_INFO = "signedRenewalInfoTest";
-  private final static String PRODUCT_ID = "productIdTest";
+  private final static String SUBSCRIPTION_PRODUCT_ID = "subscriptionProductIdTest";
+  private final static String ONE_TIME_PRODUCT_ID = "oneTimeProductIdTest";
   private final static String WEB_ORDER_LINE_ITEM = "webOrderLineItemTest";
 
   private final AppStoreServerAPIClient apiClient = mock(AppStoreServerAPIClient.class);
@@ -53,10 +57,11 @@ class AppleAppStoreManagerTest {
   @BeforeEach
   public void setup() {
     reset(apiClient, signedDataVerifier);
-    appleAppStoreManager = new AppleAppStoreManager(new AppleAppStoreClient(Environment.PRODUCTION,
-        signedDataVerifier, apiClient,
-        signedDataVerifier, apiClient, null),
-        SUBSCRIPTION_GROUP_ID, Map.of(PRODUCT_ID, LEVEL));
+    appleAppStoreManager = new AppleAppStoreManager(
+        new AppleAppStoreClient(Environment.PRODUCTION, signedDataVerifier, apiClient, signedDataVerifier, apiClient,
+            null),
+        SUBSCRIPTION_GROUP_ID,
+        Map.of(ONE_TIME_PRODUCT_ID, ReceiptLevel.LOGIN, SUBSCRIPTION_PRODUCT_ID, ReceiptLevel.BACKUP_PAID));
   }
 
   @Test
@@ -66,7 +71,7 @@ class AppleAppStoreManagerTest {
 
     assertThat(info.active()).isTrue();
     assertThat(info.paymentProcessing()).isFalse();
-    assertThat(info.level()).isEqualTo(LEVEL);
+    assertThat(info.level()).isEqualTo(ReceiptLevel.BACKUP_PAID.getValue());
     assertThat(info.cancelAtPeriodEnd()).isFalse();
     assertThat(info.status()).isEqualTo(SubscriptionStatus.ACTIVE);
     assertThat(info.price().amount().compareTo(new BigDecimal("150"))).isEqualTo(0); // 150 cents
@@ -76,7 +81,8 @@ class AppleAppStoreManagerTest {
   public void validateTransaction()
       throws VerificationException, APIException, IOException, SubscriptionException, RateLimitExceededException {
     mockValidSubscription();
-    assertThat(appleAppStoreManager.validateTransaction(ORIGINAL_TX_ID)).isEqualTo(LEVEL);
+    assertThat(appleAppStoreManager.validateTransaction(ORIGINAL_TX_ID))
+        .isEqualTo(ReceiptLevel.BACKUP_PAID.getValue());
   }
 
   @Test
@@ -84,7 +90,7 @@ class AppleAppStoreManagerTest {
       throws VerificationException, APIException, IOException, SubscriptionException, RateLimitExceededException {
     mockValidSubscription();
     final SubscriptionPaymentProcessor.ReceiptItem receipt = appleAppStoreManager.getReceiptItem(ORIGINAL_TX_ID);
-    assertThat(receipt.level()).isEqualTo(LEVEL);
+    assertThat(receipt.level()).isEqualTo(ReceiptLevel.BACKUP_PAID.getValue());
     assertThat(receipt.paymentTime().receiptExpiration(Duration.ofDays(1), Duration.ZERO))
         .isEqualTo(Instant.EPOCH.plus(Duration.ofDays(2)));
     assertThat(receipt.itemId()).isEqualTo(WEB_ORDER_LINE_ITEM);
@@ -107,14 +113,14 @@ class AppleAppStoreManagerTest {
 
     assertThat(info.active()).isTrue();
     assertThat(info.paymentProcessing()).isFalse();
-    assertThat(info.level()).isEqualTo(LEVEL);
+    assertThat(info.level()).isEqualTo(ReceiptLevel.BACKUP_PAID.getValue());
     assertThat(info.status()).isEqualTo(SubscriptionStatus.ACTIVE);
   }
 
   @Test
   public void lookupMultipleProducts() throws APIException, IOException, VerificationException, RateLimitExceededException, SubscriptionException {
     // The lookup should select the transaction at i=1
-    final List<String> products = List.of("otherProduct1", PRODUCT_ID, "otherProduct3");
+    final List<String> products = List.of("otherProduct1", SUBSCRIPTION_PRODUCT_ID, "otherProduct3");
 
     when(apiClient.getAllSubscriptionStatuses(ORIGINAL_TX_ID, new Status[]{}))
         .thenReturn(new StatusResponse().data(List.of(new SubscriptionGroupIdentifierItem()
@@ -166,7 +172,8 @@ class AppleAppStoreManagerTest {
                     .signedTransactionInfo(SIGNED_TX_INFO))))
             .environment(Environment.PRODUCTION));
     mockDecode(AutoRenewStatus.ON);
-    assertThat(appleAppStoreManager.validateTransaction(ORIGINAL_TX_ID)).isEqualTo(LEVEL);
+    assertThat(appleAppStoreManager.validateTransaction(ORIGINAL_TX_ID))
+        .isEqualTo(ReceiptLevel.BACKUP_PAID.getValue());
   }
 
   @Test
@@ -188,6 +195,37 @@ class AppleAppStoreManagerTest {
   public void cancelInactiveStatus(Status status) throws APIException, VerificationException, IOException {
     mockSubscription(status, AutoRenewStatus.ON);
     assertDoesNotThrow(() -> appleAppStoreManager.cancelAllActiveSubscriptions(ORIGINAL_TX_ID));
+  }
+
+  @Test
+  public void getPaymentDetails()
+      throws APIException, IOException, VerificationException, SubscriptionException, RateLimitExceededException {
+    when(apiClient.getTransactionInfo(TRANSACTION_ID))
+        .thenReturn(new TransactionInfoResponse().signedTransactionInfo(SIGNED_TX_INFO));
+    final JWSTransactionDecodedPayload payload = new JWSTransactionDecodedPayload()
+        .transactionId(TRANSACTION_ID)
+        .productId(ONE_TIME_PRODUCT_ID)
+        .type(Type.CONSUMABLE)
+        .inAppOwnershipType(InAppOwnershipType.PURCHASED)
+        .purchaseDate(Instant.EPOCH.plus(Duration.ofDays(1)).toEpochMilli());
+    when(signedDataVerifier.verifyAndDecodeTransaction(SIGNED_TX_INFO)).thenReturn(payload);
+
+    {
+      // PURCHASED payment
+      final PaymentDetails paymentDetails = appleAppStoreManager.claimOneTimePurchase(TRANSACTION_ID).orElseThrow();
+      assertThat(paymentDetails.id()).isEqualTo(TRANSACTION_ID);
+      assertThat(paymentDetails.level()).isEqualTo(ReceiptLevel.LOGIN);
+      assertThat(paymentDetails.created()).isEqualTo(Instant.EPOCH.plus(Duration.ofDays(1)));
+      assertThat(paymentDetails.chargeFailure()).isNull();
+      assertThat(paymentDetails.status()).isEqualTo(PaymentStatus.SUCCEEDED);
+    }
+
+    {
+      // REVOKED payment
+      payload.setRevocationDate(Instant.EPOCH.plus(Duration.ofDays(2)).toEpochMilli());
+      final PaymentDetails paymentDetails = appleAppStoreManager.claimOneTimePurchase(TRANSACTION_ID).orElseThrow();
+      assertThat(paymentDetails.status()).isEqualTo(PaymentStatus.FAILED);
+    }
   }
 
   private void mockSubscription(final Status status, final AutoRenewStatus autoRenewStatus)
@@ -212,7 +250,7 @@ class AppleAppStoreManagerTest {
   private void mockDecode(final AutoRenewStatus autoRenewStatus) throws VerificationException {
     when(signedDataVerifier.verifyAndDecodeTransaction(SIGNED_TX_INFO))
         .thenReturn(new JWSTransactionDecodedPayload()
-            .productId(PRODUCT_ID)
+            .productId(SUBSCRIPTION_PRODUCT_ID)
             .currency("usd").price(1500L) // $1.50
             .originalPurchaseDate(Instant.EPOCH.toEpochMilli())
             .expiresDate(Instant.EPOCH.plus(Duration.ofDays(1)).toEpochMilli())

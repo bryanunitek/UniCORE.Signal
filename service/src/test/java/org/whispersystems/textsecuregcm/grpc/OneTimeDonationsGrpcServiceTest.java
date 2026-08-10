@@ -20,7 +20,6 @@ import com.stripe.model.PaymentIntent;
 import jakarta.annotation.Nullable;
 import java.io.IOException;
 import java.time.Instant;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -65,6 +64,7 @@ import org.whispersystems.textsecuregcm.subscriptions.ChargeFailure;
 import org.whispersystems.textsecuregcm.subscriptions.PayPalDonationsTranslator;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentDetails;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentStatus;
+import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
 import org.whispersystems.textsecuregcm.subscriptions.StripeManager;
 import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidAmountException;
 import org.whispersystems.textsecuregcm.subscriptions.SubscriptionProcessorException;
@@ -271,8 +271,8 @@ public class OneTimeDonationsGrpcServiceTest extends
   void createBoostReceiptCredentialsPaymentRequired(
       @Nullable final ChargeFailure chargeFailure,
       final boolean expectChargeFailure) throws IOException {
-    when(stripeManager.getPaymentDetails(any())).thenReturn(
-        Optional.of(new PaymentDetails("id", Collections.emptyMap(), PaymentStatus.FAILED,
+    when(stripeManager.claimOneTimePurchase(any())).thenReturn(
+        Optional.of(new PaymentDetails("id", null, PaymentStatus.FAILED,
             clock.instant(), chargeFailure)));
 
     final CreateBoostReceiptCredentialsResponse response =
@@ -305,11 +305,12 @@ public class OneTimeDonationsGrpcServiceTest extends
         ServerSecretParams.generate().getPublicParams()).createReceiptCredentialRequestContext(
         new ReceiptSerial(new byte[ReceiptSerial.SIZE])).getRequest();
 
-    when(stripeManager.getPaymentDetails(any())).thenReturn(
-        Optional.of(new PaymentDetails("id", Collections.emptyMap(), PaymentStatus.SUCCEEDED,
-            clock.instant(), null)));
+    when(oneTimeDonationsManager.getPaidAt(any(), anyString(), any())).thenReturn(clock.instant());
+    when(stripeManager.claimOneTimePurchase(any())).thenReturn(
+        Optional.of(new PaymentDetails("id", ReceiptLevel.ONE_TIME_DONATION,
+            PaymentStatus.SUCCEEDED, clock.instant(), null)));
     doThrow(WriteConflictException.class).when(issuedReceiptsManager)
-        .recordIssuance(any(), any(), any(), any());
+        .recordOneTimeIssuance(any(), any(), any(), any());
 
     final CreateBoostReceiptCredentialsResponse response =
         unauthenticatedServiceStub().createBoostReceiptCredentials(

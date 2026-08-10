@@ -74,7 +74,6 @@ appleDeviceCheck:
 
 deviceCheck:
   backupRedemptionDuration: P30D
-  backupRedemptionLevel: 201
 
 dynamoDbClient:
   region: us-west-2 # AWS Region
@@ -105,9 +104,8 @@ dynamoDbTables:
     expiration: P7D # Duration of time until rows expire
   issuedReceipts:
     tableName: Example_IssuedReceipts
-    expiration: P30D # Duration of time until rows expire
     generator: abcdefg12345678= # random base64-encoded binary sequence
-    maxIssuedReceiptsPerPaymentId:
+    maxReceiptsPerSubscriptionPayment:
       STRIPE: 1
       BRAINTREE: 1
       GOOGLE_PLAY_BILLING: 1
@@ -366,7 +364,7 @@ badges:
         - light: example-light.svg
           dark: example-dark.svg
   receiptLevels:
-    '1': TEST
+    ONE_TIME_DONATION: TEST
 
 subscription: # configuration for Stripe subscriptions
   badgeExpiration: P30D
@@ -385,14 +383,16 @@ subscription: # configuration for Stripe subscriptions
             STRIPE: price_example   # stripe Price ID
             BRAINTREE: plan_example # braintree Plan ID
 
+loginPurchase:
+  playProductId: login_example
+  appStoreProductId: login_example
+
 oneTimeDonations:
   sepaMaximumEuros: '10000'
   boost:
-    level: 1
     expiration: P90D
     badge: EXAMPLE
   gift:
-    level: 10
     expiration: P90D
     badge: EXAMPLE
   currencies:

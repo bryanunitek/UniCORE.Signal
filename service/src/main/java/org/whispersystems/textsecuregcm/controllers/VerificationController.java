@@ -97,7 +97,7 @@ import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.VerificationSessionManager;
 import org.whispersystems.textsecuregcm.telephony.CarrierData;
 import org.whispersystems.textsecuregcm.telephony.CarrierDataException;
@@ -139,7 +139,7 @@ public class VerificationController {
   private final VerificationSessionManager verificationSessionManager;
   private final PushNotificationManager pushNotificationManager;
   private final RegistrationCaptchaManager registrationCaptchaManager;
-  private final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager;
+  private final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager;
   private final PhoneNumberIdentifiers phoneNumberIdentifiers;
   private final RateLimiters rateLimiters;
   private final AccountsManager accountsManager;
@@ -153,7 +153,7 @@ public class VerificationController {
       final VerificationSessionManager verificationSessionManager,
       final PushNotificationManager pushNotificationManager,
       final RegistrationCaptchaManager registrationCaptchaManager,
-      final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager,
+      final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager,
       final PhoneNumberIdentifiers phoneNumberIdentifiers,
       final RateLimiters rateLimiters,
       final AccountsManager accountsManager,
@@ -166,7 +166,7 @@ public class VerificationController {
     this.verificationSessionManager = verificationSessionManager;
     this.pushNotificationManager = pushNotificationManager;
     this.registrationCaptchaManager = registrationCaptchaManager;
-    this.registrationRecoveryPasswordsManager = registrationRecoveryPasswordsManager;
+    this.phoneNumberRecoveryPasswordsManager = phoneNumberRecoveryPasswordsManager;
     this.phoneNumberIdentifiers = phoneNumberIdentifiers;
     this.rateLimiters = rateLimiters;
     this.accountsManager = accountsManager;
@@ -749,7 +749,10 @@ public class VerificationController {
       // the RRP. It's possible the client will not actually be able to register (e.g. failed reglock challenge), and
       // so we will have removed the RRP unnecessarily. The impact of this is low, since the owner of the RRP
       // can always just fallback to session-based verification.
-      existingRRP = registrationRecoveryPasswordsManager.remove(phoneNumberIdentifiers.getPhoneNumberIdentifier(registrationServiceSession.number()).join());
+      //
+      // Note that we do not remove the recovery password from the account itself because re-creation is imminent, and
+      // that process will overwrite the recovery password (along with the rest of the account record).
+      existingRRP = phoneNumberRecoveryPasswordsManager.remove(phoneNumberIdentifiers.getPhoneNumberIdentifier(registrationServiceSession.number()).join());
     }
 
     Optional<Account> maybeExistingAccount;
@@ -824,7 +827,10 @@ public class VerificationController {
         // the RRP. It's possible the client will not actually be able to register (e.g. failed reglock challenge), and
         // so we will have removed the RRP unnecessarily. The impact of this is low, since the owner of the RRP
         // can always just fallback to session-based verification.
-        registrationRecoveryPasswordsManager.remove(phoneNumberIdentifiers.getPhoneNumberIdentifier(registrationServiceSession.number()).join());
+        //
+        // Note that we do not remove the recovery password from the account itself because re-creation is imminent, and
+        // that process will overwrite the recovery password (along with the rest of the account record).
+        phoneNumberRecoveryPasswordsManager.remove(phoneNumberIdentifiers.getPhoneNumberIdentifier(registrationServiceSession.number()).join());
       }
 
       return registrationServiceSession;

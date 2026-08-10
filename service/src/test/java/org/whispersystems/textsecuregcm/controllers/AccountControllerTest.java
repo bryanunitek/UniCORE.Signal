@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyByte;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
@@ -88,7 +89,7 @@ import org.whispersystems.textsecuregcm.storage.AccountBadge;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.UsernameHashNotAvailableException;
 import org.whispersystems.textsecuregcm.storage.UsernameReservationNotFoundException;
 import org.whispersystems.textsecuregcm.tests.util.AccountsHelper;
@@ -98,6 +99,7 @@ import org.whispersystems.textsecuregcm.util.SystemMapper;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import org.whispersystems.textsecuregcm.util.TestRemoteAddressFilterProvider;
 import org.whispersystems.textsecuregcm.util.UsernameHashZkProofVerifier;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
 
 @ExtendWith(DropwizardExtensionsSupport.class)
 class AccountControllerTest {
@@ -133,8 +135,8 @@ class AccountControllerTest {
   private static final Account senderRegLockAccount = mock(Account.class);
   private static final Account senderHasStorage = mock(Account.class);
   private static final Account senderTransfer = mock(Account.class);
-  private static final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager =
-      mock(RegistrationRecoveryPasswordsManager.class);
+  private static final PhoneNumberRecoveryPasswordsManager PHONE_NUMBER_RECOVERY_PASSWORDS_MANAGER =
+      mock(PhoneNumberRecoveryPasswordsManager.class);
   private static final UsernameHashZkProofVerifier usernameZkProofVerifier = mock(UsernameHashZkProofVerifier.class);
 
   private final byte[] registration_lock_key = new byte[32];
@@ -157,7 +159,7 @@ class AccountControllerTest {
       .addResource(new AccountController(
               accountsManager,
           rateLimiters,
-          registrationRecoveryPasswordsManager,
+          PHONE_NUMBER_RECOVERY_PASSWORDS_MANAGER,
           usernameZkProofVerifier
       ))
       .build();
@@ -227,6 +229,9 @@ class AccountControllerTest {
 
       return null;
     }).when(usernameZkProofVerifier).verifyProof(any(), any());
+
+    when(PHONE_NUMBER_RECOVERY_PASSWORDS_MANAGER.buildTransactWriteItemForStorePassword(any(), any()))
+        .thenReturn(TransactWriteItem.builder().build());
   }
 
   @AfterEach
@@ -856,7 +861,8 @@ class AccountControllerTest {
             .setRecoveryPassword(recoveryPassword)))) {
 
       assertThat(response.getStatus()).isEqualTo(204);
-      verify(registrationRecoveryPasswordsManager).store(AuthHelper.UNDISCOVERABLE_PNI, recoveryPassword);
+      verify(accountsManager).update(eq(AuthHelper.UNDISCOVERABLE_UUID), any(), argThat(additionWriteItems -> additionWriteItems.size() == 1));
+      verify(AuthHelper.UNDISCOVERABLE_ACCOUNT).setAccountRecoveryPassword(recoveryPassword);
     }
   }
 

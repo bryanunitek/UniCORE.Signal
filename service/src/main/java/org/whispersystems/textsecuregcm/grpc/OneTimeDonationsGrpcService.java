@@ -261,11 +261,11 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
     switch (request.getProcessor()) {
       case PAYMENT_PROVIDER_STRIPE -> {
         processor = PaymentProvider.STRIPE;
-        maybePaymentDetails = stripeManager.getPaymentDetails(request.getPaymentIntentId());
+        maybePaymentDetails = stripeManager.claimOneTimePurchase(request.getPaymentIntentId());
       }
       case PAYMENT_PROVIDER_BRAINTREE -> {
         processor = PaymentProvider.BRAINTREE;
-        maybePaymentDetails = braintreeManager.getPaymentDetails(request.getPaymentIntentId());
+        maybePaymentDetails = braintreeManager.claimOneTimePurchase(request.getPaymentIntentId());
       }
       default -> throw GrpcExceptions.fieldViolation("processor", "Unsupported payment processor");
     }
@@ -303,24 +303,24 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
       throw GrpcExceptions.fieldViolation("receipt_credential_request", "invalid receipt credential request");
     }
 
-    try {
-      issuedReceiptsManager.recordIssuance(
-          paymentDetails.id(), processor, receiptCredentialRequest, clock.instant());
-    } catch (final WriteConflictException e) {
-      return CreateBoostReceiptCredentialsResponse.newBuilder()
-          .setReceiptAlreadyIssued(FailedPrecondition.getDefaultInstance()).build();
-    }
-
-    final Instant paidAt = oneTimeDonationsManager.getPaidAt(paymentDetails.id(), paymentDetails.created());
+    final Instant paidAt = oneTimeDonationsManager.getPaidAt(processor, paymentDetails.id(), paymentDetails.created());
     final Instant expiration = paidAt
         .plus(levelDetails.levelExpiration())
         .truncatedTo(ChronoUnit.DAYS)
         .plus(1, ChronoUnit.DAYS);
 
+    try {
+      issuedReceiptsManager.recordOneTimeIssuance(
+          paymentDetails.id(), processor, receiptCredentialRequest, expiration);
+    } catch (final WriteConflictException e) {
+      return CreateBoostReceiptCredentialsResponse.newBuilder()
+          .setReceiptAlreadyIssued(FailedPrecondition.getDefaultInstance()).build();
+    }
+
     final ReceiptCredentialResponse receiptCredentialResponse;
     try {
       receiptCredentialResponse = zkReceiptOperations.issueReceiptCredential(
-          receiptCredentialRequest, expiration.getEpochSecond(), levelDetails.level());
+          receiptCredentialRequest, expiration.getEpochSecond(), levelDetails.level().getValue());
     } catch (final VerificationFailedException e) {
       throw GrpcExceptions.fieldViolation("receipt_credential_request",
           "receipt credential request failed verification");

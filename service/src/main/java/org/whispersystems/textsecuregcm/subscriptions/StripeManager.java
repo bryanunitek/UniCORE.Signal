@@ -76,7 +76,7 @@ import org.whispersystems.textsecuregcm.util.Conversions;
 import org.whispersystems.textsecuregcm.util.ExecutorUtil;
 import org.whispersystems.textsecuregcm.util.ua.ClientPlatform;
 
-public class StripeManager implements CustomerAwareSubscriptionPaymentProcessor {
+public class StripeManager implements CustomerAwareSubscriptionPaymentProcessor, OneTimePaymentProcessor {
 
   private static final Logger logger = LoggerFactory.getLogger(StripeManager.class);
   private static final String METADATA_KEY_LEVEL = "level";
@@ -221,7 +221,7 @@ public class StripeManager implements CustomerAwareSubscriptionPaymentProcessor 
         .setCurrency(currency.toLowerCase(Locale.ROOT))
         .setDescription(boostDescription)
         .setCaptureMethod(PaymentIntentCreateParams.CaptureMethod.AUTOMATIC)
-        .putMetadata("level", Long.toString(level));
+        .putMetadata(METADATA_KEY_LEVEL, Long.toString(level));
 
     if (clientPlatform != null) {
       builder.putMetadata(METADATA_KEY_CLIENT_PLATFORM, clientPlatform.name().toLowerCase());
@@ -240,7 +240,8 @@ public class StripeManager implements CustomerAwareSubscriptionPaymentProcessor 
     }
   }
 
-  public Optional<PaymentDetails> getPaymentDetails(final String paymentIntentId) throws IOException {
+  @Override
+  public Optional<PaymentDetails> claimOneTimePurchase(final String paymentIntentId) throws IOException {
     try {
       final PaymentIntent paymentIntent = getPaymentIntent(paymentIntentId);
 
@@ -252,8 +253,15 @@ public class StripeManager implements CustomerAwareSubscriptionPaymentProcessor 
         }
       }
 
+      final ReceiptLevel level = Optional.ofNullable(paymentIntent.getMetadata())
+          .map(m -> m.get(METADATA_KEY_LEVEL))
+          .map(Long::parseLong)
+          .flatMap(ReceiptLevel::lookupLevel)
+          .orElseThrow(() -> new IllegalStateException(
+              "failed to retrieve level metadata from payment intent %s".formatted(paymentIntentId)));
+
       return Optional.of(new PaymentDetails(paymentIntent.getId(),
-          paymentIntent.getMetadata() == null ? Collections.emptyMap() : paymentIntent.getMetadata(),
+          level,
           getPaymentStatusForStatus(paymentIntent.getStatus()),
           Instant.ofEpochSecond(paymentIntent.getCreated()),
           chargeFailure));

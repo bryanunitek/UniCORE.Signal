@@ -130,6 +130,7 @@ import org.whispersystems.textsecuregcm.controllers.DonationController;
 import org.whispersystems.textsecuregcm.controllers.KeepAliveController;
 import org.whispersystems.textsecuregcm.controllers.KeyTransparencyController;
 import org.whispersystems.textsecuregcm.controllers.KeysController;
+import org.whispersystems.textsecuregcm.controllers.LoginPurchaseController;
 import org.whispersystems.textsecuregcm.controllers.MessageController;
 import org.whispersystems.textsecuregcm.controllers.OneTimeDonationController;
 import org.whispersystems.textsecuregcm.controllers.PaymentsController;
@@ -277,8 +278,8 @@ import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesV2;
 import org.whispersystems.textsecuregcm.storage.PushChallengeDynamoDb;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswords;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswords;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.RemoteConfigs;
 import org.whispersystems.textsecuregcm.storage.RemoteConfigsManager;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseECSignedPreKeyStore;
@@ -300,7 +301,9 @@ import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreManager;
 import org.whispersystems.textsecuregcm.subscriptions.BankMandateTranslator;
 import org.whispersystems.textsecuregcm.subscriptions.BraintreeManager;
 import org.whispersystems.textsecuregcm.subscriptions.GooglePlayBillingManager;
+import org.whispersystems.textsecuregcm.subscriptions.LoginPurchaseManager;
 import org.whispersystems.textsecuregcm.subscriptions.PayPalDonationsTranslator;
+import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
 import org.whispersystems.textsecuregcm.subscriptions.StripeManager;
 import org.whispersystems.textsecuregcm.telephony.CarrierDataProvider;
 import org.whispersystems.textsecuregcm.telephony.hlrlookup.HlrLookupCarrierDataProvider;
@@ -329,6 +332,7 @@ import org.whispersystems.textsecuregcm.workers.DeleteUserCommand;
 import org.whispersystems.textsecuregcm.workers.IdleDeviceNotificationSchedulerFactory;
 import org.whispersystems.textsecuregcm.workers.MessagePersisterServiceCommand;
 import org.whispersystems.textsecuregcm.workers.NotifyIdleDevicesCommand;
+import org.whispersystems.textsecuregcm.workers.PopulateAccountRecoveryPasswordsCommand;
 import org.whispersystems.textsecuregcm.workers.ProcessScheduledJobsServiceCommand;
 import org.whispersystems.textsecuregcm.workers.RegenerateSecondaryDynamoDbTableDataCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveExpiredAccountsCommand;
@@ -407,6 +411,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new IdleDeviceNotificationSchedulerFactory()));
 
     bootstrap.addCommand(new RegenerateSecondaryDynamoDbTableDataCommand());
+
+    bootstrap.addCommand(new PopulateAccountRecoveryPasswordsCommand());
 
     ServiceLoader.load(SpamFilter.class)
         .stream()
@@ -581,7 +587,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     ReportMessageDynamoDb reportMessageDynamoDb = new ReportMessageDynamoDb(dynamoDbClient, dynamoDbAsyncClient,
         config.getDynamoDbTables().getReportMessage().getTableName(),
         config.getReportMessageConfiguration().getReportTtl());
-    RegistrationRecoveryPasswords registrationRecoveryPasswords = new RegistrationRecoveryPasswords(
+    PhoneNumberRecoveryPasswords phoneNumberRecoveryPasswords = new PhoneNumberRecoveryPasswords(
         config.getDynamoDbTables().getRegistrationRecovery().getTableName(),
         config.getDynamoDbTables().getRegistrationRecovery().getExpiration(),
         dynamoDbClient,
@@ -723,8 +729,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         AsnInfoProvider.EMPTY,
         "AsnManager");
 
-    RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager =
-        new RegistrationRecoveryPasswordsManager(registrationRecoveryPasswords);
+    PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager =
+        new PhoneNumberRecoveryPasswordsManager(phoneNumberRecoveryPasswords);
     UsernameHashZkProofVerifier usernameHashZkProofVerifier = new UsernameHashZkProofVerifier();
 
     final CarrierDataProvider carrierDataProvider =
@@ -791,7 +797,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keysManager, messagesManager, profilesManager,
         changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
-        registrationRecoveryPasswordsManager, accountLockExecutor, messagePollExecutor,
+        phoneNumberRecoveryPasswordsManager, accountLockExecutor, messagePollExecutor,
         retryExecutor, clock, config.getLinkDeviceSecretConfiguration().secret().value());
     RemoteConfigsManager remoteConfigsManager = new RemoteConfigsManager(remoteConfigs, config.getRemoteConfigConfiguration().globalConfig());
     APNSender apnSender = new APNSender(apnSenderExecutor, Clock.systemUTC(), config.getApnConfiguration());
@@ -804,10 +810,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     ProvisioningManager provisioningManager = new ProvisioningManager(pubsubClient);
     IssuedReceiptsManager issuedReceiptsManager = new IssuedReceiptsManager(
         config.getDynamoDbTables().getIssuedReceipts().getTableName(),
-        config.getDynamoDbTables().getIssuedReceipts().getExpiration(),
         dynamoDbClient,
         config.getDynamoDbTables().getIssuedReceipts().getGenerator(),
-        config.getDynamoDbTables().getIssuedReceipts().getmaxIssuedReceiptsPerPaymentId());
+        config.getDynamoDbTables().getIssuedReceipts().getMaxReceiptsPerSubscriptionPayment());
     OneTimeDonationsManager oneTimeDonationsManager = new OneTimeDonationsManager(
         config.getDynamoDbTables().getOnetimeDonations().getTableName(), config.getDynamoDbTables().getOnetimeDonations().getExpiration(), dynamoDbClient);
     DonationPermits donationPermits = new DonationPermits(
@@ -826,7 +831,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         callQualitySurveyPubSubExecutor);
 
     final RegistrationLockVerificationManager registrationLockVerificationManager = new RegistrationLockVerificationManager(
-        accountsManager, disconnectionRequestManager, svr2CredentialsGenerator, registrationRecoveryPasswordsManager,
+        accountsManager, disconnectionRequestManager, svr2CredentialsGenerator, phoneNumberRecoveryPasswordsManager,
         pushNotificationManager, rateLimiters);
 
     final ReportedMessageMetricsListener reportedMessageMetricsListener = new ReportedMessageMetricsListener(
@@ -984,6 +989,13 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         List.of(stripeManager, braintreeManager, googlePlayBillingManager, appleAppStoreManager),
         zkReceiptOperations, issuedReceiptsManager);
 
+    final LoginPurchaseManager loginPurchaseManager = new LoginPurchaseManager(
+        Map.of(
+            PaymentProvider.APPLE_APP_STORE, appleAppStoreManager,
+            PaymentProvider.GOOGLE_PLAY_BILLING, googlePlayBillingManager),
+        issuedReceiptsManager,
+        zkReceiptOperations);
+
     final List<SpamFilter> spamFilters = ServiceLoader.load(SpamFilter.class)
         .stream()
         .map(ServiceLoader.Provider::get)
@@ -1083,14 +1095,15 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             config.getDeliveryCertificate().embedSigner());
 
     final PhoneVerificationTokenManager phoneVerificationTokenManager = new PhoneVerificationTokenManager(
-        phoneNumberIdentifiers, registrationServiceClient, registrationRecoveryPasswordsManager, registrationRecoveryChecker);
+        phoneNumberIdentifiers, registrationServiceClient, phoneNumberRecoveryPasswordsManager, registrationRecoveryChecker);
 
     final ChangeNumberManager changeNumberManager = new ChangeNumberManager(messageSender, accountsManager,
         phoneVerificationTokenManager, registrationLockVerificationManager, rateLimiters,
         changeNumberWaitingPeriodManager, Clock.systemUTC());
 
     final List<ServerServiceDefinition> authenticatedServices = Stream.of(
-            new AccountsGrpcService(accountsManager, rateLimiters, usernameHashZkProofVerifier, registrationRecoveryPasswordsManager, Clock.systemUTC(), changeNumberManager),
+            new AccountsGrpcService(accountsManager, rateLimiters, usernameHashZkProofVerifier,
+                phoneNumberRecoveryPasswordsManager, Clock.systemUTC(), changeNumberManager),
             new CallingGrpcService(cloudflareTurnCredentialsManager, rateLimiters),
             new CredentialsGrpcService(accountsManager, certificateGenerator, zkAuthOperations, callingGenericZkSecretParams, rateLimiters, Clock.systemUTC(), ExternalServiceDefinitions.createExternalServiceList(config, Clock.systemUTC())),
             new KeysGrpcService(accountsManager, keysManager, rateLimiters),
@@ -1105,7 +1118,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             new ChallengeGrpcService(accountsManager, rateLimitChallengeManager, challengeConstraintChecker),
             new DonationsGrpcService(clock, zkReceiptOperations, redeemedReceiptsManager, accountsManager, config.getBadges(), ReceiptCredentialPresentation::new, donationPermitsManager, rateLimiters),
             new ProductConfigurationGrpcService(config.getSubscription(), config.getOneTimeDonations(),
-                List.of(stripeManager, braintreeManager), config.getBackupConfiguration().maxTotalMediaSize()),
+                config.getLoginPurchase(), List.of(stripeManager, braintreeManager),
+                config.getBackupConfiguration().maxTotalMediaSize()),
             new RemoteConfigurationGrpcService(remoteConfigsManager, profileBadgeConverter,
                 config.getBadges().getBadges().stream()
                     .map(BadgeConfiguration::getId)
@@ -1242,7 +1256,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final PersistentTimer persistentTimer = new PersistentTimer(rateLimitersCluster, clock);
 
     final List<Object> commonControllers = Lists.newArrayList(
-        new AccountController(accountsManager, rateLimiters, registrationRecoveryPasswordsManager,
+        new AccountController(accountsManager, rateLimiters, phoneNumberRecoveryPasswordsManager,
             usernameHashZkProofVerifier),
         new AccountControllerV2(accountsManager, changeNumberManager),
         new AttachmentControllerV4(rateLimiters, gcsAttachmentGenerator, tusAttachmentGenerator,
@@ -1255,7 +1269,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new ChallengeController(accountsManager, rateLimitChallengeManager, challengeConstraintChecker),
         new DeviceController(accountsManager, rateLimiters, persistentTimer),
         new DeviceCheckController(clock, accountsManager, backupAuthManager, appleDeviceCheckManager, rateLimiters,
-            config.getDeviceCheck().backupRedemptionLevel(),
             config.getDeviceCheck().backupRedemptionDuration()),
         new DirectoryV2Controller(directoryV2CredentialsGenerator),
         new DonationController(clock, zkReceiptOperations, redeemedReceiptsManager, accountsManager, config.getBadges(),
@@ -1276,16 +1289,18 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new SecureValueRecovery2Controller(svr2CredentialsGenerator, accountsManager),
         new StickerController(rateLimiters, stickerPolicyGenerator, Clock.systemUTC()),
         new VerificationController(registrationServiceClient, new VerificationSessionManager(verificationSessions),
-            pushNotificationManager, registrationCaptchaManager, registrationRecoveryPasswordsManager,
+            pushNotificationManager, registrationCaptchaManager, phoneNumberRecoveryPasswordsManager,
             phoneNumberIdentifiers, rateLimiters, accountsManager, carrierDataProvider, registrationFraudChecker,
             dynamicConfigurationManager, experimentEnrollmentManager, clock),
         new SubscriptionController(clock, config.getSubscription(), config.getOneTimeDonations(),
-            subscriptionManager, stripeManager, braintreeManager, googlePlayBillingManager, appleAppStoreManager,
+            config.getLoginPurchase(), subscriptionManager, stripeManager, braintreeManager, googlePlayBillingManager,
+            appleAppStoreManager,
             profileBadgeConverter, bankMandateTranslator, donationPermitsManager,
             config.getBackupConfiguration().maxTotalMediaSize()),
         new OneTimeDonationController(clock, config.getOneTimeDonations(), stripeManager, braintreeManager,
             payPalDonationsTranslator, zkReceiptOperations, issuedReceiptsManager, oneTimeDonationsManager,
-            donationPermitsManager)
+            donationPermitsManager),
+        new LoginPurchaseController(loginPurchaseManager, dynamicConfigurationManager)
     );
 
     for (Object controller : commonControllers) {

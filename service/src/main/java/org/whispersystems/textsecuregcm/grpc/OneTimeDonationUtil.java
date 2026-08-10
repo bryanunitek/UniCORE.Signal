@@ -11,6 +11,7 @@ import org.whispersystems.textsecuregcm.subscriptions.CustomerAwareSubscriptionP
 import org.whispersystems.textsecuregcm.subscriptions.PayPalDonationsTranslator;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentDetails;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentMethod;
+import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
 import org.whispersystems.textsecuregcm.subscriptions.SubscriptionCurrencyUtil;
 
 public class OneTimeDonationUtil {
@@ -28,7 +29,7 @@ public class OneTimeDonationUtil {
   }
 
   public record LocalizedPayPalDonationLineItem(Locale locale, String itemName){}
-  public record DonationLevelDetails(long level, Duration levelExpiration){}
+  public record DonationLevelDetails(ReceiptLevel level, Duration levelExpiration){}
 
   public sealed interface OneTimeDonationRequestValidationResult permits OneTimeDonationRequestValidationResult.Success,
       OneTimeDonationRequestValidationResult.UnsupportedCurrency,
@@ -57,8 +58,9 @@ public class OneTimeDonationUtil {
       final CustomerAwareSubscriptionPaymentProcessor manager
   ) {
 
-    if (!(level == oneTimeDonationConfiguration.gift().level()
-        || level == oneTimeDonationConfiguration.boost().level())) {
+    if (ReceiptLevel.lookupLevel(level)
+        .map(rl -> rl != ReceiptLevel.ONE_TIME_DONATION && rl != ReceiptLevel.ONE_TIME_GIFT_DONATION)
+        .orElse(true)) {
       return new OneTimeDonationRequestValidationResult.UnsupportedLevel();
     }
 
@@ -102,29 +104,15 @@ public class OneTimeDonationUtil {
       final OneTimeDonationConfiguration oneTimeDonationConfiguration)
       throws InvalidLevelException {
 
-    long level = oneTimeDonationConfiguration.boost().level();
-    if (paymentDetails.customMetadata() != null) {
-      final String levelMetadata = paymentDetails.customMetadata()
-          .getOrDefault("level", Long.toString(oneTimeDonationConfiguration.boost().level()));
-      try {
-        level = Long.parseLong(levelMetadata);
-      } catch (final NumberFormatException e) {
-        LOGGER.error("failed to parse level metadata ({}) on payment intent {}", levelMetadata,
-            paymentDetails.id(), e);
-        throw new InvalidLevelException("failed to parse level metadata");
+    final Duration levelExpiration = switch (paymentDetails.level()) {
+      case ONE_TIME_DONATION -> oneTimeDonationConfiguration.boost().expiration();
+      case ONE_TIME_GIFT_DONATION -> oneTimeDonationConfiguration.gift().expiration();
+      default -> {
+        LOGGER.error("level ({}) returned from payment intent that is unknown to the server", paymentDetails.level());
+        throw new InvalidLevelException("unrecognized level");
       }
-    }
-
-    final Duration levelExpiration;
-    if (level == oneTimeDonationConfiguration.boost().level()) {
-      levelExpiration = oneTimeDonationConfiguration.boost().expiration();
-    } else if (level == oneTimeDonationConfiguration.gift().level()) {
-      levelExpiration = oneTimeDonationConfiguration.gift().expiration();
-    } else {
-      LOGGER.error("level ({}) returned from payment intent that is unknown to the server", level);
-      throw new InvalidLevelException("unrecognized level");
-    }
-    return new DonationLevelDetails(level, levelExpiration);
+    };
+    return new DonationLevelDetails(paymentDetails.level(), levelExpiration);
   }
 
 }

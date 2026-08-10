@@ -36,6 +36,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -133,7 +134,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private final SecureStorageClient secureStorageClient;
   private final SecureValueRecoveryClient secureValueRecovery2Client;
   private final DisconnectionRequestManager disconnectionRequestManager;
-  private final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager;
+  private final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager;
   private final Executor accountLockExecutor;
   private final ScheduledExecutorService messagesPollExecutor;
   private final ScheduledExecutorService retryExecutor;
@@ -215,7 +216,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final SecureStorageClient secureStorageClient,
       final SecureValueRecoveryClient secureValueRecovery2Client,
       final DisconnectionRequestManager disconnectionRequestManager,
-      final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager,
+      final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager,
       final Executor accountLockExecutor,
       final ScheduledExecutorService messagesPollExecutor, final ScheduledExecutorService retryExecutor,
       final Clock clock,
@@ -232,7 +233,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     this.secureStorageClient = secureStorageClient;
     this.secureValueRecovery2Client = secureValueRecovery2Client;
     this.disconnectionRequestManager = disconnectionRequestManager;
-    this.registrationRecoveryPasswordsManager = requireNonNull(registrationRecoveryPasswordsManager);
+    this.phoneNumberRecoveryPasswordsManager = requireNonNull(phoneNumberRecoveryPasswordsManager);
     this.accountLockExecutor = accountLockExecutor;
     this.messagesPollExecutor = messagesPollExecutor;
     this.retryExecutor = retryExecutor;
@@ -333,6 +334,8 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     account.setDiscoverableByPhoneNumber(accountAttributes.isDiscoverableByPhoneNumber());
     account.setBadges(clock, accountBadges);
 
+    accountAttributes.recoveryPassword().ifPresent(account::setAccountRecoveryPassword);
+
     String accountCreationType = maybeRecentlyDeletedAccountIdentifier.isPresent() ? "recently-deleted" : "new";
 
     final String pushTokenType;
@@ -413,7 +416,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     redisSet(account);
 
     final boolean rrpCreated = accountAttributes.recoveryPassword().map(registrationRecoveryPassword ->
-            registrationRecoveryPasswordsManager
+            phoneNumberRecoveryPasswordsManager
                 .store(account.getIdentifier(IdentityType.PNI), registrationRecoveryPassword))
         .orElse(false);
 
@@ -961,6 +964,17 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     });
   }
 
+  public Account update(final UUID accountIdentifier,
+      final Consumer<Account> updater,
+      final Collection<TransactWriteItem> additionalWriteItems) {
+
+    return update(accountIdentifier, a -> {
+      updater.accept(a);
+      // assume that all updaters passed to the public method actually modify the account
+      return true;
+    }, additionalWriteItems);
+  }
+
   /// Using a pessimistic lock, updates the current profile version to `newVersion` if `currentProfileVersion` matches
   /// `expectedCurrentVersion`. The caller may provide a supplementary `Consumer<Account>` for additional updates
   ///
@@ -1021,12 +1035,27 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
    * @param accountIdentifier identifier of account to update
    * @param updater must return {@code true} if the account was actually updated
    */
-  private Account update(UUID accountIdentifier, Function<Account, Boolean> updater) {
+  private Account update(final UUID accountIdentifier, final Function<Account, Boolean> updater) {
+    return update(accountIdentifier, updater, Collections.emptyList());
+  }
+
+  /**
+   * @param accountIdentifier identifier of account to update
+   * @param updater must return {@code true} if the account was actually updated
+   * @param additionalWriteItems additional write items to include in a transactional update
+   */
+  private Account update(final UUID accountIdentifier,
+      final Function<Account, Boolean> updater,
+      final Collection<TransactWriteItem> additionalWriteItems) {
+
+    final ThrowingConsumer<Account, RuntimeException> persister = additionalWriteItems.isEmpty()
+        ? accounts::update
+        : account -> accounts.updateTransactionally(account, additionalWriteItems);
 
     return updateTimer.record(() -> {
 
       final Account updatedAccount = updateWithRetries(updater,
-          accounts::update,
+          persister,
           () -> accounts.getByAccountIdentifier(accountIdentifier).orElseThrow(),
           AccountChangeValidator.GENERAL_CHANGE_VALIDATOR);
 
@@ -1200,13 +1229,18 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   }
 
   private void delete(final Account account) {
-    final List<TransactWriteItem> additionalWriteItems = account.getDevices().stream()
+    final List<TransactWriteItem> additionalWriteItems = new ArrayList<>();
+
+    account.getDevices().stream()
         .flatMap(device -> keysManager.buildWriteItemsForRemovedDevice(
                 account.getIdentifier(IdentityType.ACI),
                 account.getIdentifier(IdentityType.PNI),
                 device.getId())
             .stream())
-        .toList();
+        .forEach(additionalWriteItems::add);
+
+    account.getPhoneNumberIdentifierOptional().ifPresent(phoneNumberIdentifier ->
+        additionalWriteItems.add(phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForRemovePassword(phoneNumberIdentifier)));
 
     CompletableFuture.allOf(
             secureStorageClient.deleteStoredData(account.getAccountIdentifier()),
@@ -1216,8 +1250,6 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
             messagesManager.clear(account.getAccountIdentifier()),
             profilesManager.deleteAll(account.getAccountIdentifier(), true))
         .join();
-
-    registrationRecoveryPasswordsManager.remove(account.getIdentifier(IdentityType.PNI));
 
     accounts.delete(account.getAccountIdentifier(), additionalWriteItems);
     redisDelete(account);
@@ -1691,6 +1723,35 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       return MessageDigest.getInstance("SHA-256");
     } catch (final NoSuchAlgorithmException e) {
       throw new AssertionError("Every implementation of the Java platform is required to support the SHA-256 MessageDigest algorithm", e);
+    }
+  }
+
+  public void migrateAccountRecoveryPassword(final Account account) {
+    accountLockManager.withSingleAccountLock(account, () -> {
+      migrateAccountRecoveryPassword(account.getAccountIdentifier(), MAX_UPDATE_ATTEMPTS);
+      return null;
+    }, accountLockExecutor);
+  }
+
+  private void migrateAccountRecoveryPassword(final UUID accountIdentifier, final int retries) {
+    try {
+      final Account account = accounts.getByAccountIdentifier(accountIdentifier)
+          .orElseThrow(ContestedOptimisticLockException::new);
+
+      account.getPhoneNumberIdentifierOptional()
+          .flatMap(phoneNumberRecoveryPasswordsManager::getPasswordAndWriteItemForMigration)
+          .ifPresent(passwordAndWriteItem -> {
+            account.setAccountRecoveryPassword(passwordAndWriteItem.first());
+            accounts.updateTransactionally(account, List.of(passwordAndWriteItem.second()));
+
+            redisDelete(account);
+          });
+    } catch (final ContestedOptimisticLockException | TransactionCanceledException e) {
+      if (retries > 0) {
+        migrateAccountRecoveryPassword(accountIdentifier, retries - 1);
+      }
+
+      throw e;
     }
   }
 }

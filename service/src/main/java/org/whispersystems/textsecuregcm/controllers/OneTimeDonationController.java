@@ -350,8 +350,8 @@ public class OneTimeDonationController {
     }
 
     final Optional<PaymentDetails> maybePaymentDetails = (switch (request.processor) {
-      case STRIPE -> stripeManager.getPaymentDetails(request.paymentIntentId);
-      case BRAINTREE -> braintreeManager.getPaymentDetails(request.paymentIntentId);
+      case STRIPE -> stripeManager.claimOneTimePurchase(request.paymentIntentId);
+      case BRAINTREE -> braintreeManager.claimOneTimePurchase(request.paymentIntentId);
       case GOOGLE_PLAY_BILLING -> throw new BadRequestException("cannot use play billing for one-time donations");
       case APPLE_APP_STORE -> throw new BadRequestException("cannot use app store purchases for one-time donations");
     });
@@ -383,21 +383,21 @@ public class OneTimeDonationController {
     } catch (final InvalidInputException e) {
       throw new BadRequestException("invalid receipt credential request", e);
     }
-    try {
-      issuedReceiptsManager.recordIssuance(paymentDetails.id(), request.processor,
-          receiptCredentialRequest, clock.instant());
-    } catch (WriteConflictException _) {
-      throw new WebApplicationException(Response.Status.CONFLICT);
-    }
-    final Instant paidAt = oneTimeDonationsManager.getPaidAt(paymentDetails.id(), paymentDetails.created());
+    final Instant paidAt = oneTimeDonationsManager.getPaidAt(request.processor, paymentDetails.id(), paymentDetails.created());
     final Instant expiration = paidAt
         .plus(levelDetails.levelExpiration())
         .truncatedTo(ChronoUnit.DAYS)
         .plus(1, ChronoUnit.DAYS);
+    try {
+      issuedReceiptsManager.recordOneTimeIssuance(paymentDetails.id(), request.processor,
+          receiptCredentialRequest, expiration);
+    } catch (WriteConflictException _) {
+      throw new WebApplicationException(Response.Status.CONFLICT);
+    }
     final ReceiptCredentialResponse receiptCredentialResponse;
     try {
       receiptCredentialResponse = zkReceiptOperations.issueReceiptCredential(
-          receiptCredentialRequest, expiration.getEpochSecond(), levelDetails.level());
+          receiptCredentialRequest, expiration.getEpochSecond(), levelDetails.level().getValue());
     } catch (final VerificationFailedException e) {
       throw new BadRequestException("receipt credential request failed verification", e);
     }

@@ -20,7 +20,6 @@ import org.apache.commons.lang3.StringUtils;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.entities.PhoneVerificationRequest;
 import org.whispersystems.textsecuregcm.entities.RegistrationLockFailure;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
 import org.whispersystems.textsecuregcm.push.NotPushRegisteredException;
@@ -28,7 +27,7 @@ import org.whispersystems.textsecuregcm.push.PushNotificationManager;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 
 public class RegistrationLockVerificationManager {
   public enum Flow {
@@ -54,20 +53,20 @@ public class RegistrationLockVerificationManager {
   private final DisconnectionRequestManager disconnectionRequestManager;
   private final ExternalServiceCredentialsGenerator svr2CredentialGenerator;
   private final RateLimiters rateLimiters;
-  private final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager;
+  private final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager;
   private final PushNotificationManager pushNotificationManager;
 
   public RegistrationLockVerificationManager(
       final AccountsManager accounts,
       final DisconnectionRequestManager disconnectionRequestManager,
       final ExternalServiceCredentialsGenerator svr2CredentialGenerator,
-      final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager,
+      final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager,
       final PushNotificationManager pushNotificationManager,
       final RateLimiters rateLimiters) {
     this.accounts = accounts;
     this.disconnectionRequestManager = disconnectionRequestManager;
     this.svr2CredentialGenerator = svr2CredentialGenerator;
-    this.registrationRecoveryPasswordsManager = registrationRecoveryPasswordsManager;
+    this.phoneNumberRecoveryPasswordsManager = phoneNumberRecoveryPasswordsManager;
     this.pushNotificationManager = pushNotificationManager;
     this.rateLimiters = rateLimiters;
   }
@@ -152,7 +151,8 @@ public class RegistrationLockVerificationManager {
       // This allows users to re-register via registration recovery password
       // instead of always being forced to fall back to SMS verification.
       if (!phoneVerificationType.equals(PhoneVerificationRequest.VerificationType.RECOVERY_PASSWORD) || clientRegistrationLock != null) {
-        registrationRecoveryPasswordsManager.remove(updatedAccount.getIdentifier(IdentityType.PNI));
+        phoneNumberRecoveryPasswordsManager.remove(updatedAccount.getPhoneNumberIdentifierOptional()
+            .orElseThrow(() -> new AssertionError("Account with a phone number did not have a phone number identifier")));
       }
 
       final List<Byte> deviceIds = updatedAccount.getDevices().stream().map(Device::getId).toList();

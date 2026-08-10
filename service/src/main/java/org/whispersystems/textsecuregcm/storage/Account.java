@@ -145,6 +145,18 @@ public class Account {
   @JsonProperty("holds")
   private List<UsernameHold> usernameHolds = Collections.emptyList();
 
+  @JsonProperty("arps")
+  @Nullable
+  private String accountRecoveryPasswordSalt;
+
+  @JsonProperty("arph")
+  @Nullable
+  private String accountRecoveryPasswordHash;
+
+  @JsonProperty("acs")
+  @Nullable
+  private byte[] authCredentialSalt;
+
   @JsonIgnore
   private boolean stale;
 
@@ -676,6 +688,37 @@ public class Account {
 
   public void setZkCredentialKeyRotationId(@Nullable final Long zkCredentialKeyRotationId) {
     this.zkCredentialKeyRotationId = zkCredentialKeyRotationId;
+  }
+
+  public Optional<SaltedTokenHash> getAccountRecoveryPassword() {
+    requireNotStale();
+
+    return accountRecoveryPasswordHash != null && accountRecoveryPasswordSalt != null
+        ? Optional.of(new SaltedTokenHash(accountRecoveryPasswordHash, accountRecoveryPasswordSalt))
+        : Optional.empty();
+  }
+
+  public void setAccountRecoveryPassword(final byte[] accountRecoveryPassword) {
+    requireNotStale();
+
+    setAccountRecoveryPassword(SaltedTokenHash.generateFor(HexFormat.of().formatHex(accountRecoveryPassword)));
+  }
+
+  public void setAccountRecoveryPassword(final SaltedTokenHash saltedAccountRecoveryPasswordHash) {
+    requireNotStale();
+
+    this.accountRecoveryPasswordSalt = saltedAccountRecoveryPasswordHash.salt();
+    this.accountRecoveryPasswordHash = saltedAccountRecoveryPasswordHash.hash();
+  }
+
+  public Optional<byte[]> getAuthCredentialSalt() {
+    requireNotStale();
+    return Optional.ofNullable(authCredentialSalt);
+  }
+
+  public void setAuthCredentialSalt(final byte[] authCredentialSalt) {
+    requireNotStale();
+    this.authCredentialSalt = authCredentialSalt;
   }
 
   public void markStale() {

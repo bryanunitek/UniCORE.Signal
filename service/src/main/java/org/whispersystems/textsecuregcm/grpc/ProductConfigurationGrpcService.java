@@ -12,11 +12,14 @@ import org.signal.chat.purchase.CurrencyConfiguration;
 import org.signal.chat.purchase.GetConfigurationRequest;
 import org.signal.chat.purchase.GetConfigurationResponse;
 import org.signal.chat.purchase.LevelConfiguration;
+import org.signal.chat.purchase.LoginConfiguration;
 import org.signal.chat.purchase.SimpleProductConfigurationGrpc;
+import org.whispersystems.textsecuregcm.configuration.LoginPurchaseConfiguration;
 import org.whispersystems.textsecuregcm.configuration.OneTimeDonationConfiguration;
 import org.whispersystems.textsecuregcm.configuration.SubscriptionConfiguration;
 import org.whispersystems.textsecuregcm.subscriptions.CustomerAwareSubscriptionPaymentProcessor;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentMethod;
+import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
 
 public class ProductConfigurationGrpcService extends SimpleProductConfigurationGrpc.ProductConfigurationImplBase {
   private final GetConfigurationResponse configurationResponse;
@@ -24,6 +27,7 @@ public class ProductConfigurationGrpcService extends SimpleProductConfigurationG
   public ProductConfigurationGrpcService(
       final SubscriptionConfiguration subscriptionConfiguration,
       final OneTimeDonationConfiguration oneTimeDonationConfiguration,
+      final LoginPurchaseConfiguration loginPurchaseConfiguration,
       List<CustomerAwareSubscriptionPaymentProcessor> paymentProcessors,
       final long backupMediaStorageAllowanceBytes) {
     this.configurationResponse = GetConfigurationResponse.newBuilder()
@@ -31,6 +35,7 @@ public class ProductConfigurationGrpcService extends SimpleProductConfigurationG
         .setSepaMaximumEuros(oneTimeDonationConfiguration.sepaMaximumEuros().toString())
         .putAllCurrencies(buildCurrencyConfigurations(subscriptionConfiguration, oneTimeDonationConfiguration, paymentProcessors))
         .putAllBadgeLevels(buildLevelConfigurations(subscriptionConfiguration, oneTimeDonationConfiguration))
+        .setLogin(buildLoginConfiguration(loginPurchaseConfiguration))
         .build();
   }
 
@@ -58,11 +63,11 @@ public class ProductConfigurationGrpcService extends SimpleProductConfigurationG
     subscriptionConfiguration.getDonationLevels().forEach((levelId, levelConfig) -> {
       donationLevels.put(levelId, LevelConfiguration.newBuilder().setBadgeId(levelConfig.badge()).build());
     });
-    donationLevels.put(oneTimeDonationConfiguration.boost().level(),
+    donationLevels.put(ReceiptLevel.ONE_TIME_DONATION.getValue(),
         LevelConfiguration.newBuilder()
             .setBadgeId(oneTimeDonationConfiguration.boost().badge())
             .setBadgeDurationSeconds(oneTimeDonationConfiguration.boost().expiration().toSeconds()).build());
-    donationLevels.put(oneTimeDonationConfiguration.gift().level(),
+    donationLevels.put(ReceiptLevel.ONE_TIME_GIFT_DONATION.getValue(),
         LevelConfiguration.newBuilder()
             .setBadgeId(oneTimeDonationConfiguration.gift().badge())
             .setBadgeDurationSeconds(oneTimeDonationConfiguration.gift().expiration().toSeconds()).build());
@@ -82,6 +87,15 @@ public class ProductConfigurationGrpcService extends SimpleProductConfigurationG
     return BackupConfiguration.newBuilder()
         .putAllLevels(backupLevels)
         .setFreeTierMediaDays(subscriptionConfiguration.getbackupFreeTierMediaDuration().toDays())
+        .build();
+  }
+
+  private static LoginConfiguration buildLoginConfiguration(
+      final LoginPurchaseConfiguration loginPurchaseConfiguration) {
+    return LoginConfiguration.newBuilder()
+        .setLevel(ReceiptLevel.LOGIN.getValue())
+        .setPlayProductId(loginPurchaseConfiguration.playProductId())
+        .setAppStoreProductId(loginPurchaseConfiguration.appStoreProductId())
         .build();
   }
 

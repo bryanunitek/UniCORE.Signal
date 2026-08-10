@@ -23,12 +23,10 @@ import jakarta.ws.rs.core.Response;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.Base64;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
 import org.assertj.core.api.InstanceOfAssertFactories;
 import org.glassfish.jersey.server.ServerProperties;
@@ -56,6 +54,7 @@ import org.whispersystems.textsecuregcm.subscriptions.PaymentDetails;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentMethod;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentStatus;
+import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
 import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidAmountException;
 import org.whispersystems.textsecuregcm.subscriptions.SubscriptionProcessorException;
 import org.whispersystems.textsecuregcm.tests.util.AuthHelper;
@@ -258,9 +257,9 @@ class OneTimeDonationControllerTest extends AbstractV1SubscriptionControllerTest
   @MethodSource
   void createBoostReceiptPaymentRequired(final ChargeFailure chargeFailure, boolean expectChargeFailure)
       throws IOException {
-    when(STRIPE_MANAGER.getPaymentDetails(any())).thenReturn(Optional.of(new PaymentDetails(
+    when(STRIPE_MANAGER.claimOneTimePurchase(any())).thenReturn(Optional.of(new PaymentDetails(
         "id",
-        Collections.emptyMap(),
+        null,
         PaymentStatus.FAILED,
         Instant.now(),
         chargeFailure))
@@ -341,13 +340,14 @@ class OneTimeDonationControllerTest extends AbstractV1SubscriptionControllerTest
         ServerSecretParams.generate().getPublicParams()).createReceiptCredentialRequestContext(
         new ReceiptSerial(new byte[ReceiptSerial.SIZE])).getRequest();
 
-    when(STRIPE_MANAGER.getPaymentDetails(any())).thenReturn(Optional.of(new PaymentDetails(
+    when(ONE_TIME_DONATIONS_MANAGER.getPaidAt(any(), anyString(), any())).thenReturn(Instant.now());
+    when(STRIPE_MANAGER.claimOneTimePurchase(any())).thenReturn(Optional.of(new PaymentDetails(
         "id",
-        Collections.emptyMap(),
+        ReceiptLevel.ONE_TIME_DONATION,
         PaymentStatus.SUCCEEDED,
         Instant.now(),
         null)));
-    doThrow(WriteConflictException.class).when(ISSUED_RECEIPTS_MANAGER).recordIssuance(any(), any(), any(), any());
+    doThrow(WriteConflictException.class).when(ISSUED_RECEIPTS_MANAGER).recordOneTimeIssuance(any(), any(), any(), any());
 
     try (Response response = RESOURCE_EXTENSION.target("/v1/subscription/boost/receipt_credentials")
         .request()

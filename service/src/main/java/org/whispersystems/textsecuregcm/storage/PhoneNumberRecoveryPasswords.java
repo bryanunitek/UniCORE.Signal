@@ -17,15 +17,19 @@ import org.whispersystems.textsecuregcm.auth.SaltedTokenHash;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
+import software.amazon.awssdk.services.dynamodb.model.ConditionCheck;
+import software.amazon.awssdk.services.dynamodb.model.Delete;
 import software.amazon.awssdk.services.dynamodb.model.DeleteItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.DeleteItemResponse;
 import software.amazon.awssdk.services.dynamodb.model.GetItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.GetItemResponse;
+import software.amazon.awssdk.services.dynamodb.model.Put;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.PutItemResponse;
 import software.amazon.awssdk.services.dynamodb.model.ReturnValue;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
 
-public class RegistrationRecoveryPasswords {
+public class PhoneNumberRecoveryPasswords {
 
   // For historical reasons, we record the PNI as a UUID string rather than a compact byte array
   static final String KEY_PNI = "P";
@@ -41,7 +45,7 @@ public class RegistrationRecoveryPasswords {
 
   private final Clock clock;
 
-  public RegistrationRecoveryPasswords(
+  public PhoneNumberRecoveryPasswords(
       final String tableName,
       final Duration expiration,
       final DynamoDbClient dynamoDbClient,
@@ -62,7 +66,7 @@ public class RegistrationRecoveryPasswords {
     return Optional.ofNullable(getItemResponse.item())
         .filter(item -> item.containsKey(ATTR_SALT))
         .filter(item -> item.containsKey(ATTR_HASH))
-        .map(RegistrationRecoveryPasswords::saltedTokenHashFromItem);
+        .map(PhoneNumberRecoveryPasswords::saltedTokenHashFromItem);
   }
 
   ///  Add a PNI -> RRP mapping, or replace the current one if it already exists
@@ -71,19 +75,32 @@ public class RegistrationRecoveryPasswords {
   /// @param data The salted registration recovery password
   /// @return true if a new mapping was added, false if an existing mapping was updated
   public boolean addOrReplace(final UUID phoneNumberIdentifier, final SaltedTokenHash data) {
-    final long expirationSeconds = expirationSeconds();
-
     final PutItemResponse response = dynamoDbClient.putItem(PutItemRequest.builder()
         .tableName(tableName)
         .returnValues(ReturnValue.ALL_OLD)
         .item(Map.of(
             KEY_PNI, AttributeValues.fromString(phoneNumberIdentifier.toString()),
-            ATTR_EXP, AttributeValues.fromLong(expirationSeconds),
+            ATTR_EXP, AttributeValues.fromLong(expirationSeconds()),
             ATTR_SALT, AttributeValues.fromString(data.salt()),
             ATTR_HASH, AttributeValues.fromString(data.hash())))
         .build());
 
     return response.attributes() == null || response.attributes().isEmpty();
+  }
+
+  TransactWriteItem buildWriteItemForAddOrReplace(final UUID phoneNumberIdentifier, final SaltedTokenHash data) {
+    final long expirationSeconds = expirationSeconds();
+
+    return TransactWriteItem.builder()
+        .put(Put.builder()
+            .tableName(tableName)
+            .item(Map.of(
+                KEY_PNI, AttributeValues.fromString(phoneNumberIdentifier.toString()),
+                ATTR_EXP, AttributeValues.fromLong(expirationSeconds),
+                ATTR_SALT, AttributeValues.fromString(data.salt()),
+                ATTR_HASH, AttributeValues.fromString(data.hash())))
+            .build())
+        .build();
   }
 
   ///  Remove the entry associated with the provided PNI
@@ -99,6 +116,15 @@ public class RegistrationRecoveryPasswords {
     return response.attributes() != null && !response.attributes().isEmpty();
   }
 
+  TransactWriteItem buildWriteItemForRemove(final UUID phoneNumberIdentifier) {
+    return TransactWriteItem.builder()
+        .delete(Delete.builder()
+            .tableName(tableName)
+            .key(Map.of(KEY_PNI, AttributeValues.fromString(phoneNumberIdentifier.toString())))
+            .build())
+        .build();
+  }
+
   @VisibleForTesting
   long expirationSeconds() {
     return clock.instant().plus(expiration).getEpochSecond();
@@ -106,5 +132,22 @@ public class RegistrationRecoveryPasswords {
 
   private static SaltedTokenHash saltedTokenHashFromItem(final Map<String, AttributeValue> item) {
     return new SaltedTokenHash(item.get(ATTR_HASH).s(), item.get(ATTR_SALT).s());
+  }
+
+  TransactWriteItem buildConditionCheckForMigration(final UUID phoneNumberIdentifier, final SaltedTokenHash expectedPassword) {
+    return TransactWriteItem.builder()
+        .conditionCheck(ConditionCheck.builder()
+            .tableName(tableName)
+            .key(Map.of(KEY_PNI, AttributeValues.fromString(phoneNumberIdentifier.toString())))
+            .conditionExpression("attribute_exists(#pni) AND #salt = :salt AND #hash = :hash")
+            .expressionAttributeNames(Map.of(
+                "#pni", KEY_PNI,
+                "#salt", ATTR_SALT,
+                "#hash", ATTR_HASH))
+            .expressionAttributeValues(Map.of(
+                ":salt", AttributeValues.fromString(expectedPassword.salt()),
+                ":hash", AttributeValues.fromString(expectedPassword.hash())))
+            .build())
+        .build();
   }
 }
