@@ -42,11 +42,13 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
+import org.apache.commons.lang3.ObjectUtils;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.BasicAuthorizationHeader;
 import org.whispersystems.textsecuregcm.auth.ChangesLinkedDevices;
@@ -72,6 +74,7 @@ import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
+import org.whispersystems.textsecuregcm.storage.DeviceIdentityInfo;
 import org.whispersystems.textsecuregcm.storage.DeviceSpec;
 import org.whispersystems.textsecuregcm.storage.LinkDeviceTokenAlreadyUsedException;
 import org.whispersystems.textsecuregcm.storage.PersistentTimer;
@@ -222,7 +225,7 @@ public class DeviceController {
           """)
   @ApiResponse(responseCode = "200", description = "The new device was linked to the calling account", useReturnTypeSchema = true)
   @ApiResponse(responseCode = "403", description = "The given account was not found or the given verification code was incorrect")
-  @ApiResponse(responseCode = "409", description = "The new device is missing a capability supported by all other devices on the account")
+  @ApiResponse(responseCode = "409", description = "The new device is missing a capability required for the account")
   @ApiResponse(responseCode = "411", description = "The given account already has its maximum number of linked devices")
   @ApiResponse(responseCode = "422", description = "The request did not pass validation")
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
@@ -232,7 +235,6 @@ public class DeviceController {
       @HeaderParam(HttpHeaders.USER_AGENT) @Nullable String userAgent,
       @NotNull @Valid LinkDeviceRequest linkDeviceRequest)
       throws RateLimitExceededException, DeviceLimitExceededException {
-
     final Account account = accounts.checkDeviceLinkingToken(linkDeviceRequest.verificationCode())
         .flatMap(accounts::getByAccountIdentifier)
         .orElseThrow(ForbiddenException::new);
@@ -242,15 +244,31 @@ public class DeviceController {
 
     rateLimiters.getVerifyDeviceLimiter().validate(account.getAccountIdentifier());
 
+    // Check the optional-phone-number capability before checking PNI keys, so we can give a better error code (since an
+    // older device will improperly supply PNI keys for a PNI-less account)
+    if (account.getPhoneNumberIdentifierOptional().isEmpty() &&
+        !linkDeviceRequest.deviceAttributes().capabilities().contains(DeviceCapability.OPTIONAL_PHONE_NUMBER)) {
+      throw new WebApplicationException("Missing required device capability", 409);
+    }
+
     final boolean allKeysValid =
-        PreKeySignatureValidator.validatePreKeySignatures(account.getIdentityKey(IdentityType.ACI),
-            List.of(deviceActivationRequest.aciSignedPreKey(), deviceActivationRequest.aciPqLastResortPreKey()),
-            userAgent,
-            "link-device")
-            && PreKeySignatureValidator.validatePreKeySignatures(account.getIdentityKey(IdentityType.PNI),
-            List.of(deviceActivationRequest.pniSignedPreKey(), deviceActivationRequest.pniPqLastResortPreKey()),
-            userAgent,
-            "link-device");
+      PreKeySignatureValidator
+          .validatePreKeySignatures(account.getAccountIdentityKey(),
+              List.of(deviceActivationRequest.aciSignedPreKey(), deviceActivationRequest.aciPqLastResortPreKey()),
+              userAgent,
+              "link-device")
+          && account.getPhoneNumberIdentityKey()
+                .map(pniIdentityKey ->
+                  deviceActivationRequest.pniSignedPreKey().isPresent()
+                      && deviceActivationRequest.pniPqLastResortPreKey().isPresent()
+                      && PreKeySignatureValidator.validatePreKeySignatures(
+                          pniIdentityKey,
+                          List.of(deviceActivationRequest.pniSignedPreKey().get(), deviceActivationRequest.pniPqLastResortPreKey().get()),
+                          userAgent,
+                          "link-device"))
+              .orElse(
+                  deviceActivationRequest.pniSignedPreKey().isEmpty()
+                      && deviceActivationRequest.pniPqLastResortPreKey().isEmpty());
 
     if (!allKeysValid) {
       throw new WebApplicationException(Response.status(422).build());
@@ -279,25 +297,28 @@ public class DeviceController {
     }
 
     try {
-      final Pair<Account, Device> accountAndDevice = accounts.addDevice(account.getIdentifier(IdentityType.ACI),
+      final Pair<Account, Device> accountAndDevice = accounts.addDevice(account.getAccountIdentifier(),
           new DeviceSpec(deviceAttributes.name(),
               authorizationHeader.getPassword(),
               signalAgent,
               capabilities,
-              deviceAttributes.registrationId(),
-              deviceAttributes.phoneNumberIdentityRegistrationId(),
+              new DeviceIdentityInfo(
+                  deviceAttributes.registrationId(),
+                  deviceActivationRequest.aciSignedPreKey(),
+                  deviceActivationRequest.aciPqLastResortPreKey()),
+              account.getPhoneNumberIdentityKey().map(_ ->
+                  new DeviceIdentityInfo(
+                      deviceAttributes.phoneNumberIdentityRegistrationId(),
+                      deviceActivationRequest.pniSignedPreKey().get(),
+                      deviceActivationRequest.pniPqLastResortPreKey().get())),
               deviceAttributes.fetchesMessages(),
               deviceActivationRequest.apnToken(),
-              deviceActivationRequest.gcmToken(),
-              deviceActivationRequest.aciSignedPreKey(),
-              deviceActivationRequest.pniSignedPreKey(),
-              deviceActivationRequest.aciPqLastResortPreKey(),
-              deviceActivationRequest.pniPqLastResortPreKey()),
+              deviceActivationRequest.gcmToken()),
           linkDeviceRequest.verificationCode());
 
       return new LinkDeviceResponse(
-          accountAndDevice.first().getIdentifier(IdentityType.ACI),
-          accountAndDevice.first().getIdentifier(IdentityType.PNI),
+          accountAndDevice.first().getAccountIdentifier(),
+          accountAndDevice.first().getPhoneNumberIdentifierOptional(),
           accountAndDevice.second().getId());
     } catch (final LinkDeviceTokenAlreadyUsedException e) {
       throw new ForbiddenException();

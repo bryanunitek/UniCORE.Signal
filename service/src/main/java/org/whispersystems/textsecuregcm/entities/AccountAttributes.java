@@ -52,15 +52,17 @@ public class AccountAttributes {
   public AccountAttributes(
       final boolean fetchesMessages,
       final int registrationId,
-      final int phoneNumberIdentifierRegistrationId,
+      final Integer phoneNumberIdentifierRegistrationId,
       final byte[] name,
       final String registrationLock,
       final boolean discoverableByPhoneNumber,
-      final Set<DeviceCapability> capabilities) {
+      final Set<DeviceCapability> capabilities,
+      @Nullable final byte[] recoveryPassword) {
 
     this.deviceAttributes = new DeviceAttributes(fetchesMessages, registrationId, phoneNumberIdentifierRegistrationId, name, capabilities);
     this.registrationLock = registrationLock;
     this.discoverableByPhoneNumber = discoverableByPhoneNumber;
+    this.recoveryPassword = recoveryPassword;
   }
 
   public boolean getFetchesMessages() {
@@ -71,8 +73,8 @@ public class AccountAttributes {
     return deviceAttributes.registrationId();
   }
 
-  public int getPhoneNumberIdentityRegistrationId() {
-    return deviceAttributes.phoneNumberIdentityRegistrationId();
+  public Optional<Integer> getPhoneNumberIdentityRegistrationId() {
+    return Optional.ofNullable(deviceAttributes.phoneNumberIdentityRegistrationId());
   }
 
   public byte[] getName() {
@@ -125,6 +127,11 @@ public class AccountAttributes {
   @VisibleForTesting
   public AccountAttributes setUnrestrictedUnidentifiedAccess(final boolean unrestrictedUnidentifiedAccess) {
     this.unrestrictedUnidentifiedAccess = unrestrictedUnidentifiedAccess;
+    return this;
+  }
+
+  public AccountAttributes setDiscoverableByPhoneNumber(final boolean discoverableByPhoneNumber) {
+    this.discoverableByPhoneNumber = discoverableByPhoneNumber;
     return this;
   }
 

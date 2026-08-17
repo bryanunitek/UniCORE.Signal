@@ -16,6 +16,7 @@ import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
@@ -26,6 +27,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.whispersystems.textsecuregcm.auth.DisconnectionRequestManager;
+import org.whispersystems.textsecuregcm.entities.AccountAttributes;
+import org.whispersystems.textsecuregcm.entities.DeviceAttributes;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClient;
 import org.whispersystems.textsecuregcm.redis.RedisClusterExtension;
 import org.whispersystems.textsecuregcm.securestorage.SecureStorageClient;
@@ -48,7 +51,7 @@ public class AccountsManagerMigrateRecoveryPasswordIntegrationTest {
       DynamoDbExtensionSchema.Tables.PAGED_PQ_KEYS,
       DynamoDbExtensionSchema.Tables.REPEATED_USE_EC_SIGNED_PRE_KEYS,
       DynamoDbExtensionSchema.Tables.REPEATED_USE_KEM_SIGNED_PRE_KEYS,
-      DynamoDbExtensionSchema.Tables.REGISTRATION_RECOVERY_PASSWORDS);
+      DynamoDbExtensionSchema.Tables.PHONE_NUMBER_RECOVERY_PASSWORDS);
 
   @RegisterExtension
   static final RedisClusterExtension CACHE_CLUSTER_EXTENSION = RedisClusterExtension.builder().build();
@@ -81,6 +84,8 @@ public class AccountsManagerMigrateRecoveryPasswordIntegrationTest {
           Clock.systemUTC(),
           DYNAMO_DB_EXTENSION.getDynamoDbClient(),
           DYNAMO_DB_EXTENSION.getDynamoDbAsyncClient(),
+          new RedeemedReceiptsManager(Clock.systemUTC(), DynamoDbExtensionSchema.Tables.REDEEMED_RECEIPTS.tableName(),
+              DYNAMO_DB_EXTENSION.getDynamoDbClient()),
           DynamoDbExtensionSchema.Tables.ACCOUNTS.tableName(),
           DynamoDbExtensionSchema.Tables.NUMBERS.tableName(),
           DynamoDbExtensionSchema.Tables.PNI_ASSIGNMENTS.tableName(),
@@ -111,7 +116,7 @@ public class AccountsManagerMigrateRecoveryPasswordIntegrationTest {
       when(profilesManager.deleteAll(any(), anyBoolean())).thenReturn(CompletableFuture.completedFuture(null));
 
       final PhoneNumberRecoveryPasswords phoneNumberRecoveryPasswords =
-          new PhoneNumberRecoveryPasswords(DynamoDbExtensionSchema.Tables.REGISTRATION_RECOVERY_PASSWORDS.tableName(),
+          new PhoneNumberRecoveryPasswords(DynamoDbExtensionSchema.Tables.PHONE_NUMBER_RECOVERY_PASSWORDS.tableName(),
               Duration.ofDays(1),
               DYNAMO_DB_EXTENSION.getDynamoDbClient(),
               Clock.systemUTC());
@@ -153,7 +158,13 @@ public class AccountsManagerMigrateRecoveryPasswordIntegrationTest {
     final String phoneNumber = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164);
 
-    final Account account = AccountsHelper.createAccount(accountsManager, phoneNumber);
+    final Account account = new AccountsHelper.AccountBuilder(accountsManager)
+        .e164(phoneNumber)
+        .accountAttributes(new AccountAttributes()
+            // No recoveryPassword
+            .setDeviceAttributes(new DeviceAttributes(false, 1, 1, new byte[0], Collections.emptySet())))
+        .build();
+
     final UUID phoneNumberIdentifier = account.getPhoneNumberIdentifierOptional().orElseThrow();
     final byte[] recoveryPassword = TestRandomUtil.nextBytes(16);
 

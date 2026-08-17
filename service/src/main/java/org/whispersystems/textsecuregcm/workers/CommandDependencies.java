@@ -75,6 +75,7 @@ import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesV2;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswords;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseECSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseKEMSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.ReportMessageDynamoDb;
@@ -122,6 +123,7 @@ public record CommandDependencies(
     SubscriptionManager subscriptionManager,
     DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
     DynamoDbAsyncClient dynamoDbAsyncClient,
+    DynamoDbClient dynamoDbClient,
     PhoneNumberIdentifiers phoneNumberIdentifiers,
     DynamoDbRecoveryManager dynamoDbRecoveryManager) {
 
@@ -259,10 +261,15 @@ public record CommandDependencies(
         dynamoDbClient,
         clock);
 
+    RedeemedReceiptsManager redeemedReceiptsManager = new RedeemedReceiptsManager(clock,
+        configuration.getDynamoDbTables().getRedeemedReceipts().getTableName(),
+        dynamoDbClient);
+
     Accounts accounts = new Accounts(
         clock,
         dynamoDbClient,
         dynamoDbAsyncClient,
+        redeemedReceiptsManager,
         configuration.getDynamoDbTables().getAccounts().getTableName(),
         configuration.getDynamoDbTables().getAccounts().getPhoneNumberTableName(),
         configuration.getDynamoDbTables().getAccounts().getPhoneNumberIdentifierTableName(),
@@ -448,6 +455,7 @@ public record CommandDependencies(
         subscriptionManager,
         dynamicConfigurationManager,
         dynamoDbAsyncClient,
+        dynamoDbClient,
         phoneNumberIdentifiers,
         dynamoDbRecoveryManager
     );

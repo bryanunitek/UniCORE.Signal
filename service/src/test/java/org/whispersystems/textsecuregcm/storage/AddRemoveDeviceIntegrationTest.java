@@ -14,6 +14,7 @@ import static org.mockito.Mockito.when;
 
 import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
@@ -60,7 +61,8 @@ public class AddRemoveDeviceIntegrationTest {
       DynamoDbExtensionSchema.Tables.EC_KEYS,
       DynamoDbExtensionSchema.Tables.PAGED_PQ_KEYS,
       DynamoDbExtensionSchema.Tables.REPEATED_USE_EC_SIGNED_PRE_KEYS,
-      DynamoDbExtensionSchema.Tables.REPEATED_USE_KEM_SIGNED_PRE_KEYS);
+      DynamoDbExtensionSchema.Tables.REPEATED_USE_KEM_SIGNED_PRE_KEYS,
+      DynamoDbExtensionSchema.Tables.PHONE_NUMBER_RECOVERY_PASSWORDS);
 
   @RegisterExtension
   static final RedisClusterExtension CACHE_CLUSTER_EXTENSION = RedisClusterExtension.builder().build();
@@ -99,6 +101,8 @@ public class AddRemoveDeviceIntegrationTest {
         clock,
         DYNAMO_DB_EXTENSION.getDynamoDbClient(),
         DYNAMO_DB_EXTENSION.getDynamoDbAsyncClient(),
+        new RedeemedReceiptsManager(clock, DynamoDbExtensionSchema.Tables.REDEEMED_RECEIPTS.tableName(),
+            DYNAMO_DB_EXTENSION.getDynamoDbClient()),
         DynamoDbExtensionSchema.Tables.ACCOUNTS.tableName(),
         DynamoDbExtensionSchema.Tables.NUMBERS.tableName(),
         DynamoDbExtensionSchema.Tables.PNI_ASSIGNMENTS.tableName(),
@@ -129,7 +133,11 @@ public class AddRemoveDeviceIntegrationTest {
     when(profilesManager.deleteAll(any(), anyBoolean())).thenReturn(CompletableFuture.completedFuture(null));
 
     final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager =
-        mock(PhoneNumberRecoveryPasswordsManager.class);
+        new PhoneNumberRecoveryPasswordsManager(new PhoneNumberRecoveryPasswords(
+            DynamoDbExtensionSchema.Tables.PHONE_NUMBER_RECOVERY_PASSWORDS.tableName(),
+            Duration.ofDays(1),
+            DYNAMO_DB_EXTENSION.getDynamoDbClient(),
+            Clock.systemUTC()));
 
     PUBSUB_SERVER_EXTENSION.getRedisClient().useConnection(connection -> {
       connection.sync().flushall();
@@ -149,7 +157,7 @@ public class AddRemoveDeviceIntegrationTest {
         secureStorageClient,
         svr2Client,
         mock(DisconnectionRequestManager.class),
-        mock(PhoneNumberRecoveryPasswordsManager.class),
+        phoneNumberRecoveryPasswordsManager,
         accountLockExecutor,
         scheduledExecutorService,
         scheduledExecutorService,
@@ -187,15 +195,11 @@ public class AddRemoveDeviceIntegrationTest {
                     "password",
                     "OWT",
                     Set.of(),
-                    1,
-                    2,
+                    new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+                    Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
                     true,
                     Optional.empty(),
-                    Optional.empty(),
-                    KeysHelper.signedECPreKey(1, aciKeyPair),
-                    KeysHelper.signedECPreKey(2, pniKeyPair),
-                    KeysHelper.signedKEMPreKey(3, aciKeyPair),
-                    KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+                    Optional.empty()),
                 accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI)));
 
     assertEquals(2, updatedAccountAndDevice.first().getDevices().size());
@@ -237,15 +241,11 @@ public class AddRemoveDeviceIntegrationTest {
                     "password",
                     "OWT",
                     Set.of(),
-                    1,
-                    2,
+                    new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+                    Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
                     true,
                     Optional.empty(),
-                    Optional.empty(),
-                    KeysHelper.signedECPreKey(1, aciKeyPair),
-                    KeysHelper.signedECPreKey(2, pniKeyPair),
-                    KeysHelper.signedKEMPreKey(3, aciKeyPair),
-                    KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+                    Optional.empty()),
                 linkDeviceToken);
 
     assertEquals(2,
@@ -258,15 +258,11 @@ public class AddRemoveDeviceIntegrationTest {
                     "password",
                     "OWT",
                     Set.of(),
-                    1,
-                    2,
+                    new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+                    Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
                     true,
                     Optional.empty(),
-                    Optional.empty(),
-                    KeysHelper.signedECPreKey(1, aciKeyPair),
-                    KeysHelper.signedECPreKey(2, pniKeyPair),
-                    KeysHelper.signedKEMPreKey(3, aciKeyPair),
-                    KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+                    Optional.empty()),
                 linkDeviceToken));
 
     assertEquals(2,
@@ -292,15 +288,11 @@ public class AddRemoveDeviceIntegrationTest {
                     "password",
                     "OWT",
                     Set.of(),
-                    1,
-                    2,
+                    new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+                    Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
                     true,
                     Optional.empty(),
-                    Optional.empty(),
-                    KeysHelper.signedECPreKey(1, aciKeyPair),
-                    KeysHelper.signedECPreKey(2, pniKeyPair),
-                    KeysHelper.signedKEMPreKey(3, aciKeyPair),
-                    KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+                    Optional.empty()),
                 accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI)));
 
     final byte addedDeviceId = updatedAccountAndDevice.second().getId();
@@ -343,15 +335,11 @@ public class AddRemoveDeviceIntegrationTest {
                     "password",
                     "OWT",
                     Set.of(),
-                    1,
-                    2,
+                    new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+                    Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
                     true,
                     Optional.empty(),
-                    Optional.empty(),
-                    KeysHelper.signedECPreKey(1, aciKeyPair),
-                    KeysHelper.signedECPreKey(2, pniKeyPair),
-                    KeysHelper.signedKEMPreKey(3, aciKeyPair),
-                    KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+                    Optional.empty()),
                 accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI)));
 
     final byte addedDeviceId = updatedAccountAndDevice.second().getId();
@@ -413,15 +401,11 @@ public class AddRemoveDeviceIntegrationTest {
                     "password",
                     "OWT",
                     Set.of(),
-                    1,
-                    2,
+                    new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+                    Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
                     true,
                     Optional.empty(),
-                    Optional.empty(),
-                    KeysHelper.signedECPreKey(1, aciKeyPair),
-                    KeysHelper.signedECPreKey(2, pniKeyPair),
-                    KeysHelper.signedKEMPreKey(3, aciKeyPair),
-                    KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+                    Optional.empty()),
                 linkDeviceToken);
 
     final Optional<DeviceInfo> maybeDeviceInfo = activeFuture.join();
@@ -454,15 +438,11 @@ public class AddRemoveDeviceIntegrationTest {
                     "password",
                     "OWT",
                     Set.of(),
-                    1,
-                    2,
+                    new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+                    Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
                     true,
                     Optional.empty(),
-                    Optional.empty(),
-                    KeysHelper.signedECPreKey(1, aciKeyPair),
-                    KeysHelper.signedECPreKey(2, pniKeyPair),
-                    KeysHelper.signedKEMPreKey(3, aciKeyPair),
-                    KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+                    Optional.empty()),
                 linkDeviceToken);
 
     when(messagesManager.getEarliestUndeliveredTimestampForDevice(account.getAccountIdentifier(), account.getPrimaryDevice()))
@@ -523,15 +503,11 @@ public class AddRemoveDeviceIntegrationTest {
             "password",
             "OWT",
             Set.of(),
-            1,
-            2,
+            new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+            Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
             true,
             Optional.empty(),
-            Optional.empty(),
-            KeysHelper.signedECPreKey(1, aciKeyPair),
-            KeysHelper.signedECPreKey(2, pniKeyPair),
-            KeysHelper.signedKEMPreKey(3, aciKeyPair),
-            KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+            Optional.empty()),
         linkDeviceToken);
 
     when(messagesManager.getEarliestUndeliveredTimestampForDevice(account.getAccountIdentifier(), account.getPrimaryDevice()))
@@ -566,15 +542,11 @@ public class AddRemoveDeviceIntegrationTest {
             "password",
             "OWT",
             Set.of(),
-            1,
-            2,
+            new DeviceIdentityInfo(1, KeysHelper.signedECPreKey(1, aciKeyPair), KeysHelper.signedKEMPreKey(3, aciKeyPair)),
+            Optional.of(new DeviceIdentityInfo(2, KeysHelper.signedECPreKey(2, pniKeyPair), KeysHelper.signedKEMPreKey(4, pniKeyPair))),
             true,
             Optional.empty(),
-            Optional.empty(),
-            KeysHelper.signedECPreKey(1, aciKeyPair),
-            KeysHelper.signedECPreKey(2, pniKeyPair),
-            KeysHelper.signedKEMPreKey(3, aciKeyPair),
-            KeysHelper.signedKEMPreKey(4, pniKeyPair)),
+            Optional.empty()),
         linkDeviceToken);
 
     when(messagesManager.getEarliestUndeliveredTimestampForDevice(account.getAccountIdentifier(), account.getPrimaryDevice()))

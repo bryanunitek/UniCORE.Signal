@@ -175,6 +175,7 @@ import org.whispersystems.textsecuregcm.grpc.GrpcAllowListInterceptor;
 import org.whispersystems.textsecuregcm.grpc.KeyTransparencyGrpcService;
 import org.whispersystems.textsecuregcm.grpc.KeysAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.KeysGrpcService;
+import org.whispersystems.textsecuregcm.grpc.LoginPurchaseGrpcService;
 import org.whispersystems.textsecuregcm.grpc.MessageDispatcher;
 import org.whispersystems.textsecuregcm.grpc.MessagesAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.MessagesGrpcService;
@@ -542,10 +543,15 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         .allowCoreThreadTimeOut(true)
         .workQueue(messageDeletionQueue).build();
 
+    RedeemedReceiptsManager redeemedReceiptsManager = new RedeemedReceiptsManager(clock,
+        config.getDynamoDbTables().getRedeemedReceipts().getTableName(),
+        dynamoDbClient);
+
     Accounts accounts = new Accounts(
         clock,
         dynamoDbClient,
         dynamoDbAsyncClient,
+        redeemedReceiptsManager,
         config.getDynamoDbTables().getAccounts().getTableName(),
         config.getDynamoDbTables().getAccounts().getPhoneNumberTableName(),
         config.getDynamoDbTables().getAccounts().getPhoneNumberIdentifierTableName(),
@@ -817,10 +823,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         config.getDynamoDbTables().getOnetimeDonations().getTableName(), config.getDynamoDbTables().getOnetimeDonations().getExpiration(), dynamoDbClient);
     DonationPermits donationPermits = new DonationPermits(
         config.getDynamoDbTables().getDonationPermits().getTableName(), config.getDynamoDbTables().getDonationPermits().getExpiration(), dynamoDbClient);
-    RedeemedReceiptsManager redeemedReceiptsManager = new RedeemedReceiptsManager(clock,
-        config.getDynamoDbTables().getRedeemedReceipts().getTableName(),
-        dynamoDbClient,
-        config.getDynamoDbTables().getRedeemedReceipts().getExpiration());
     Subscriptions subscriptions = new Subscriptions(
         config.getDynamoDbTables().getSubscriptions().getTableName(), dynamoDbClient);
     MessageDeliveryLoopMonitor messageDeliveryLoopMonitor =
@@ -1141,6 +1143,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             new CallQualitySurveyGrpcService(callQualitySurveyManager, rateLimiters),
             new KeysAnonymousGrpcService(accountsManager, keysManager, groupZkSecretParams, Clock.systemUTC()),
             new KeyTransparencyGrpcService(rateLimiters, keyTransparencyServiceClient),
+            new LoginPurchaseGrpcService(loginPurchaseManager, dynamicConfigurationManager),
             new ProfileAnonymousGrpcService(accountsManager, profilesManager, profileBadgeConverter, profileCdnPolicyGenerator, chatGenericZkSecretParams, groupZkSecretParams, rateLimiters, clock),
             new MessagesAnonymousGrpcService(accountsManager, rateLimiters, messageSender, groupSendTokenUtil, messageByteLimitCardinalityEstimator, spamChecker, Clock.systemUTC()),
             new BackupsAnonymousGrpcService(backupManager, backupMetrics, config.getAttachments().maxAttachmentUploadSizeInBytes(), config.getAttachments().maxMessageBackupUploadSizeInBytes()),
@@ -1283,7 +1286,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             groupZkSecretParams, zkProfileOperations, batchIdentityCheckExecutor),
         new ProvisioningController(rateLimiters, provisioningManager),
         new RegistrationController(accountsManager, phoneVerificationTokenManager, registrationLockVerificationManager,
-            rateLimiters, registrationFraudChecker),
+            rateLimiters, registrationFraudChecker, ReceiptCredentialPresentation::new, zkReceiptOperations, clock, dynamicConfigurationManager),
         new RemoteConfigController(remoteConfigsManager),
         new SecureStorageController(storageCredentialsGenerator),
         new SecureValueRecovery2Controller(svr2CredentialsGenerator, accountsManager),
