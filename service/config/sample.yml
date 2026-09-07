@@ -315,8 +315,11 @@ storageService:
       AAAAAAAAAAAAAAAAAAAA
       -----END CERTIFICATE-----
 
+callingZkConfigPreV101:
+  serverSecret: secret://callingZkConfigPreV101.serverSecret
+
 callingZkConfig:
-  serverSecret: secret://callingZkConfig.serverSecret
+  serverSecret: secret://callingZkConfigV101.serverSecret
 
 chatZkConfig:
   serverSecret: secret://chatZkConfig.serverSecret
@@ -384,6 +387,7 @@ subscription: # configuration for Stripe subscriptions
 
 loginPurchase:
   playProductId: login_example
+  playOptionId: login_option_example
   appStoreProductId: login_example
 
 oneTimeDonations:

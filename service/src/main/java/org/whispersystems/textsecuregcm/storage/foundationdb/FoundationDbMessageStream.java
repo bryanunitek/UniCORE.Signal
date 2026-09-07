@@ -206,7 +206,7 @@ public class FoundationDbMessageStream implements MessageStream {
   /// @return a [KeySelector] for the first key greater than the current greatest key in the device queue.
   private CompletableFuture<Optional<KeySelector>> getEndOfQueueKeyExclusive(final Database database) {
     return FoundationDbUtil.safeRunAsync(database, transaction ->
-            transaction.getRange(deviceQueueSubspace.range(), 1, true, StreamingMode.EXACT).asList())
+            transaction.getRange(deviceQueueSubspace.range(), 1, true, StreamingMode.EXACT).asList(), FoundationDbUtil.Context.GET_END_OF_QUEUE)
         .<Optional<KeySelector>>thenApply(items -> {
           if (items.isEmpty()) {
             return Optional.empty();
@@ -226,5 +226,18 @@ public class FoundationDbMessageStream implements MessageStream {
     messageAcknowledgedCounter.increment();
 
     return foundationDbMessageStore.delete(aciServiceIdentifier, deviceId, messageGuid);
+  }
+
+  public CompletableFuture<Optional<MessageStreamEntry.Envelope>> acknowledgeAndGetMessage(final UUID messageGuid) {
+    messageAcknowledgedCounter.increment();
+
+    return foundationDbMessageStore.deleteAndGet(aciServiceIdentifier, deviceId, messageGuid)
+        .thenApply(foundationDbMessageStreamEntry -> foundationDbMessageStreamEntry.map(m -> {
+          final MessageStreamEntry messageStreamEntry = m.toMessageStreamEntry(messageGuidCodec);
+          if (!(messageStreamEntry instanceof MessageStreamEntry.Envelope)) {
+            throw new AssertionError("Expected MessageStreamEntry.Envelope, got " + messageStreamEntry);
+          }
+          return (MessageStreamEntry.Envelope) messageStreamEntry;
+        }));
   }
 }

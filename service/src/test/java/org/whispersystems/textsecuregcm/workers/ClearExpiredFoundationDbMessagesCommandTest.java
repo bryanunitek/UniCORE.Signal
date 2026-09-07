@@ -22,7 +22,6 @@ import net.sourceforge.argparse4j.inf.Namespace;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
@@ -45,7 +44,8 @@ class ClearExpiredFoundationDbMessagesCommandTest {
 
       super(clock);
 
-      this.commandDependencies = new CommandDependencies(null, null, null, null, messagesManager, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+      this.commandDependencies = new CommandDependencies(null, null, null, null, messagesManager, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null,
+          null);
       this.dryRun = dryRun;
     }
 
@@ -92,7 +92,7 @@ class ClearExpiredFoundationDbMessagesCommandTest {
       when(linkedDevice.getId()).thenReturn(linkedDeviceId);
 
       final Account account = mock(Account.class);
-      when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+      when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
       when(account.getDevices()).thenReturn(i % 2 == 0 ? List.of(primaryDevice) : List.of(primaryDevice, linkedDevice));
 
       accounts.add(account);

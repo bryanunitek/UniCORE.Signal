@@ -105,7 +105,7 @@ class AccountsManagerConcurrentModificationIntegrationTest {
       doAnswer(invocation -> {
         final ThrowingSupplier<?, ?> task = invocation.getArgument(1);
         return task.get();
-      }).when(accountLockManager).withLock(anySet(), any(), any());
+      }).when(accountLockManager).withLock(anySet(), any());
 
       final PhoneNumberIdentifiers phoneNumberIdentifiers = mock(PhoneNumberIdentifiers.class);
       when(phoneNumberIdentifiers.getPhoneNumberIdentifier(anyString()))
@@ -132,11 +132,11 @@ class AccountsManagerConcurrentModificationIntegrationTest {
           mock(SecureValueRecoveryClient.class),
           mock(DisconnectionRequestManager.class),
           phoneNumberRecoveryPasswordsManager,
-          mock(Executor.class),
           mock(ScheduledExecutorService.class),
           mock(ScheduledExecutorService.class),
           mock(Clock.class),
-          "link-device-secret".getBytes(StandardCharsets.UTF_8)
+          "link-device-secret".getBytes(StandardCharsets.UTF_8),
+          AccountsManager.TOTP.getTimeStep().dividedBy(2)
       );
     }
   }
@@ -222,7 +222,7 @@ class AccountsManagerConcurrentModificationIntegrationTest {
         () -> assertArrayEquals(currentProfileVersion, account.getCurrentProfileVersion().orElseThrow()),
         () -> assertEquals(identityKey, account.getAccountIdentityKey()),
         () -> assertArrayEquals(unidentifiedAccessKey, account.getUnidentifiedAccessKey().orElseThrow()),
-        () -> assertTrue(account.getPhoneNumberIdentifierOptional().isEmpty() || account.getRegistrationLock().verify(clientRegistrationLock)),
+        () -> assertTrue(account.getPhoneNumberIdentifier().isEmpty() || account.getRegistrationLock().verify(clientRegistrationLock)),
         () -> assertTrue(account.getAccountRecoveryPassword().orElseThrow().verify(accountRecoveryPassword)),
         () -> assertEquals(unrestrictedUnidentifiedAccess, account.isUnrestrictedUnidentifiedAccess())
     );

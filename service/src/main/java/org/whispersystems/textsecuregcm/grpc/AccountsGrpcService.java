@@ -14,10 +14,12 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -28,6 +30,8 @@ import org.signal.chat.account.ClearRegistrationLockRequest;
 import org.signal.chat.account.ClearRegistrationLockResponse;
 import org.signal.chat.account.ConfigureUnidentifiedAccessRequest;
 import org.signal.chat.account.ConfigureUnidentifiedAccessResponse;
+import org.signal.chat.account.ConfirmTotpKeyRequest;
+import org.signal.chat.account.ConfirmTotpKeyResponse;
 import org.signal.chat.account.ConfirmUsernameHashRequest;
 import org.signal.chat.account.ConfirmUsernameHashResponse;
 import org.signal.chat.account.DeleteAccountRequest;
@@ -37,6 +41,8 @@ import org.signal.chat.account.DeleteUsernameHashResponse;
 import org.signal.chat.account.DeleteUsernameLinkRequest;
 import org.signal.chat.account.DeleteUsernameLinkResponse;
 import org.signal.chat.account.ExternalServiceCredentials;
+import org.signal.chat.account.GenerateTotpKeyRequest;
+import org.signal.chat.account.GenerateTotpKeyResponse;
 import org.signal.chat.account.GetAccountDataReportRequest;
 import org.signal.chat.account.GetAccountDataReportResponse;
 import org.signal.chat.account.GetAccountIdentityRequest;
@@ -45,7 +51,12 @@ import org.signal.chat.account.GetCapabilitiesRequest;
 import org.signal.chat.account.GetCapabilitiesResponse;
 import org.signal.chat.account.GetEntitlementsRequest;
 import org.signal.chat.account.GetEntitlementsResponse;
+import org.signal.chat.account.ListMfaKeysRequest;
+import org.signal.chat.account.ListMfaKeysResponse;
+import org.signal.chat.account.ListMfaKeysResponse.MfaKeyMetadata.MfaKeyType;
 import org.signal.chat.account.RegistrationLockFailure;
+import org.signal.chat.account.RemoveMfaKeyRequest;
+import org.signal.chat.account.RemoveMfaKeyResponse;
 import org.signal.chat.account.ReserveUsernameHashRequest;
 import org.signal.chat.account.ReserveUsernameHashResponse;
 import org.signal.chat.account.SetDiscoverableByPhoneNumberRequest;
@@ -54,15 +65,19 @@ import org.signal.chat.account.SetRegistrationLockRequest;
 import org.signal.chat.account.SetRegistrationLockResponse;
 import org.signal.chat.account.SetRegistrationRecoveryPasswordRequest;
 import org.signal.chat.account.SetRegistrationRecoveryPasswordResponse;
+import org.signal.chat.account.SetMfaKeyMetadataRequest;
+import org.signal.chat.account.SetMfaKeyMetadataResponse;
 import org.signal.chat.account.SetUsernameLinkRequest;
 import org.signal.chat.account.SetUsernameLinkResponse;
 import org.signal.chat.account.SetZkCredentialKeyRequest;
 import org.signal.chat.account.SetZkCredentialKeyResponse;
 import org.signal.chat.account.SimpleAccountsGrpc;
 import org.signal.chat.account.StaleDevices;
+import org.signal.chat.account.TotpParameters;
 import org.signal.chat.account.UsernameNotAvailable;
 import org.signal.chat.common.AccountIdentifiers;
 import org.signal.chat.errors.FailedPrecondition;
+import org.signal.chat.errors.NotFound;
 import org.signal.chat.messages.SendMessageType;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.protocol.InvalidKeyException;
@@ -90,16 +105,23 @@ import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.push.MessageTooLargeException;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
+import org.whispersystems.textsecuregcm.storage.AnnotatedMfaKey;
+import org.whispersystems.textsecuregcm.storage.AnnotatedTotpKey;
 import org.whispersystems.textsecuregcm.storage.ChangeNumberManager;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.TooManyMfaKeysException;
+import org.whispersystems.textsecuregcm.storage.TooManyTotpKeysException;
+import org.whispersystems.textsecuregcm.storage.TotpKey;
 import org.whispersystems.textsecuregcm.storage.UsernameHashNotAvailableException;
 import org.whispersystems.textsecuregcm.storage.UsernameReservationNotFoundException;
+import org.whispersystems.textsecuregcm.util.NoStackTraceRuntimeException;
 import org.whispersystems.textsecuregcm.util.RegistrationIdValidator;
 import org.whispersystems.textsecuregcm.util.SystemMapper;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.textsecuregcm.util.UsernameHashZkProofVerifier;
 import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
+import javax.annotation.Nullable;
 
 public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
 
@@ -111,6 +133,9 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
   private final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager;
   private final Clock clock;
   private final ChangeNumberManager changeNumberManager;
+
+  private static class MfaKeyNotFoundException extends NoStackTraceRuntimeException {
+  }
 
   public AccountsGrpcService(final AccountsManager accountsManager,
       final RateLimiters rateLimiters,
@@ -317,7 +342,7 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
   public SetDiscoverableByPhoneNumberResponse setDiscoverableByPhoneNumber(final SetDiscoverableByPhoneNumberRequest request) {
     accountsManager.update(AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier(),
         account -> {
-          if (account.getNumberOptional().isEmpty()) {
+          if (account.getNumber().isEmpty()) {
             throw GrpcExceptions.invalidArguments("account does not have a phone number");
           }
 
@@ -332,7 +357,7 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
     final Account account = getAuthenticatedAccount();
     final byte[] recoveryPassword = request.getRegistrationRecoveryPassword().toByteArray();
 
-    final Collection<TransactWriteItem> additionalWriteItems = account.getPhoneNumberIdentifierOptional()
+    final Collection<TransactWriteItem> additionalWriteItems = account.getPhoneNumberIdentifier()
         .map(phoneNumberIdentifier ->
             List.of(phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForStorePassword(phoneNumberIdentifier, recoveryPassword)))
         .orElseGet(Collections::emptyList);
@@ -505,7 +530,7 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
     final AccountDataReportResponse report = new AccountDataReportResponse(UUID.randomUUID(), clock.instant(),
         new AccountDataReportResponse.AccountAndDevicesDataReport(
             new AccountDataReportResponse.AccountDataReport(
-                account.getNumberOptional(),
+                account.getNumber(),
                 account.getBadges().stream().map(AccountDataReportResponse.BadgeDataReport::new).toList(),
                 account.isUnrestrictedUnidentifiedAccess(),
                 account.isDiscoverableByPhoneNumber()),
@@ -534,15 +559,139 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
     return GetCapabilitiesResponse.newBuilder().setCapabilities(builder.build()).build();
   }
 
+  @Override
+  public GenerateTotpKeyResponse generateTotpKey(final GenerateTotpKeyRequest request) {
+    try {
+      final TotpKey pendingTotpKey =
+          accountsManager.generatePendingTotpKey(AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier());
+
+      return GenerateTotpKeyResponse.newBuilder()
+          .setKeyGenerated(GenerateTotpKeyResponse.KeyGenerated.newBuilder()
+              .setKey(ByteString.copyFrom(pendingTotpKey.getEncoded()))
+              .setTotpParameters(toGrpcTotpParameters(pendingTotpKey.totpParameters()))
+              .build())
+          .build();
+    } catch (final TooManyTotpKeysException _) {
+      return GenerateTotpKeyResponse.newBuilder()
+          .setTooManyTotpKeys(FailedPrecondition.getDefaultInstance())
+          .build();
+    } catch (final TooManyMfaKeysException _) {
+      return GenerateTotpKeyResponse.newBuilder()
+          .setTooManyMfaKeys(FailedPrecondition.getDefaultInstance())
+          .build();
+    }
+  }
+
+  @Override
+  public ConfirmTotpKeyResponse confirmTotpKey(final ConfirmTotpKeyRequest request) {
+    try {
+      final Optional<Byte> maybeConfirmedTotpKeyId =
+        accountsManager.confirmPendingTotpKey(
+              AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier(),
+              request.getOneTimePassword(),
+              clock.instant(),
+              request.getMetadataCiphertext().toByteArray());
+
+      return maybeConfirmedTotpKeyId.map(keyId -> ConfirmTotpKeyResponse.newBuilder()
+          .setKeyConfirmed(ConfirmTotpKeyResponse.KeyConfirmed.newBuilder()
+              .setKeyId(keyId)
+              .build())
+          .build()).orElseGet(() -> ConfirmTotpKeyResponse.newBuilder()
+              .setOneTimePasswordNotVerified(FailedPrecondition.getDefaultInstance())
+              .build());
+    } catch (TooManyMfaKeysException _) {
+      return ConfirmTotpKeyResponse.newBuilder()
+          .setTooManyMfaKeys(FailedPrecondition.getDefaultInstance())
+          .build();
+    }
+  }
+
+  @Override
+  public ListMfaKeysResponse listMfaKeys(final ListMfaKeysRequest request) {
+    final ListMfaKeysResponse.Builder responseBuilder = ListMfaKeysResponse.newBuilder();
+
+    getAuthenticatedAccount().getMfaKeys().forEach((keyId, mfaKey) -> {
+      assert mfaKey.metadataCiphertext() != null;
+
+      responseBuilder.putKeys(
+          keyId,
+          ListMfaKeysResponse.MfaKeyMetadata.newBuilder()
+              .setMetadataCiphertext(ByteString.copyFrom(mfaKey.metadataCiphertext()))
+              .setType(switch (mfaKey) {
+                  case AnnotatedTotpKey _ -> MfaKeyType.MFA_KEY_TYPE_TOTP;
+              }).build());
+    });
+
+    return responseBuilder.build();
+  }
+
+  @Override
+  public SetMfaKeyMetadataResponse setMfaKeyMetadata(final SetMfaKeyMetadataRequest request) {
+    final byte keyId = validateMfaKeyId(request.getKeyId());
+
+    try {
+      accountsManager.update(AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier(), account -> {
+        final Map<Byte, AnnotatedMfaKey> mfaKeys = new HashMap<>(account.getMfaKeys());
+        @Nullable final AnnotatedMfaKey existingKey = mfaKeys.get(keyId);
+
+        if (existingKey == null) {
+          throw new MfaKeyNotFoundException();
+        }
+
+        mfaKeys.put(keyId, existingKey.withMetadataCiphertext(request.getMetadataCiphertext().toByteArray()));
+
+        account.setMfaKeys(mfaKeys);
+      });
+
+      return SetMfaKeyMetadataResponse.newBuilder()
+          .setMetadataUpdated(SetMfaKeyMetadataResponse.MetadataUpdated.getDefaultInstance())
+          .build();
+    } catch (final MfaKeyNotFoundException _) {
+      return SetMfaKeyMetadataResponse.newBuilder()
+          .setKeyNotFound(NotFound.getDefaultInstance())
+          .build();
+    }
+  }
+
+  @Override
+  public RemoveMfaKeyResponse removeMfaKey(final RemoveMfaKeyRequest request) {
+    final byte keyId = validateMfaKeyId(request.getKeyId());
+
+    accountsManager.update(AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier(), account -> {
+      final Map<Byte, AnnotatedMfaKey> mfaKeys = new HashMap<>(account.getMfaKeys());
+      mfaKeys.remove(keyId);
+
+      account.setMfaKeys(mfaKeys);
+    });
+
+    return RemoveMfaKeyResponse.getDefaultInstance();
+  }
+
+  private byte validateMfaKeyId(final int keyId) {
+    if (keyId < 0 || keyId > Account.MAX_MFA_KEY_ID) {
+      throw GrpcExceptions.invalidArguments("MFA key ID out of range");
+    }
+
+    return (byte) keyId;
+  }
+
+  private static TotpParameters toGrpcTotpParameters(final org.whispersystems.textsecuregcm.storage.TotpParameters totpParameters) {
+    return TotpParameters.newBuilder()
+        .setAlgorithm(totpParameters.algorithm())
+        .setPasswordLength(totpParameters.passwordLength())
+        .setTimeStepSeconds(Math.toIntExact(totpParameters.timeStep().toSeconds()))
+        .build();
+  }
+
   private static AccountIdentifiers buildAccountIdentifiers(final Account account) {
     final AccountIdentifiers.Builder accountIdentifiersBuilder = AccountIdentifiers.newBuilder()
         .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(account.getAccountIdentifier())));
 
-    account.getPhoneNumberIdentifierOptional()
+    account.getPhoneNumberIdentifier()
         .map(phoneNumberIdentifier -> GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new PniServiceIdentifier(phoneNumberIdentifier)))
         .ifPresent(accountIdentifiersBuilder::addServiceIdentifiers);
 
-    account.getNumberOptional().ifPresent(accountIdentifiersBuilder::setE164);
+    account.getNumber().ifPresent(accountIdentifiersBuilder::setE164);
 
     account.getUsernameHash().ifPresent(usernameHash ->
         accountIdentifiersBuilder.setUsernameHash(ByteString.copyFrom(usernameHash)));
@@ -584,7 +733,7 @@ public class AccountsGrpcService extends SimpleAccountsGrpc.AccountsImplBase {
   }
 
   private static StatusRuntimeException invalidSignatureException(final String fieldName) {
-    return  GrpcExceptions.fieldViolation(fieldName, "pre-key signature did not match PNI identity key");
+    return GrpcExceptions.fieldViolation(fieldName, "pre-key signature did not match PNI identity key");
   }
 
   private static <T, U> Map<Byte, U> transformDeviceMap(final Map<Integer, T> byDeviceId, final Function<T, U> f) {

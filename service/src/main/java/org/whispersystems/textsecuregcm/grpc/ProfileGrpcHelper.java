@@ -16,11 +16,11 @@ import java.util.HexFormat;
 import java.util.Optional;
 import org.bouncycastle.crypto.digests.TupleHash;
 import org.signal.chat.common.S3UploadForm;
+import org.signal.chat.profile.AccountInfo;
 import org.signal.chat.profile.GetExpiringProfileKeyCredentialResult;
+import org.signal.chat.profile.LegacyProfileResult;
 import org.signal.chat.profile.ProfileResult;
 import org.signal.chat.profile.ProfileResultOrBuilder;
-import org.signal.chat.profile.LegacyProfileResult;
-import org.signal.chat.profile.AccountInfo;
 import org.signal.libsignal.protocol.ServiceId;
 import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.VerificationFailedException;
@@ -30,7 +30,6 @@ import org.signal.libsignal.zkgroup.profiles.ProfileKeyCredentialRequest;
 import org.signal.libsignal.zkgroup.profiles.ServerZkProfileOperations;
 import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessChecksum;
 import org.whispersystems.textsecuregcm.badges.ProfileBadgeConverter;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
@@ -60,12 +59,20 @@ public class ProfileGrpcHelper {
     final VersionedProfileV1 v1Profile = maybeV1Profile.get();
 
     final LegacyProfileResult.Builder builder = LegacyProfileResult.newBuilder()
-        .setAccountInfo(buildAccountInfo(profileBadgeConverter, account))
-        .setName(ByteString.copyFrom(v1Profile.name()))
-        .setAbout(ByteString.copyFrom(v1Profile.about()))
-        .setAboutEmoji(ByteString.copyFrom(v1Profile.aboutEmoji()))
-        .setPhoneNumberSharing(ByteString.copyFrom(v1Profile.phoneNumberSharing()));
+        .setAccountInfo(buildAccountInfo(profileBadgeConverter, account));
 
+    if (v1Profile.name() != null) {
+      builder.setName(ByteString.copyFrom(v1Profile.name()));
+    }
+    if (v1Profile.about() != null) {
+      builder.setAbout(ByteString.copyFrom(v1Profile.about()));
+    }
+    if (v1Profile.aboutEmoji() != null) {
+      builder.setAboutEmoji(ByteString.copyFrom(v1Profile.aboutEmoji()));
+    }
+    if (v1Profile.phoneNumberSharing() != null) {
+      builder.setPhoneNumberSharing(ByteString.copyFrom(v1Profile.phoneNumberSharing()));
+    }
     if (v1Profile.avatar() != null) {
       builder.setAvatar(v1Profile.avatar());
     }
@@ -110,7 +117,7 @@ public class ProfileGrpcHelper {
       final Account account) {
     final AccountInfo.Builder accountInfoBuilder = AccountInfo.newBuilder()
         .addAllBadgeIds(profileBadgeConverter.visibleBadgeIds(account.getBadges()))
-        .setIdentityKey(ByteString.copyFrom(account.getIdentityKey(IdentityType.ACI).serialize()))
+        .setIdentityKey(ByteString.copyFrom(account.getAccountIdentityKey().serialize()))
         .setUnrestrictedUnidentifiedAccess(account.isUnrestrictedUnidentifiedAccess());
 
     account.getUnidentifiedAccessKey()

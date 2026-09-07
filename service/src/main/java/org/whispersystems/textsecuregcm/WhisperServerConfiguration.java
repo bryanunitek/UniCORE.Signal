@@ -63,6 +63,7 @@ import org.whispersystems.textsecuregcm.configuration.SpamFilterConfiguration;
 import org.whispersystems.textsecuregcm.configuration.StripeConfiguration;
 import org.whispersystems.textsecuregcm.configuration.SubscriptionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TlsKeyStoreConfiguration;
+import org.whispersystems.textsecuregcm.configuration.TotpConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TurnConfiguration;
 import org.whispersystems.textsecuregcm.configuration.UnidentifiedDeliveryConfiguration;
 import org.whispersystems.textsecuregcm.configuration.VirtualThreadConfiguration;
@@ -230,6 +231,11 @@ public class WhisperServerConfiguration extends Configuration {
   @Valid
   @NotNull
   @JsonProperty
+  private GenericZkConfig callingZkConfigPreV101;
+
+  @Valid
+  @NotNull
+  @JsonProperty
   private GenericZkConfig callingZkConfig;
 
   @Valid
@@ -379,6 +385,11 @@ public class WhisperServerConfiguration extends Configuration {
   @JsonProperty
   private FoundationDbMessagesConfiguration foundationDbMessages;
 
+  @Valid
+  @NotNull
+  @JsonProperty
+  private TotpConfiguration registrationTotp = TotpConfiguration.DEFAULT;
+
   public TlsKeyStoreConfiguration getTlsKeyStoreConfiguration() {
     return tlsKeyStore;
   }
@@ -509,6 +520,11 @@ public class WhisperServerConfiguration extends Configuration {
   }
 
   /// ZK secret shared with Calling Service
+  public GenericZkConfig getCallingZkConfigPreV101() {
+    return callingZkConfigPreV101;
+  }
+
+  /// ZK secret shared with Calling Service
   public GenericZkConfig getCallingZkConfig() {
     return callingZkConfig;
   }
@@ -632,5 +648,9 @@ public class WhisperServerConfiguration extends Configuration {
 
   public FoundationDbMessagesConfiguration getFoundationDbMessagesConfiguration() {
     return foundationDbMessages;
+  }
+
+  public TotpConfiguration getRegistrationTotpConfiguration() {
+    return registrationTotp;
   }
 }

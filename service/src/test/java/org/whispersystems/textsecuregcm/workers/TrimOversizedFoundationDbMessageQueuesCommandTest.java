@@ -20,7 +20,6 @@ import net.sourceforge.argparse4j.inf.Namespace;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
@@ -40,7 +39,7 @@ public class TrimOversizedFoundationDbMessageQueuesCommandTest {
         final boolean dryRun) {
 
       super();
-      this.commandDependencies = new CommandDependencies(null, null, null, null, messagesManager, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+      this.commandDependencies = new CommandDependencies(null, null, null, null, messagesManager, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
       this.dryRun = dryRun;
     }
 
@@ -72,7 +71,7 @@ public class TrimOversizedFoundationDbMessageQueuesCommandTest {
 
     final UUID uuid = UUID.randomUUID();
     final Account account = mock(Account.class);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(uuid);
+    when(account.getAccountIdentifier()).thenReturn(uuid);
     when(account.getDevices()).thenReturn(List.of(device));
 
     when(messagesManager.trimQueue(any(), any(), anyLong(), anyLong(), anyLong(), anyBoolean())).thenReturn(Mono.empty());

@@ -140,9 +140,8 @@ public class SubscriptionsGrpcService extends SimpleSubscriptionsGrpc.Subscripti
 
       subscriptionManager.updateSubscriber(subscriberCredentials, creationPermitted);
       return UpdateSubscriberResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
-    } catch (final SubscriptionForbiddenException e) {
-      return UpdateSubscriberResponse.newBuilder().setSubscriberIdMismatch(
-          FailedUnidentifiedAuthorization.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
+    } catch (final SubscriptionForbiddenException _) {
+      throw GrpcExceptions.invalidArguments("subscriber-ids must be randomly generated");
     } catch (SubscriberIdCreationNotPermittedException _) {
       if (request.getDonationPermit().isEmpty()) {
         throw GrpcExceptions.invalidArguments("donation permit is required to create a subscriber ID");
@@ -206,11 +205,8 @@ public class SubscriptionsGrpcService extends SimpleSubscriptionsGrpc.Subscripti
       return CreatePaymentMethodResponse.newBuilder().setResult(
           CreatePaymentMethodResponse.CreatePaymentMethodResult.newBuilder().setClientSecret(token)
               .setPaymentProvider(customerAwareSubscriptionPaymentProcessor.getProvider().toProto()).build()).build();
-    } catch (final SubscriptionNotFoundException e) {
+    } catch (final SubscriptionNotFoundException | SubscriptionForbiddenException _) {
       return CreatePaymentMethodResponse.newBuilder().setSubscriberNotFound(NotFound.newBuilder()).build();
-    } catch (final SubscriptionForbiddenException e) {
-      return CreatePaymentMethodResponse.newBuilder().setSubscriberIdMismatch(
-          FailedUnidentifiedAuthorization.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
     } catch (final SubscriptionProcessorConflictException e) {
       return CreatePaymentMethodResponse.newBuilder().setSubscriptionProcessorConflict(
           FailedPrecondition.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
@@ -231,12 +227,9 @@ public class SubscriptionsGrpcService extends SimpleSubscriptionsGrpc.Subscripti
       return CreatePayPalPaymentMethodResponse.newBuilder().setResult(
           CreatePayPalPaymentMethodResponse.CreatePayPalPaymentMethodResult.newBuilder()
               .setApprovalUrl(details.approvalUrl()).setToken(details.billingAgreementToken()).build()).build();
-    } catch (final SubscriptionNotFoundException e) {
+    } catch (final SubscriptionNotFoundException | SubscriptionForbiddenException _) {
       return CreatePayPalPaymentMethodResponse.newBuilder().setSubscriberNotFound(NotFound.newBuilder().build())
           .build();
-    } catch (final SubscriptionForbiddenException e) {
-      return CreatePayPalPaymentMethodResponse.newBuilder().setSubscriberIdMismatch(
-          FailedUnidentifiedAuthorization.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
     } catch (final SubscriptionProcessorConflictException e) {
       return CreatePayPalPaymentMethodResponse.newBuilder().setSubscriptionProcessorConflict(
           FailedPrecondition.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
@@ -267,22 +260,20 @@ public class SubscriptionsGrpcService extends SimpleSubscriptionsGrpc.Subscripti
       };
 
       final Subscriptions.Record record = subscriptionManager.getSubscriber(subscriberCredentials);
-      return record.getProcessorCustomer().map(
-          processorCustomer -> setDefaultPaymentMethodForCustomer(manager, processorCustomer, paymentMethodId,
-              record.subscriptionId)).orElseGet(() ->
+      return record.getProcessorCustomer()
+          .map(processorCustomer ->
+              setDefaultPaymentMethodForCustomer(manager, processorCustomer, paymentMethodId, record.subscriptionId))
           // a missing customer ID indicates the client made requests out of order,
           // and needs to call create_payment_method to create a customer for the given payment method
-          SetDefaultPaymentMethodResponse.newBuilder().setPaymentMethodNotSetUp(FailedPrecondition.newBuilder().build())
+          .orElseGet(() -> SetDefaultPaymentMethodResponse.newBuilder()
+              .setPaymentMethodNotSetUp(FailedPrecondition.newBuilder().build())
               .build());
-    } catch (final SubscriptionNotFoundException e) {
+    } catch (final SubscriptionNotFoundException | SubscriptionForbiddenException _) {
       return SetDefaultPaymentMethodResponse.newBuilder().setSubscriberNotFound(NotFound.newBuilder().build()).build();
-    } catch (final SubscriptionForbiddenException e) {
-      return SetDefaultPaymentMethodResponse.newBuilder().setSubscriberIdMismatch(
-          FailedUnidentifiedAuthorization.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
-    } catch (final SubscriptionProcessorConflictException e) {
+    } catch (final SubscriptionProcessorConflictException _) {
       return SetDefaultPaymentMethodResponse.newBuilder()
-          .setSubscriptionProcessorConflict(
-              FailedPrecondition.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
+          .setPaymentMethodNotSetUp(FailedPrecondition.newBuilder().build())
+          .build();
     }
   }
 
@@ -310,16 +301,14 @@ public class SubscriptionsGrpcService extends SimpleSubscriptionsGrpc.Subscripti
         request.getSubscriberId().toByteArray(), clock);
     try {
       final Subscriptions.Record record = subscriptionManager.getSubscriber(subscriberCredentials);
-      return record.getProcessorCustomer().map(
-          processorCustomer -> setSubscriptionLevelForCustomer(processorCustomer, subscriberCredentials, record,
-              request)).orElseGet(() -> SetSubscriptionLevelResponse.newBuilder()
-          .setPaymentMethodNotSetUp(FailedPrecondition.newBuilder().build()).build());
+      return record.getProcessorCustomer().map(processorCustomer ->
+              setSubscriptionLevelForCustomer(processorCustomer, subscriberCredentials, record, request))
+          .orElseGet(() -> SetSubscriptionLevelResponse.newBuilder()
+              .setPaymentMethodNotSetUp(FailedPrecondition.newBuilder().build())
+              .build());
 
-    } catch (final SubscriptionNotFoundException e) {
+    } catch (final SubscriptionNotFoundException | SubscriptionForbiddenException _) {
       return SetSubscriptionLevelResponse.newBuilder().setSubscriberNotFound(NotFound.newBuilder().build()).build();
-    } catch (final SubscriptionForbiddenException e) {
-      return SetSubscriptionLevelResponse.newBuilder().setSubscriberIdMismatch(
-          FailedUnidentifiedAuthorization.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
     }
   }
 
@@ -394,11 +383,8 @@ public class SubscriptionsGrpcService extends SimpleSubscriptionsGrpc.Subscripti
       };
       return SetIapSubscriptionResponse.newBuilder()
           .setSuccess(SetIapSubscriptionResponse.SetIapSubscriptionResult.newBuilder().setLevel(level).build()).build();
-    } catch (final SubscriptionNotFoundException e) {
+    } catch (final SubscriptionNotFoundException | SubscriptionForbiddenException _) {
       return SetIapSubscriptionResponse.newBuilder().setSubscriberNotFound(NotFound.newBuilder().build()).build();
-    } catch (final SubscriptionForbiddenException e) {
-      return SetIapSubscriptionResponse.newBuilder().setSubscriberIdMismatch(
-          FailedUnidentifiedAuthorization.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
     } catch (final SubscriptionProcessorConflictException e) {
       return SetIapSubscriptionResponse.newBuilder().setSubscriptionProcessorConflict(
           FailedPrecondition.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
@@ -422,12 +408,9 @@ public class SubscriptionsGrpcService extends SimpleSubscriptionsGrpc.Subscripti
           .map(SubscriptionsGrpcService::buildSubscriptionInformationResponse).orElseGet(
               () -> GetSubscriptionInformationResponse.newBuilder().setNoSubscription(Empty.getDefaultInstance())
                   .build());
-    } catch (final SubscriptionNotFoundException e) {
+    } catch (final SubscriptionNotFoundException | SubscriptionForbiddenException _) {
       return GetSubscriptionInformationResponse.newBuilder().setSubscriberNotFound(NotFound.newBuilder().build())
           .build();
-    } catch (final SubscriptionForbiddenException e) {
-      return GetSubscriptionInformationResponse.newBuilder().setSubscriberIdMismatch(
-          FailedUnidentifiedAuthorization.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
     }
   }
 
@@ -487,11 +470,8 @@ public class SubscriptionsGrpcService extends SimpleSubscriptionsGrpc.Subscripti
     } catch (final SubscriptionReceiptAlreadyRedeemedException e) {
       return GetReceiptCredentialsResponse.newBuilder().setAlreadyRedeemed(FailedPrecondition.newBuilder().build())
           .build();
-    } catch (final SubscriptionNotFoundException e) {
+    } catch (final SubscriptionNotFoundException | SubscriptionForbiddenException _) {
       return GetReceiptCredentialsResponse.newBuilder().setSubscriberNotFound(NotFound.newBuilder().build()).build();
-    } catch (final SubscriptionForbiddenException e) {
-      return GetReceiptCredentialsResponse.newBuilder().setSubscriberIdMismatch(
-          FailedUnidentifiedAuthorization.newBuilder().setDescription(e.errorDetail().orElse("")).build()).build();
     }
   }
 

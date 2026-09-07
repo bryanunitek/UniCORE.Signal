@@ -12,6 +12,7 @@ import com.apple.foundationdb.tuple.Tuple;
 import com.apple.foundationdb.tuple.Versionstamp;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.hash.Hashing;
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.dropwizard.util.DataSize;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.DistributionSummary;
@@ -19,6 +20,7 @@ import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.time.Clock;
 import java.time.Duration;
@@ -85,7 +87,7 @@ public class FoundationDbMessageStore {
   private static final byte[] SERVER_ID = UUIDUtil.toBytes(UUID.randomUUID());
   private static final int PRESENCE_VALUE_LENGTH = 28;
 
-  private static final Subspace MESSAGES_SUBSPACE = new Subspace(Tuple.from("M"));
+  public static final Subspace MESSAGES_SUBSPACE = new Subspace(Tuple.from("M"));
 
   @VisibleForTesting
   static final Duration PRESENCE_STALE_THRESHOLD = Duration.ofMinutes(5);
@@ -285,7 +287,7 @@ public class FoundationDbMessageStore {
         .map(MessageProtos.Envelope::getEphemeral)
         .orElseThrow(() -> new IllegalStateException("One or more bundles is empty"));
 
-    return getDatabases(epoch)[shardId].runAsync(transaction -> {
+    return FoundationDbUtil.safeRunAsync(getDatabases(epoch)[shardId], transaction -> {
           messagesByAccountIdentifier.forEach(entry ->
               insertFuturesByAci.put(entry.getKey(), insert(entry.getKey(), entry.getValue(), epoch, shardId, transaction)));
 
@@ -303,7 +305,7 @@ public class FoundationDbMessageStore {
                 }
                 return CompletableFuture.completedFuture(Optional.<Versionstamp>empty());
               });
-        })
+        }, FoundationDbUtil.Context.INSERT_MESSAGE_BATCH)
         .thenCompose(Function.identity())
         .thenApply(maybeVersionstamp -> insertFuturesByAci.entrySet().stream()
             .collect(Collectors.toMap(Map.Entry::getKey, entry -> {
@@ -391,14 +393,43 @@ public class FoundationDbMessageStore {
 
     final byte[] messageKey = getDeviceQueueSubspace(aci, deviceId).pack(Tuple.from(versionstamp));
 
-    return databasesByEpoch[getConfigurationEpoch(versionstamp)][getShardId(versionstamp)].runAsync(transaction -> {
+    return FoundationDbUtil.safeRunAsync(databasesByEpoch[getConfigurationEpoch(versionstamp)][getShardId(versionstamp)], transaction -> {
           transaction.clear(messageKey);
           return CompletableFuture.completedFuture(null);
-        })
+        }, FoundationDbUtil.Context.DELETE_MESSAGE)
         .thenRun(() -> {
           sample.stop(DELETE_MESSAGE_TIMER);
           DELETE_MESSAGE_COUNTER.increment();
         });
+  }
+
+  CompletableFuture<Optional<FoundationDbMessageStreamEntry.Message>> deleteAndGet(final AciServiceIdentifier aci, final byte deviceId, final UUID messageGuid) {
+    return deleteAndGet(aci, deviceId, versionstampUUIDCipher.decryptVersionstamp(messageGuid, aci.uuid(), deviceId));
+  }
+
+  CompletableFuture<Optional<FoundationDbMessageStreamEntry.Message>> deleteAndGet(final AciServiceIdentifier aci, final byte deviceId, final Versionstamp versionstamp) {
+    final Timer.Sample sample = Timer.start();
+
+    final byte[] messageKey = getDeviceQueueSubspace(aci, deviceId).pack(Tuple.from(versionstamp));
+
+    return databasesByEpoch[getConfigurationEpoch(versionstamp)][getShardId(versionstamp)].runAsync(
+            transaction -> transaction.get(messageKey)
+                .thenApply(value -> {
+                  if (value == null) {
+                    return Optional.<byte[]>empty();
+                  }
+                  transaction.clear(messageKey);
+                  return Optional.of(value);
+                }))
+        .whenComplete((_, _) -> sample.stop(DELETE_MESSAGE_TIMER))
+        .thenApply(maybeValue -> maybeValue.map(value -> {
+          DELETE_MESSAGE_COUNTER.increment();
+          try {
+            return new FoundationDbMessageStreamEntry.Message(versionstamp, MessageProtos.Envelope.parseFrom(value));
+          } catch (final InvalidProtocolBufferException e) {
+            throw new UncheckedIOException(e);
+          }
+        }));
   }
 
   public void clearAll(final AciServiceIdentifier aci) {
@@ -590,7 +621,7 @@ public class FoundationDbMessageStore {
     final Range deviceQueueRange = getDeviceQueueSubspace(aci, deviceId).range();
 
     return getDistinctDatabasesForAci(aci)
-        .flatMap(database -> Mono.fromFuture(() -> FoundationDbUtil.safeRunAsync(database, transaction -> transaction.getEstimatedRangeSizeBytes(deviceQueueRange))))
+        .flatMap(database -> Mono.fromFuture(() -> FoundationDbUtil.safeRunAsync(database, transaction -> transaction.getEstimatedRangeSizeBytes(deviceQueueRange), FoundationDbUtil.Context.ESTIMATE_QUEUE_SIZE)))
         .reduce(0L, Long::sum);
   }
 
@@ -625,7 +656,7 @@ public class FoundationDbMessageStore {
 
       final CompletableFuture<KeyArrayResult> rangeSplitPointsFuture = transaction.getRangeSplitPoints(deviceQueueRange, rangeSplitChunkSize);
       return estimatedQueueSizeFuture.thenCombine(rangeSplitPointsFuture, Pair::new);
-    });
+    }, FoundationDbUtil.Context.ESTIMATE_QUEUE_SIZE_AND_RANGE_SPLITS);
   }
 
   public Mono<Void> trimQueue(final AciServiceIdentifier aci,
@@ -714,11 +745,16 @@ public class FoundationDbMessageStore {
       transaction.options().setRetryLimit(batchPriorityTransactionRetryLimit);
       transaction.clear(range);
       return CompletableFuture.completedFuture(null);
-    });
+    }, FoundationDbUtil.Context.TRIM_QUEUE);
   }
 
-  private static Subspace getAccountSubspace(final AciServiceIdentifier aci) {
-    return MESSAGES_SUBSPACE.get(aci.uuid());
+  @VisibleForTesting
+  public static Subspace getAccountSubspace(final AciServiceIdentifier aci) {
+    return getAccountSubspace(MESSAGES_SUBSPACE, aci);
+  }
+
+  public static Subspace getAccountSubspace(final Subspace messagesSubspace, final AciServiceIdentifier aci) {
+    return messagesSubspace.get(aci.uuid());
   }
 
   @VisibleForTesting

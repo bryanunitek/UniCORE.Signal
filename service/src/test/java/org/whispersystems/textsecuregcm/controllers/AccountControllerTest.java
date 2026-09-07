@@ -46,6 +46,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
 import java.util.stream.Stream;
+import org.apache.commons.lang3.ArrayUtils;
 import org.glassfish.jersey.server.ServerProperties;
 import org.glassfish.jersey.test.grizzly.GrizzlyWebTestContainerFactory;
 import org.junit.jupiter.api.AfterEach;
@@ -197,12 +198,12 @@ class AccountControllerTest {
             Optional.of(registrationLockCredentials.salt()), Instant.ofEpochMilli(System.currentTimeMillis())));
     when(senderRegLockAccount.getLastSeen()).thenReturn(System.currentTimeMillis());
     when(senderRegLockAccount.getAccountIdentifier()).thenReturn(SENDER_REG_LOCK_UUID);
-    when(senderRegLockAccount.getNumberOptional()).thenReturn(Optional.of(SENDER_REG_LOCK));
+    when(senderRegLockAccount.getNumber()).thenReturn(Optional.of(SENDER_REG_LOCK));
 
     when(senderTransfer.getRegistrationLock()).thenReturn(
         new StoredRegistrationLock(Optional.empty(), Optional.empty(), Instant.ofEpochMilli(System.currentTimeMillis())));
     when(senderTransfer.getAccountIdentifier()).thenReturn(SENDER_TRANSFER_UUID);
-    when(senderTransfer.getNumberOptional()).thenReturn(Optional.of(SENDER_TRANSFER));
+    when(senderTransfer.getNumber()).thenReturn(Optional.of(SENDER_TRANSFER));
 
     when(accountsManager.getByE164(eq(SENDER_PIN))).thenReturn(Optional.of(senderPinAccount));
     when(accountsManager.getByE164(eq(SENDER_REG_LOCK))).thenReturn(Optional.of(senderRegLockAccount));
@@ -230,7 +231,7 @@ class AccountControllerTest {
       return null;
     }).when(usernameZkProofVerifier).verifyProof(any(), any());
 
-    when(PHONE_NUMBER_RECOVERY_PASSWORDS_MANAGER.buildTransactWriteItemForStorePassword(any(), any()))
+    when(PHONE_NUMBER_RECOVERY_PASSWORDS_MANAGER.buildTransactWriteItemForStorePassword(any(), any(byte[].class)))
         .thenReturn(TransactWriteItem.builder().build());
   }
 
@@ -869,6 +870,19 @@ class AccountControllerTest {
   }
 
   @Test
+  void testSetAccountAttributesRegistrationLockWithNoNumber() {
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/attributes/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.NUMBERLESS_UUID, AuthHelper.NUMBERLESS_PASSWORD))
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, "1234", false, null, null)
+            .setUnidentifiedAccessKey(new byte[16])))) {
+
+      assertThat(response.getStatus()).isEqualTo(422);
+    }
+  }
+
+  @Test
   void testSetAccountAttributesEnableDiscovery() {
     try (final Response response = resources.getJerseyTest()
         .target("/v1/accounts/attributes/")
@@ -881,10 +895,13 @@ class AccountControllerTest {
     }
   }
 
-  @Test
-  void testAccountsAttributesUpdateRecoveryPassword() {
-    final byte[] recoveryPassword = TestRandomUtil.nextBytes(32);
+  static Stream<byte[]> testAccountsAttributesUpdateRecoveryPassword() {
+    return Stream.of(null, new byte[]{}, TestRandomUtil.nextBytes(32));
+  }
 
+  @ParameterizedTest
+  @MethodSource
+  void testAccountsAttributesUpdateRecoveryPassword(final byte[] recoveryPassword) {
     try (final Response response = resources.getJerseyTest()
         .target("/v1/accounts/attributes/")
         .request()
@@ -893,9 +910,12 @@ class AccountControllerTest {
             .setUnidentifiedAccessKey(new byte[16])
             .setRecoveryPassword(recoveryPassword)))) {
 
+      final int expectedRrpUpdates = ArrayUtils.isEmpty(recoveryPassword) ? 0 : 1;
+
       assertThat(response.getStatus()).isEqualTo(204);
-      verify(accountsManager).update(eq(AuthHelper.UNDISCOVERABLE_UUID), any(), argThat(additionWriteItems -> additionWriteItems.size() == 1));
-      verify(AuthHelper.UNDISCOVERABLE_ACCOUNT).setAccountRecoveryPassword(recoveryPassword);
+      verify(accountsManager).update(eq(AuthHelper.UNDISCOVERABLE_UUID), any(), argThat(additionWriteItems -> additionWriteItems.size() == expectedRrpUpdates));
+
+      verify(AuthHelper.UNDISCOVERABLE_ACCOUNT, times(expectedRrpUpdates)).setAccountRecoveryPassword(recoveryPassword);
     }
   }
 

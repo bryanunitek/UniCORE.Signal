@@ -6,11 +6,13 @@
 package org.whispersystems.textsecuregcm.grpc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -27,12 +29,15 @@ import io.grpc.Status;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -49,6 +54,8 @@ import org.signal.chat.account.ChangeNumberResponse;
 import org.signal.chat.account.ClearRegistrationLockRequest;
 import org.signal.chat.account.ClearRegistrationLockResponse;
 import org.signal.chat.account.ConfigureUnidentifiedAccessRequest;
+import org.signal.chat.account.ConfirmTotpKeyRequest;
+import org.signal.chat.account.ConfirmTotpKeyResponse;
 import org.signal.chat.account.ConfirmUsernameHashRequest;
 import org.signal.chat.account.ConfirmUsernameHashResponse;
 import org.signal.chat.account.DeleteAccountRequest;
@@ -56,6 +63,8 @@ import org.signal.chat.account.DeleteAccountResponse;
 import org.signal.chat.account.DeleteUsernameHashRequest;
 import org.signal.chat.account.DeleteUsernameLinkRequest;
 import org.signal.chat.account.ExternalServiceCredentials;
+import org.signal.chat.account.GenerateTotpKeyRequest;
+import org.signal.chat.account.GenerateTotpKeyResponse;
 import org.signal.chat.account.GetAccountDataReportRequest;
 import org.signal.chat.account.GetAccountDataReportResponse;
 import org.signal.chat.account.GetAccountIdentityRequest;
@@ -64,19 +73,26 @@ import org.signal.chat.account.GetCapabilitiesRequest;
 import org.signal.chat.account.GetCapabilitiesResponse;
 import org.signal.chat.account.GetEntitlementsRequest;
 import org.signal.chat.account.GetEntitlementsResponse;
+import org.signal.chat.account.ListMfaKeysRequest;
+import org.signal.chat.account.ListMfaKeysResponse;
 import org.signal.chat.account.RegistrationLockFailure;
+import org.signal.chat.account.RemoveMfaKeyRequest;
 import org.signal.chat.account.ReserveUsernameHashRequest;
 import org.signal.chat.account.ReserveUsernameHashResponse;
 import org.signal.chat.account.SetDiscoverableByPhoneNumberRequest;
 import org.signal.chat.account.SetRegistrationLockRequest;
 import org.signal.chat.account.SetRegistrationLockResponse;
 import org.signal.chat.account.SetRegistrationRecoveryPasswordRequest;
+import org.signal.chat.account.SetMfaKeyMetadataRequest;
+import org.signal.chat.account.SetMfaKeyMetadataResponse;
 import org.signal.chat.account.SetUsernameLinkRequest;
 import org.signal.chat.account.SetUsernameLinkResponse;
 import org.signal.chat.account.SetZkCredentialKeyRequest;
 import org.signal.chat.account.SetZkCredentialKeyResponse;
 import org.signal.chat.account.StaleDevices;
+import org.signal.chat.account.TotpParameters;
 import org.signal.chat.account.UsernameNotAvailable;
+import org.signal.chat.account.ListMfaKeysResponse.MfaKeyMetadata.MfaKeyType;
 import org.signal.chat.common.AccountIdentifiers;
 import org.signal.chat.common.EcSignedPreKey;
 import org.signal.chat.common.KemSignedPreKey;
@@ -108,11 +124,16 @@ import org.whispersystems.textsecuregcm.push.MessageTooLargeException;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountBadge;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
+import org.whispersystems.textsecuregcm.storage.AnnotatedMfaKey;
+import org.whispersystems.textsecuregcm.storage.AnnotatedTotpKey;
 import org.whispersystems.textsecuregcm.storage.ChangeNumberManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.KeyIdUtil;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.TooManyTotpKeysException;
+import org.whispersystems.textsecuregcm.storage.TooManyMfaKeysException;
+import org.whispersystems.textsecuregcm.storage.TotpKey;
 import org.whispersystems.textsecuregcm.storage.UsernameHashNotAvailableException;
 import org.whispersystems.textsecuregcm.storage.UsernameReservationNotFoundException;
 import org.whispersystems.textsecuregcm.tests.util.AccountsHelper;
@@ -142,6 +163,14 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
   @Mock
   private ChangeNumberManager changeNumberManager;
+
+  private static final org.whispersystems.textsecuregcm.storage.TotpParameters TOTP_PARAMETERS =
+      new org.whispersystems.textsecuregcm.storage.TotpParameters(
+          AccountsManager.TOTP.getAlgorithm(),
+          AccountsManager.TOTP.getPasswordLength(),
+          AccountsManager.TOTP.getTimeStep());
+
+  private static final int MFA_KEY_METADATA_SIZE = 160;
 
   @Override
   protected AccountsGrpcService createServiceBeforeEachTest() {
@@ -187,11 +216,11 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
           .addServiceIdentifiers(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new PniServiceIdentifier(phoneNumberIdentifier)))
           .setE164(e164);
 
-      when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(phoneNumberIdentifier));
-      when(account.getNumberOptional()).thenReturn(Optional.of(e164));
+      when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(phoneNumberIdentifier));
+      when(account.getNumber()).thenReturn(Optional.of(e164));
     } else {
-      when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.empty());
-      when(account.getNumberOptional()).thenReturn(Optional.empty());
+      when(account.getPhoneNumberIdentifier()).thenReturn(Optional.empty());
+      when(account.getNumber()).thenReturn(Optional.empty());
     }
 
     when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
@@ -714,7 +743,7 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
     when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
         .thenReturn(Optional.of(account));
 
-    when(account.getNumberOptional())
+    when(account.getNumber())
         .thenReturn(Optional.of(PhoneNumberUtil.getInstance().format(
             PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164)));
 
@@ -734,7 +763,7 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
     when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
         .thenReturn(Optional.of(account));
 
-    when(account.getNumberOptional())
+    when(account.getNumber())
         .thenReturn(Optional.empty());
 
     GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT, () ->
@@ -751,7 +780,7 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
     final Account account = mock(Account.class);
     when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
-    when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(phoneNumberIdentifier));
+    when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(phoneNumberIdentifier));
 
     when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
         .thenReturn(Optional.of(account));
@@ -887,8 +916,8 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
 
     final Account updatedAccount = mock(Account.class);
     when(updatedAccount.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
-    when(updatedAccount.getNumberOptional()).thenReturn(Optional.of(newNumber));
-    when(updatedAccount.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(updatedPni));
+    when(updatedAccount.getNumber()).thenReturn(Optional.of(newNumber));
+    when(updatedAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(updatedPni));
     when(updatedAccount.getUsernameHash()).thenReturn(Optional.empty());
 
     when(changeNumberManager.changeNumber(eq(AUTHENTICATED_ACI), any(), any(), any(), eq(newNumber),
@@ -1095,5 +1124,218 @@ class AccountsGrpcServiceTest extends SimpleBaseGrpcTest<AccountsGrpcService, Ac
         .addCapabilities(org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_SPARSE_POST_QUANTUM_RATCHET)
         .addCapabilities(org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_USERNAME_CHANGE_SYNC_MESSAGE)
         .build(), response.getCapabilities());
+  }
+
+  @Test
+  void generateTotpKey() throws TooManyTotpKeysException, TooManyMfaKeysException {
+    final byte[] encodedKey = TestRandomUtil.nextBytes(16);
+
+    when(accountsManager.generatePendingTotpKey(AUTHENTICATED_ACI))
+        .thenReturn(new TotpKey(TOTP_PARAMETERS, encodedKey));
+
+    final GenerateTotpKeyResponse response =
+        authenticatedServiceStub().generateTotpKey(GenerateTotpKeyRequest.getDefaultInstance());
+
+    assertEquals(GenerateTotpKeyResponse.ResponseCase.KEY_GENERATED, response.getResponseCase());
+
+    assertArrayEquals(encodedKey, response.getKeyGenerated().getKey().toByteArray());
+    assertEquals(AccountsManager.TOTP.getAlgorithm(), response.getKeyGenerated().getTotpParameters().getAlgorithm());
+    assertEquals(AccountsManager.TOTP.getPasswordLength(), response.getKeyGenerated().getTotpParameters().getPasswordLength());
+    assertEquals(AccountsManager.TOTP.getTimeStep().toSeconds(), response.getKeyGenerated().getTotpParameters().getTimeStepSeconds());
+  }
+
+  @Test
+  void generateTotpKeyTooManyKeys() throws TooManyTotpKeysException, TooManyMfaKeysException {
+    when(accountsManager.generatePendingTotpKey(AUTHENTICATED_ACI))
+        .thenThrow(TooManyTotpKeysException.class);
+
+    final GenerateTotpKeyResponse response =
+        authenticatedServiceStub().generateTotpKey(GenerateTotpKeyRequest.getDefaultInstance());
+
+    assertEquals(GenerateTotpKeyResponse.ResponseCase.TOO_MANY_TOTP_KEYS, response.getResponseCase());
+  }
+
+  @Test
+  void generateTotpKeyTooManyNonTotpKeys() throws TooManyTotpKeysException, TooManyMfaKeysException {
+    when(accountsManager.generatePendingTotpKey(AUTHENTICATED_ACI))
+        .thenThrow(TooManyMfaKeysException.class);
+
+    final GenerateTotpKeyResponse response =
+        authenticatedServiceStub().generateTotpKey(GenerateTotpKeyRequest.getDefaultInstance());
+
+    assertEquals(GenerateTotpKeyResponse.ResponseCase.TOO_MANY_MFA_KEYS, response.getResponseCase());
+  }
+
+
+  @Test
+  void confirmTotpKey() throws TooManyMfaKeysException {
+    final byte keyId = 17;
+    final int oneTimePassword = 123456;
+    final byte[] metadataCiphertext = TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE);
+
+    when(accountsManager.confirmPendingTotpKey(AUTHENTICATED_ACI, oneTimePassword, testClock.instant(), metadataCiphertext))
+        .thenReturn(Optional.of(keyId));
+
+    final ConfirmTotpKeyResponse response = authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+            .setOneTimePassword(oneTimePassword)
+            .setMetadataCiphertext(ByteString.copyFrom(metadataCiphertext))
+        .build());
+
+    assertEquals(ConfirmTotpKeyResponse.ResponseCase.KEY_CONFIRMED, response.getResponseCase());
+    assertEquals(keyId, response.getKeyConfirmed().getKeyId());
+  }
+
+  @Test
+  void confirmTotpKeyIncorrectMetadataSize() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+            .setOneTimePassword(123456)
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE + 1)))
+            .build()));
+  }
+
+  @Test
+  void confirmTotpKeyPasswordNotVerified() throws TooManyMfaKeysException {
+    when(accountsManager.confirmPendingTotpKey(any(), anyInt(), any(), any()))
+        .thenReturn(Optional.empty());
+
+    final ConfirmTotpKeyResponse response = authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+        .setOneTimePassword(123456)
+        .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+        .build());
+
+    assertEquals(ConfirmTotpKeyResponse.ResponseCase.ONE_TIME_PASSWORD_NOT_VERIFIED, response.getResponseCase());
+  }
+
+  @Test
+  void confirmTotpKeyTooManyNonTotpKeys() throws TooManyTotpKeysException, TooManyMfaKeysException {
+    when(accountsManager.confirmPendingTotpKey(any(), anyInt(), any(), any()))
+        .thenThrow(TooManyMfaKeysException.class);
+
+    final ConfirmTotpKeyResponse response =
+      authenticatedServiceStub().confirmTotpKey(ConfirmTotpKeyRequest.newBuilder()
+          .setOneTimePassword(123456)
+          .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+          .build());
+
+    assertEquals(ConfirmTotpKeyResponse.ResponseCase.TOO_MANY_MFA_KEYS, response.getResponseCase());
+  }
+
+
+  @Test
+  void listTotpKeys() {
+    final Map<Byte, AnnotatedMfaKey> totpKeys = Map.of(
+        (byte) 1, generateRandomAnnotatedTotpKey(),
+        (byte) 2, generateRandomAnnotatedTotpKey());
+
+    final Account account = mock(Account.class);
+    when(account.getMfaKeys()).thenReturn(totpKeys);
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    final ListMfaKeysResponse response =
+        authenticatedServiceStub().listMfaKeys(ListMfaKeysRequest.getDefaultInstance());
+
+    final Map<Integer, ListMfaKeysResponse.MfaKeyMetadata> expectedTotpKeys = totpKeys.entrySet().stream()
+        .collect(Collectors.toMap(entry -> entry.getKey().intValue(), entry -> ListMfaKeysResponse.MfaKeyMetadata.newBuilder()
+            .setType(MfaKeyType.MFA_KEY_TYPE_TOTP)
+            .setMetadataCiphertext(ByteString.copyFrom(entry.getValue().metadataCiphertext()))
+            .build()));
+
+    assertEquals(expectedTotpKeys, response.getKeysMap());
+  }
+
+  @Test
+  void setTotpKeyMetadata() {
+    final byte keyId = (byte) ThreadLocalRandom.current().nextInt(Account.MAX_MFA_KEY_ID);
+    final byte[] updatedMetadata = TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE);
+    final AnnotatedMfaKey existingTotpKey = generateRandomAnnotatedTotpKey();
+
+    final Account account = mock(Account.class);
+    when(account.getMfaKeys()).thenReturn(Map.of(keyId, existingTotpKey));
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    final SetMfaKeyMetadataResponse response =
+        authenticatedServiceStub().setMfaKeyMetadata(SetMfaKeyMetadataRequest.newBuilder()
+            .setKeyId(keyId)
+            .setMetadataCiphertext(ByteString.copyFrom(updatedMetadata))
+            .build());
+
+    assertEquals(SetMfaKeyMetadataResponse.ResponseCase.METADATA_UPDATED, response.getResponseCase());
+    verify(account).setMfaKeys(Map.of(keyId, existingTotpKey.withMetadataCiphertext(updatedMetadata)));
+  }
+
+  @Test
+  void setTotpKeyMetadataKeyNotFound() {
+    final Account account = mock(Account.class);
+    when(account.getMfaKeys()).thenReturn(Collections.emptyMap());
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    final SetMfaKeyMetadataResponse response =
+        authenticatedServiceStub().setMfaKeyMetadata(SetMfaKeyMetadataRequest.newBuilder()
+            .setKeyId(ThreadLocalRandom.current().nextInt(Account.MAX_MFA_KEY_ID))
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+            .build());
+
+    assertEquals(SetMfaKeyMetadataResponse.ResponseCase.KEY_NOT_FOUND, response.getResponseCase());
+  }
+
+  @Test
+  void setTotpKeyMetadataIncorrectMetadataSize() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().setMfaKeyMetadata(SetMfaKeyMetadataRequest.newBuilder()
+            .setKeyId(1)
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE + 1)))
+            .build()));
+  }
+
+  @Test
+  void setTotpKeyMetadataKeyIdOutOfRange() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().setMfaKeyMetadata(SetMfaKeyMetadataRequest.newBuilder()
+            .setKeyId(Account.MAX_MFA_KEY_ID + 1)
+            .setMetadataCiphertext(ByteString.copyFrom(TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE)))
+            .build()));
+  }
+
+  @Test
+  void removeTotpKey() {
+    final byte retainedKeyId = 1;
+    final byte removedKeyId = 2;
+
+    final Map<Byte, AnnotatedMfaKey> initialKeys = Map.of(
+        retainedKeyId, generateRandomAnnotatedTotpKey(),
+        removedKeyId, generateRandomAnnotatedTotpKey());
+
+    final Account account = mock(Account.class);
+    when(account.getMfaKeys()).thenReturn(initialKeys);
+
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
+        .thenReturn(Optional.of(account));
+
+    //noinspection ResultOfMethodCallIgnored
+    authenticatedServiceStub().removeMfaKey(RemoveMfaKeyRequest.newBuilder()
+        .setKeyId(removedKeyId)
+        .build());
+
+    verify(account).setMfaKeys(Map.of(retainedKeyId, initialKeys.get(retainedKeyId)));
+  }
+
+  @Test
+  void removeTotpKeyIdOutOfRange() {
+    GrpcTestUtils.assertStatusInvalidArgument(
+        () -> authenticatedServiceStub().removeMfaKey(RemoveMfaKeyRequest.newBuilder()
+            .setKeyId(Account.MAX_MFA_KEY_ID + 1)
+            .build()));
+  }
+
+  private static AnnotatedTotpKey generateRandomAnnotatedTotpKey() {
+    return new AnnotatedTotpKey(new TotpKey(TOTP_PARAMETERS, TestRandomUtil.nextBytes(32)),
+        TestRandomUtil.nextBytes(MFA_KEY_METADATA_SIZE));
   }
 }

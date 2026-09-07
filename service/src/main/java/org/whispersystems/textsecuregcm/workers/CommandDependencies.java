@@ -125,7 +125,9 @@ public record CommandDependencies(
     DynamoDbAsyncClient dynamoDbAsyncClient,
     DynamoDbClient dynamoDbClient,
     PhoneNumberIdentifiers phoneNumberIdentifiers,
-    DynamoDbRecoveryManager dynamoDbRecoveryManager) {
+    DynamoDbRecoveryManager dynamoDbRecoveryManager,
+    FDB fdb,
+    AccountLockManager accountLockManager) {
 
   static CommandDependencies build(
       final String name,
@@ -204,8 +206,6 @@ public record CommandDependencies(
         .maxThreads(8).minThreads(8).build();
     ExecutorService storageServiceExecutor = ExecutorServiceBuilder.of(environment, "storageService")
         .maxThreads(8).minThreads(8).build();
-    ExecutorService accountLockExecutor = ExecutorServiceBuilder.of(environment, "accountLock")
-        .minThreads(8).maxThreads(8).build();
     ExecutorService remoteStorageHttpExecutor = ExecutorServiceBuilder.of(environment, "remoteStorage")
 
         .minThreads(0).maxThreads(Integer.MAX_VALUE).workQueue(new SynchronousQueue<>())
@@ -356,8 +356,9 @@ public record CommandDependencies(
     AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keys, messagesManager, profilesManager,
         changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
-        phoneNumberRecoveryPasswordsManager, accountLockExecutor, messagePollExecutor,
-        retryExecutor, clock, configuration.getLinkDeviceSecretConfiguration().secret().value());
+        phoneNumberRecoveryPasswordsManager, messagePollExecutor,
+        retryExecutor, clock, configuration.getLinkDeviceSecretConfiguration().secret().value(),
+        configuration.getRegistrationTotpConfiguration().maxValidationDelay());
     RateLimiters rateLimiters = RateLimiters.create(dynamicConfigurationManager, rateLimitersCluster, retryExecutor);
     final BackupsDb backupsDb =
         new BackupsDb(dynamoDbAsyncClient, configuration.getDynamoDbTables().getBackups().getTableName(), clock);
@@ -457,8 +458,9 @@ public record CommandDependencies(
         dynamoDbAsyncClient,
         dynamoDbClient,
         phoneNumberIdentifiers,
-        dynamoDbRecoveryManager
-    );
+        dynamoDbRecoveryManager,
+        fdb,
+        accountLockManager);
   }
 
 }

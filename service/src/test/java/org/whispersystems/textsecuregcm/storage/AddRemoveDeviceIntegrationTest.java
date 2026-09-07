@@ -21,10 +21,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -35,7 +32,6 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.signal.libsignal.protocol.ecc.ECKeyPair;
 import org.whispersystems.textsecuregcm.auth.DisconnectionRequestManager;
 import org.whispersystems.textsecuregcm.entities.DeviceInfo;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.redis.RedisClusterExtension;
 import org.whispersystems.textsecuregcm.redis.RedisServerExtension;
 import org.whispersystems.textsecuregcm.securestorage.SecureStorageClient;
@@ -73,7 +69,6 @@ public class AddRemoveDeviceIntegrationTest {
   @RegisterExtension
   static final S3LocalStackExtension S3_EXTENSION = new S3LocalStackExtension("testbucket");
 
-  private ExecutorService accountLockExecutor;
   private ScheduledExecutorService scheduledExecutorService;
 
   private KeysManager keysManager;
@@ -110,7 +105,6 @@ public class AddRemoveDeviceIntegrationTest {
         DynamoDbExtensionSchema.Tables.DELETED_ACCOUNTS.tableName(),
         DynamoDbExtensionSchema.Tables.USED_LINK_DEVICE_TOKENS.tableName());
 
-    accountLockExecutor = Executors.newSingleThreadExecutor();
     scheduledExecutorService = mock(ScheduledExecutorService.class);
 
     final AccountLockManager accountLockManager = new AccountLockManager(DYNAMO_DB_EXTENSION.getDynamoDbClient(),
@@ -158,11 +152,11 @@ public class AddRemoveDeviceIntegrationTest {
         svr2Client,
         mock(DisconnectionRequestManager.class),
         phoneNumberRecoveryPasswordsManager,
-        accountLockExecutor,
         scheduledExecutorService,
         scheduledExecutorService,
         clock,
-        "link-device-secret".getBytes(StandardCharsets.UTF_8));
+        "link-device-secret".getBytes(StandardCharsets.UTF_8),
+        AccountsManager.TOTP.getTimeStep().dividedBy(2));
 
     accountsManager.start();
   }
@@ -170,15 +164,10 @@ public class AddRemoveDeviceIntegrationTest {
   @AfterEach
   void tearDown() throws InterruptedException {
     accountsManager.stop();
-
-    accountLockExecutor.shutdown();
-
-    //noinspection ResultOfMethodCallIgnored
-    accountLockExecutor.awaitTermination(1, TimeUnit.SECONDS);
   }
 
   @Test
-  void addDevice() throws InterruptedException, LinkDeviceTokenAlreadyUsedException {
+  void addDevice() throws LinkDeviceTokenAlreadyUsedException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -190,7 +179,7 @@ public class AddRemoveDeviceIntegrationTest {
     assertEquals(1, accountsManager.getByAccountIdentifier(account.getAccountIdentifier()).orElseThrow().getDevices().size());
 
     final Pair<Account, Device> updatedAccountAndDevice =
-        accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+        accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
                     "device-name".getBytes(StandardCharsets.UTF_8),
                     "password",
                     "OWT",
@@ -200,7 +189,7 @@ public class AddRemoveDeviceIntegrationTest {
                     true,
                     Optional.empty(),
                     Optional.empty()),
-                accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI)));
+                accountsManager.generateLinkDeviceToken(account.getAccountIdentifier()));
 
     assertEquals(2, updatedAccountAndDevice.first().getDevices().size());
 
@@ -213,16 +202,16 @@ public class AddRemoveDeviceIntegrationTest {
     assertTrue(
         keysManager.getEcSignedPreKey(updatedAccountAndDevice.first().getAccountIdentifier(), addedDeviceId).join().isPresent());
     assertTrue(
-        keysManager.getEcSignedPreKey(updatedAccountAndDevice.first().getPhoneNumberIdentifier(), addedDeviceId).join()
+        keysManager.getEcSignedPreKey(updatedAccountAndDevice.first().getPhoneNumberIdentifier().orElseThrow(), addedDeviceId).join()
             .isPresent());
     assertTrue(keysManager.getLastResort(updatedAccountAndDevice.first().getAccountIdentifier(), addedDeviceId).join().isPresent());
     assertTrue(
-        keysManager.getLastResort(updatedAccountAndDevice.first().getPhoneNumberIdentifier(), addedDeviceId).join()
+        keysManager.getLastResort(updatedAccountAndDevice.first().getPhoneNumberIdentifier().orElseThrow(), addedDeviceId).join()
             .isPresent());
   }
 
   @Test
-  void addDeviceReusedToken() throws InterruptedException, LinkDeviceTokenAlreadyUsedException {
+  void addDeviceReusedToken() throws LinkDeviceTokenAlreadyUsedException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -233,10 +222,10 @@ public class AddRemoveDeviceIntegrationTest {
     final Account account = AccountsHelper.createAccount(accountsManager, number);
     assertEquals(1, accountsManager.getByAccountIdentifier(account.getAccountIdentifier()).orElseThrow().getDevices().size());
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI));
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getAccountIdentifier());
 
     final Pair<Account, Device> updatedAccountAndDevice =
-        accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+        accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
                     "device-name".getBytes(StandardCharsets.UTF_8),
                     "password",
                     "OWT",
@@ -253,7 +242,7 @@ public class AddRemoveDeviceIntegrationTest {
             .size());
 
     assertThrows(LinkDeviceTokenAlreadyUsedException.class,
-        () -> accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+        () -> accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
                     "device-name".getBytes(StandardCharsets.UTF_8),
                     "password",
                     "OWT",
@@ -271,7 +260,7 @@ public class AddRemoveDeviceIntegrationTest {
   }
 
   @Test
-  void removeDevice() throws InterruptedException, LinkDeviceTokenAlreadyUsedException {
+  void removeDevice() throws LinkDeviceTokenAlreadyUsedException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -283,7 +272,7 @@ public class AddRemoveDeviceIntegrationTest {
     assertEquals(1, accountsManager.getByAccountIdentifier(account.getAccountIdentifier()).orElseThrow().getDevices().size());
 
     final Pair<Account, Device> updatedAccountAndDevice =
-        accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+        accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
                     "device-name".getBytes(StandardCharsets.UTF_8),
                     "password",
                     "OWT",
@@ -293,30 +282,30 @@ public class AddRemoveDeviceIntegrationTest {
                     true,
                     Optional.empty(),
                     Optional.empty()),
-                accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI)));
+                accountsManager.generateLinkDeviceToken(account.getAccountIdentifier()));
 
     final byte addedDeviceId = updatedAccountAndDevice.second().getId();
 
-    final Account updatedAccount = accountsManager.removeDevice(updatedAccountAndDevice.first().getIdentifier(IdentityType.ACI), addedDeviceId);
+    final Account updatedAccount = accountsManager.removeDevice(updatedAccountAndDevice.first().getAccountIdentifier(), addedDeviceId);
 
     assertEquals(1, updatedAccount.getDevices().size());
 
     assertFalse(keysManager.getEcSignedPreKey(updatedAccount.getAccountIdentifier(), addedDeviceId).join().isPresent());
     assertFalse(
-        keysManager.getEcSignedPreKey(updatedAccount.getPhoneNumberIdentifier(), addedDeviceId).join().isPresent());
+        keysManager.getEcSignedPreKey(updatedAccount.getPhoneNumberIdentifier().orElseThrow(), addedDeviceId).join().isPresent());
     assertFalse(keysManager.getLastResort(updatedAccount.getAccountIdentifier(), addedDeviceId).join().isPresent());
-    assertFalse(keysManager.getLastResort(updatedAccount.getPhoneNumberIdentifier(), addedDeviceId).join().isPresent());
+    assertFalse(keysManager.getLastResort(updatedAccount.getPhoneNumberIdentifier().orElseThrow(), addedDeviceId).join().isPresent());
 
     assertTrue(keysManager.getEcSignedPreKey(updatedAccount.getAccountIdentifier(), Device.PRIMARY_ID).join().isPresent());
     assertTrue(
-        keysManager.getEcSignedPreKey(updatedAccount.getPhoneNumberIdentifier(), Device.PRIMARY_ID).join().isPresent());
+        keysManager.getEcSignedPreKey(updatedAccount.getPhoneNumberIdentifier().orElseThrow(), Device.PRIMARY_ID).join().isPresent());
     assertTrue(keysManager.getLastResort(updatedAccount.getAccountIdentifier(), Device.PRIMARY_ID).join().isPresent());
     assertTrue(
-        keysManager.getLastResort(updatedAccount.getPhoneNumberIdentifier(), Device.PRIMARY_ID).join().isPresent());
+        keysManager.getLastResort(updatedAccount.getPhoneNumberIdentifier().orElseThrow(), Device.PRIMARY_ID).join().isPresent());
   }
 
   @Test
-  void removeDevicePartialFailure() throws InterruptedException, LinkDeviceTokenAlreadyUsedException {
+  void removeDevicePartialFailure() throws LinkDeviceTokenAlreadyUsedException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -327,10 +316,10 @@ public class AddRemoveDeviceIntegrationTest {
     final Account account = AccountsHelper.createAccount(accountsManager, number);
     assertEquals(1, accountsManager.getByAccountIdentifier(account.getAccountIdentifier()).orElseThrow().getDevices().size());
 
-    final UUID aci = account.getIdentifier(IdentityType.ACI);
+    final UUID aci = account.getAccountIdentifier();
 
     final Pair<Account, Device> updatedAccountAndDevice =
-        accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+        accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
                     "device-name".getBytes(StandardCharsets.UTF_8),
                     "password",
                     "OWT",
@@ -340,7 +329,7 @@ public class AddRemoveDeviceIntegrationTest {
                     true,
                     Optional.empty(),
                     Optional.empty()),
-                accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI)));
+                accountsManager.generateLinkDeviceToken(account.getAccountIdentifier()));
 
     final byte addedDeviceId = updatedAccountAndDevice.second().getId();
 
@@ -348,7 +337,7 @@ public class AddRemoveDeviceIntegrationTest {
         .thenReturn(CompletableFuture.failedFuture(new RuntimeException("OH NO")));
 
     assertThrows(RuntimeException.class,
-        () -> accountsManager.removeDevice(updatedAccountAndDevice.first().getIdentifier(IdentityType.ACI), addedDeviceId));
+        () -> accountsManager.removeDevice(updatedAccountAndDevice.first().getAccountIdentifier(), addedDeviceId));
 
     final Account retrievedAccount = accountsManager.getByAccountIdentifierAsync(aci).join().orElseThrow();
 
@@ -356,21 +345,21 @@ public class AddRemoveDeviceIntegrationTest {
 
     assertTrue(keysManager.getEcSignedPreKey(retrievedAccount.getAccountIdentifier(), addedDeviceId).join().isPresent());
     assertTrue(
-        keysManager.getEcSignedPreKey(retrievedAccount.getPhoneNumberIdentifier(), addedDeviceId).join().isPresent());
+        keysManager.getEcSignedPreKey(retrievedAccount.getPhoneNumberIdentifier().orElseThrow(), addedDeviceId).join().isPresent());
     assertTrue(keysManager.getLastResort(retrievedAccount.getAccountIdentifier(), addedDeviceId).join().isPresent());
     assertTrue(
-        keysManager.getLastResort(retrievedAccount.getPhoneNumberIdentifier(), addedDeviceId).join().isPresent());
+        keysManager.getLastResort(retrievedAccount.getPhoneNumberIdentifier().orElseThrow(), addedDeviceId).join().isPresent());
 
     assertTrue(keysManager.getEcSignedPreKey(retrievedAccount.getAccountIdentifier(), Device.PRIMARY_ID).join().isPresent());
-    assertTrue(keysManager.getEcSignedPreKey(retrievedAccount.getPhoneNumberIdentifier(), Device.PRIMARY_ID).join()
+    assertTrue(keysManager.getEcSignedPreKey(retrievedAccount.getPhoneNumberIdentifier().orElseThrow(), Device.PRIMARY_ID).join()
         .isPresent());
     assertTrue(keysManager.getLastResort(retrievedAccount.getAccountIdentifier(), Device.PRIMARY_ID).join().isPresent());
     assertTrue(
-        keysManager.getLastResort(retrievedAccount.getPhoneNumberIdentifier(), Device.PRIMARY_ID).join().isPresent());
+        keysManager.getLastResort(retrievedAccount.getPhoneNumberIdentifier().orElseThrow(), Device.PRIMARY_ID).join().isPresent());
   }
 
   @Test
-  void waitForNewLinkedDevice() throws InterruptedException, LinkDeviceTokenAlreadyUsedException {
+  void waitForNewLinkedDevice() throws LinkDeviceTokenAlreadyUsedException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -380,7 +369,7 @@ public class AddRemoveDeviceIntegrationTest {
 
     final Account account = AccountsHelper.createAccount(accountsManager, number);
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI));
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getAccountIdentifier());
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
     final CompletableFuture<Optional<DeviceInfo>> displacedFuture = accountsManager.waitForNewLinkedDevice(
@@ -396,7 +385,7 @@ public class AddRemoveDeviceIntegrationTest {
     assertEquals(Optional.empty(), displacedFuture.join());
 
     final Pair<Account, Device> updatedAccountAndDevice =
-        accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+        accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
                     "device-name".getBytes(StandardCharsets.UTF_8),
                     "password",
                     "OWT",
@@ -414,12 +403,12 @@ public class AddRemoveDeviceIntegrationTest {
     final DeviceInfo deviceInfo = maybeDeviceInfo.get();
 
     assertEquals(updatedAccountAndDevice.second().getId(), deviceInfo.id());
-    assertEquals(updatedAccountAndDevice.second().getRegistrationId(IdentityType.ACI), deviceInfo.registrationId());
+    assertEquals(updatedAccountAndDevice.second().getAccountRegistrationId(), deviceInfo.registrationId());
     assertNotNull(deviceInfo.createdAtCiphertext());
   }
 
   @Test
-  void waitForNewLinkedDeviceAlreadyAdded() throws InterruptedException, LinkDeviceTokenAlreadyUsedException {
+  void waitForNewLinkedDeviceAlreadyAdded() throws LinkDeviceTokenAlreadyUsedException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -429,11 +418,11 @@ public class AddRemoveDeviceIntegrationTest {
 
     final Account account = AccountsHelper.createAccount(accountsManager, number);
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getIdentifier(IdentityType.ACI));
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getAccountIdentifier());
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
     final Pair<Account, Device> updatedAccountAndDevice =
-        accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+        accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
                     "device-name".getBytes(StandardCharsets.UTF_8),
                     "password",
                     "OWT",
@@ -457,12 +446,12 @@ public class AddRemoveDeviceIntegrationTest {
     final DeviceInfo deviceInfo = maybeDeviceInfo.get();
 
     assertEquals(updatedAccountAndDevice.second().getId(), deviceInfo.id());
-    assertEquals(updatedAccountAndDevice.second().getRegistrationId(IdentityType.ACI), deviceInfo.registrationId());
+    assertEquals(updatedAccountAndDevice.second().getAccountRegistrationId(), deviceInfo.registrationId());
     assertNotNull(deviceInfo.createdAtCiphertext());
   }
 
   @Test
-  void waitForNewLinkedDeviceTimeout() throws InterruptedException {
+  void waitForNewLinkedDeviceTimeout() {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -487,7 +476,7 @@ public class AddRemoveDeviceIntegrationTest {
       "10_000,10_001,false",   // pending message after now
   })
   void waitForMessageFetch(long currentTime, Long oldestMessage, boolean shouldWait)
-      throws InterruptedException, LinkDeviceTokenAlreadyUsedException {
+      throws LinkDeviceTokenAlreadyUsedException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -498,7 +487,7 @@ public class AddRemoveDeviceIntegrationTest {
     final String linkDeviceToken = accountsManager.generateLinkDeviceToken(UUID.randomUUID());
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
-    accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+    accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
             "device-name".getBytes(StandardCharsets.UTF_8),
             "password",
             "OWT",
@@ -524,8 +513,7 @@ public class AddRemoveDeviceIntegrationTest {
   // preempted by the timeout check
   @Timeout(value = 10, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
   @Test
-  void waitForMessageFetchRetries()
-      throws InterruptedException, LinkDeviceTokenAlreadyUsedException {
+  void waitForMessageFetchRetries() throws LinkDeviceTokenAlreadyUsedException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -537,7 +525,7 @@ public class AddRemoveDeviceIntegrationTest {
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
     clock.pin(Instant.ofEpochMilli(0));
-    accountsManager.addDevice(account.getIdentifier(IdentityType.ACI), new DeviceSpec(
+    accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
             "device-name".getBytes(StandardCharsets.UTF_8),
             "password",
             "OWT",

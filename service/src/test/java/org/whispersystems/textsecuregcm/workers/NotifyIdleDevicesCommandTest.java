@@ -18,7 +18,6 @@ import net.sourceforge.argparse4j.inf.Namespace;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.push.IdleDeviceNotificationScheduler;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.Device;
@@ -50,6 +49,8 @@ class NotifyIdleDevicesCommandTest {
           null,
           null,
           messagesManager,
+          null,
+          null,
           null,
           null,
           null,
@@ -130,7 +131,7 @@ class NotifyIdleDevicesCommandTest {
 
 
     final Account account = mock(Account.class);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.getDevices()).thenReturn(List.of(eligibleDevice, ineligibleDevice));
 
     when(messagesManager.mayHavePersistedMessages(accountIdentifier, eligibleDevice))

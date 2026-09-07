@@ -34,11 +34,11 @@ import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
 import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.push.RedisMessageAvailabilityManager;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
+import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import reactor.core.observability.micrometer.Micrometer;
 import reactor.core.publisher.Flux;
@@ -132,7 +132,7 @@ public class MessagesManager {
       foundationDbInsertFuture =
           foundationDbMessageStore.insert(new AciServiceIdentifier(accountIdentifier), minimizedMessagesByDeviceId)
               .exceptionally(e -> {
-                if (e instanceof FDBException fdbException) {
+                if (ExceptionUtils.unwrap(e) instanceof final FDBException fdbException) {
                   Metrics.counter(INSERT_FDB_EXCEPTIONS_COUNTER_NAME, "code", String.valueOf(fdbException.getCode()))
                       .increment();
                 } else {
@@ -142,7 +142,7 @@ public class MessagesManager {
                       e);
                 }
 
-                return Collections.emptyMap();
+                throw ExceptionUtils.wrap(e);
               });
     } else {
       foundationDbInsertFuture = CompletableFuture.completedFuture(Collections.emptyMap());
@@ -241,7 +241,7 @@ public class MessagesManager {
                     final SealedSenderMultiRecipientMessage.Recipient recipient = serviceIdAndRecipient.getValue();
                     final byte[] devices = recipient.getDevices();
 
-                    return insertAsync(resolvedRecipients.get(recipient).getIdentifier(IdentityType.ACI),
+                    return insertAsync(resolvedRecipients.get(recipient).getAccountIdentifier(),
                         IntStream.range(0, devices.length).mapToObj(i -> devices[i])
                             .collect(Collectors.toMap(deviceId -> deviceId, _ -> prototypeMessage.toBuilder()
                                 .setContent(ByteString.copyFrom(multiRecipientMessage.messageForRecipient(serviceIdAndRecipient.getValue())))

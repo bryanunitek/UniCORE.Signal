@@ -8,11 +8,13 @@ package org.whispersystems.textsecuregcm.controllers;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -58,14 +60,17 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junitpioneer.jupiter.cartesian.ArgumentSets;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.protocol.ecc.ECKeyPair;
 import org.signal.libsignal.zkgroup.InvalidInputException;
+import org.signal.libsignal.zkgroup.ServerSecretParams;
 import org.signal.libsignal.zkgroup.VerificationFailedException;
 import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialPresentation;
+import org.signal.libsignal.zkgroup.receipts.ReceiptSerial;
 import org.signal.libsignal.zkgroup.receipts.ServerZkReceiptOperations;
 import org.whispersystems.textsecuregcm.auth.InvalidRegistrationSessionException;
 import org.whispersystems.textsecuregcm.auth.PhoneVerificationTokenManager;
@@ -99,6 +104,7 @@ import org.whispersystems.textsecuregcm.storage.DeviceIdentityInfo;
 import org.whispersystems.textsecuregcm.storage.DeviceSpec;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.ReceiptAlreadyRedeemedException;
+import org.whispersystems.textsecuregcm.storage.ReceiptCredentialTestUtil;
 import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
 import org.whispersystems.textsecuregcm.tests.util.AuthHelper;
 import org.whispersystems.textsecuregcm.tests.util.KeysHelper;
@@ -124,6 +130,7 @@ class RegistrationControllerTest {
   private final PhoneVerificationTokenManager phoneVerificationTokenManager = mock(PhoneVerificationTokenManager.class);
 
   private final RateLimiter registrationLimiter = mock(RateLimiter.class);
+  private final RateLimiter totpLimiter = mock(RateLimiter.class);
 
   private static final Clock CLOCK = TestClock.pinned(Instant.now());
 
@@ -143,13 +150,14 @@ class RegistrationControllerTest {
       .setMapper(SystemMapper.jsonMapper())
       .setTestContainerFactory(new GrizzlyWebTestContainerFactory())
       .addResource(new RegistrationController(accountsManager, phoneVerificationTokenManager,
-          registrationLockVerificationManager, rateLimiters, registrationFraudChecker, ReceiptCredentialPresentation::new, mock(
-          ServerZkReceiptOperations.class), CLOCK, DYNAMIC_CONFIGURATION_MANAGER))
+          registrationLockVerificationManager, rateLimiters, registrationFraudChecker, ReceiptCredentialPresentation::new,
+          new ServerZkReceiptOperations(ReceiptCredentialTestUtil.RECEIPT_PARAMS), CLOCK, DYNAMIC_CONFIGURATION_MANAGER))
       .build();
 
   @BeforeEach
   void setUp() throws Exception {
     when(rateLimiters.getRegistrationLimiter()).thenReturn(registrationLimiter);
+    when(rateLimiters.getCheckTotpLimiter()).thenReturn(totpLimiter);
 
     when(accountsManager.update(any(UUID.class), any())).thenAnswer(invocation -> {
       final Account account = invocation.getArgument(0);
@@ -160,6 +168,7 @@ class RegistrationControllerTest {
       return invocation.getArgument(0);
     });
 
+    when(accountsManager.verifyTotp(any(), any(), any())).thenReturn(true);
 
     reset(DYNAMIC_CONFIGURATION_MANAGER, DYNAMIC_CONFIGURATION);
 
@@ -301,7 +310,7 @@ class RegistrationControllerTest {
 
     final Account account = mock(Account.class);
     when(accountsManager.getByE164(any())).thenReturn(Optional.of(account));
-    when(account.getNumberOptional()).thenReturn(Optional.of(NUMBER));
+    when(account.getNumber()).thenReturn(Optional.of(NUMBER));
     when(account.hasCapability(DeviceCapability.TRANSFER)).thenReturn(deviceTransferSupported);
 
     final int expectedStatus;
@@ -353,7 +362,7 @@ class RegistrationControllerTest {
 
     final Account account = mock(Account.class);
     when(accountsManager.getByE164(oldFormatBeninNumber)).thenReturn(Optional.of(account));
-    when(account.getNumberOptional()).thenReturn(Optional.of(oldFormatBeninNumber));
+    when(account.getNumber()).thenReturn(Optional.of(oldFormatBeninNumber));
     when(accountsManager.getByE164(newFormatBeninNumber)).thenReturn(Optional.empty());
 
     doThrow(new WebApplicationException(RegistrationLockError.MISMATCH.getExpectedStatus()))
@@ -384,7 +393,7 @@ class RegistrationControllerTest {
     if (existingAccount) {
       final Account account = mock(Account.class);
       when(account.hasCapability(DeviceCapability.TRANSFER)).thenReturn(transferSupported);
-      when(account.getNumberOptional()).thenReturn(Optional.of(NUMBER));
+      when(account.getNumber()).thenReturn(Optional.of(NUMBER));
       maybeAccount = Optional.of(account);
     } else {
       maybeAccount = Optional.empty();
@@ -404,6 +413,50 @@ class RegistrationControllerTest {
     try (Response response = request.post(Entity.json(requestJson("sessionId", new byte[0], skipDeviceTransfer, 1, 2)))) {
       assertEquals(expectedStatus, response.getStatus());
     }
+  }
+
+  @Test
+  void totpInvalid() {
+    final Account existingAccount = mock(Account.class);
+    when(existingAccount.getNumber()).thenReturn(Optional.of(NUMBER));
+
+    when(accountsManager.getByE164(any())).thenReturn(Optional.of(existingAccount));
+    when(accountsManager.verifyTotp(any(), any(), any())).thenReturn(false);
+
+    final Invocation.Builder request = resources.getJerseyTest()
+        .target("/v1/registration")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getProvisioningAuthHeader(NUMBER, PASSWORD));
+
+    try (Response response = request.post(Entity.json(requestJson("sessionId", new byte[0], false, 1, 2)))) {
+      assertEquals(441, response.getStatus());
+    }
+
+    verify(accountsManager, never()).create(any(), any(), any(), any(), any(), any());
+  }
+
+  @Test
+  void totpRateLimited() throws RateLimitExceededException {
+    final Account existingAccount = mock(Account.class);
+    when(existingAccount.getAccountIdentifier()).thenReturn(UUID.randomUUID());
+    when(existingAccount.getNumber()).thenReturn(Optional.of(NUMBER));
+
+    when(accountsManager.getByE164(any())).thenReturn(Optional.of(existingAccount));
+
+    doThrow(new RateLimitExceededException(Duration.ofSeconds(5)))
+        .when(totpLimiter).validate(any(UUID.class));
+
+    final Invocation.Builder request = resources.getJerseyTest()
+        .target("/v1/registration")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getProvisioningAuthHeader(NUMBER, PASSWORD));
+
+    try (Response response = request.post(Entity.json(requestJson("sessionId", new byte[0], false, 1, 2)))) {
+      assertEquals(429, response.getStatus());
+    }
+
+    verify(accountsManager, never()).verifyTotp(any(), any(), any());
+    verify(accountsManager, never()).create(any(), any(), any(), any(), any(), any());
   }
 
   // this is functionally the same as deviceTransferAvailable(existingAccount=false)
@@ -481,7 +534,7 @@ class RegistrationControllerTest {
             new RegistrationRequest("session-id",
                 new byte[0],
                 null,
-                fetchesMessagesAccountAttributes,
+                null, fetchesMessagesAccountAttributes,
                 true,
                 aciIdentityKey,
                 pniIdentityKey,
@@ -495,6 +548,7 @@ class RegistrationControllerTest {
         Arguments.argumentSet("\"Fetches messages\" is true, but an FCM (GCM) token is provided",
             new RegistrationRequest("session-id",
                 new byte[0],
+                null,
                 null,
                 fetchesMessagesAccountAttributes,
                 true,
@@ -510,6 +564,7 @@ class RegistrationControllerTest {
         Arguments.argumentSet("\"Fetches messages\" is false, but multiple types of push tokens are provided",
             new RegistrationRequest("session-id",
                 new byte[0],
+                null,
                 null,
                 pushAccountAttributes,
                 true,
@@ -565,6 +620,7 @@ class RegistrationControllerTest {
             new RegistrationRequest("session-id",
                 new byte[0],
                 null,
+                null,
                 accountAttributes,
                 true,
                 aciIdentityKey,
@@ -579,6 +635,7 @@ class RegistrationControllerTest {
         Arguments.argumentSet("Signed ACI EC pre-key is missing",
             new RegistrationRequest("session-id",
                 new byte[0],
+                null,
                 null,
                 accountAttributes,
                 true,
@@ -595,6 +652,7 @@ class RegistrationControllerTest {
             new RegistrationRequest("session-id",
                 new byte[0],
                 null,
+                null,
                 accountAttributes,
                 true,
                 aciIdentityKey,
@@ -609,6 +667,7 @@ class RegistrationControllerTest {
         Arguments.argumentSet("Signed ACI KEM pre-key is missing",
             new RegistrationRequest("session-id",
                 new byte[0],
+                null,
                 null,
                 accountAttributes,
                 true,
@@ -625,6 +684,7 @@ class RegistrationControllerTest {
             new RegistrationRequest("session-id",
                 new byte[0],
                 null,
+                null,
                 accountAttributes,
                 true,
                 null,
@@ -639,6 +699,7 @@ class RegistrationControllerTest {
         Arguments.argumentSet("All signed pre-keys are present, but PNI identity key is missing",
             new RegistrationRequest("session-id",
                 new byte[0],
+                null,
                 null,
                 accountAttributes,
                 true,
@@ -658,7 +719,7 @@ class RegistrationControllerTest {
   @ValueSource(booleans = {true, false})
   void reregistrationFlag(final boolean accountExists) {
     final Account existingAccount = mock(Account.class);
-    when(existingAccount.getNumberOptional()).thenReturn(Optional.of(NUMBER));
+    when(existingAccount.getNumber()).thenReturn(Optional.of(NUMBER));
     when(accountsManager.getByE164(any())).thenReturn(accountExists ? Optional.of(existingAccount) : Optional.empty());
 
     final Account account = mock(Account.class);
@@ -719,6 +780,7 @@ class RegistrationControllerTest {
     final RegistrationRequest registrationRequest = new RegistrationRequest(null,
         new byte[0],
         receiptCredentialPresentation.serialize(),
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -795,6 +857,7 @@ class RegistrationControllerTest {
     final RegistrationRequest registrationRequest = new RegistrationRequest(null,
         new byte[0],
         receiptCredentialPresentation.serialize(),
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -820,7 +883,7 @@ class RegistrationControllerTest {
 
   @ParameterizedTest
   @MethodSource
-  void registerAccountBadReceipt(final byte[] receiptCredentialPresentation) {
+  void registerAccountBadReceipt(final byte[] receiptCredentialPresentation, final int expectedStatusCode) {
     final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
     final IdentityKey aciIdentityKey = new IdentityKey(aciIdentityKeyPair.getPublicKey());
     final ECSignedPreKey aciSignedPreKey = KeysHelper.signedECPreKey(1, aciIdentityKeyPair);
@@ -838,6 +901,7 @@ class RegistrationControllerTest {
     final RegistrationRequest registrationRequest = new RegistrationRequest(null,
         new byte[0],
         receiptCredentialPresentation,
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -862,7 +926,7 @@ class RegistrationControllerTest {
         .header(HttpHeaders.AUTHORIZATION, AuthHelper.getProvisioningAuthHeader(NUMBER, PASSWORD));
 
     try (Response response = request.post(Entity.json(requestToJson(registrationRequest)))) {
-      assertEquals(400, response.getStatus());
+      assertEquals(expectedStatusCode, response.getStatus());
     }
 
     verifyNoInteractions(phoneVerificationTokenManager);
@@ -871,9 +935,14 @@ class RegistrationControllerTest {
 
   static Stream<Arguments> registerAccountBadReceipt() throws InvalidInputException, VerificationFailedException {
     return Stream.of(
-        Arguments.argumentSet("malformed receipt", new byte[]{0, 0}),
-        Arguments.argumentSet("expired receipt", receiptPresentation(CLOCK.instant().minusSeconds(5), ReceiptLevel.LOGIN.getValue()).serialize()),
-        Arguments.argumentSet("wrong receipt level", receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.BACKUP_PAID.getValue()).serialize())
+        Arguments.argumentSet("malformed receipt", new byte[]{0, 0}, 400),
+        Arguments.argumentSet("expired receipt",
+            receiptPresentation(CLOCK.instant().minusSeconds(5), ReceiptLevel.LOGIN.getValue()).serialize(), 401),
+        Arguments.argumentSet("receipt signed by wrong params", receiptPresentation(
+            ServerSecretParams.generate(), new ReceiptSerial(TestRandomUtil.nextBytes(ReceiptSerial.SIZE)),
+            CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()).serialize(), 401),
+        Arguments.argumentSet("wrong receipt level", receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)),
+            ReceiptLevel.BACKUP_PAID.getValue()).serialize(), 400)
     );
   }
 
@@ -895,6 +964,7 @@ class RegistrationControllerTest {
         Base64.getEncoder().encodeToString("session-id".getBytes(StandardCharsets.UTF_8)),
         new byte[0],
         receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), 1).serialize(),
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -938,6 +1008,7 @@ class RegistrationControllerTest {
         null,
         recoveryPassword,
         receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), 1).serialize(),
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -960,19 +1031,23 @@ class RegistrationControllerTest {
 
   }
 
-  @Test
-  void registerAccountMissingRecoveryPassword() throws Exception {
+  @ParameterizedTest
+  @NullSource
+  @ValueSource(ints = 0)
+  void registerAccountMissingRecoveryPassword(@Nullable final Integer recoveryPasswordLength) throws Exception {
     final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
     final IdentityKey aciIdentityKey = new IdentityKey(aciIdentityKeyPair.getPublicKey());
 
     final AccountAttributes accountAttributes =
         new AccountAttributes(true, 1, null, "test".getBytes(StandardCharsets.UTF_8), null, false,
-            DeviceCapability.CAPABILITIES_REQUIRED_FOR_NEW_DEVICES, null)
+            DeviceCapability.CAPABILITIES_REQUIRED_FOR_NEW_DEVICES,
+            recoveryPasswordLength == null ? null : new byte[recoveryPasswordLength])
             .setUnidentifiedAccessKey(TestRandomUtil.nextBytes(16));
 
     final RegistrationRequest registrationRequest = new RegistrationRequest(null,
         new byte[0],
-        receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), 1).serialize(),
+        receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()).serialize(),
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -1021,6 +1096,7 @@ class RegistrationControllerTest {
     final RegistrationRequest registrationRequest = new RegistrationRequest(null,
         new byte[0],
         receiptCredentialPresentation.serialize(),
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -1055,7 +1131,8 @@ class RegistrationControllerTest {
 
     final RegistrationRequest registrationRequest = new RegistrationRequest(null,
         new byte[0],
-        receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), 1).serialize(),
+        receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()).serialize(),
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -1076,7 +1153,8 @@ class RegistrationControllerTest {
         .header(HttpHeaders.AUTHORIZATION, AuthHelper.getProvisioningAuthHeader(NUMBER, PASSWORD));
 
     try (Response response = request.post(Entity.json(requestToJson(registrationRequest)))) {
-      assertEquals(400, response.getStatus());
+      assertEquals(401, response.getStatus());
+      verify(accountsManager).create(any(), any(), any(), any(), any());
     }
   }
 
@@ -1103,6 +1181,7 @@ class RegistrationControllerTest {
         Base64.getEncoder().encodeToString("session-id".getBytes(StandardCharsets.UTF_8)),
         new byte[0],
         null,
+        null,
         accountAttributes,
         true,
         aciIdentityKey,
@@ -1124,6 +1203,464 @@ class RegistrationControllerTest {
     }
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  void recoverAccount(final boolean existingAccountHasPhoneNumber) {
+    final IdentityKey aciIdentityKey;
+    final IdentityKey pniIdentityKey;
+    final ECSignedPreKey aciSignedPreKey;
+    final ECSignedPreKey pniSignedPreKey;
+    final KEMSignedPreKey aciPqLastResortPreKey;
+    final KEMSignedPreKey pniPqLastResortPreKey;
+    {
+      final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
+      final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+
+      aciIdentityKey = new IdentityKey(aciIdentityKeyPair.getPublicKey());
+      pniIdentityKey = new IdentityKey(pniIdentityKeyPair.getPublicKey());
+      aciSignedPreKey = KeysHelper.signedECPreKey(1, aciIdentityKeyPair);
+      pniSignedPreKey = KeysHelper.signedECPreKey(2, pniIdentityKeyPair);
+      aciPqLastResortPreKey = KeysHelper.signedKEMPreKey(3, aciIdentityKeyPair);
+      pniPqLastResortPreKey = KeysHelper.signedKEMPreKey(4, pniIdentityKeyPair);
+    }
+
+    final byte[] deviceName = "test".getBytes(StandardCharsets.UTF_8);
+    final int registrationId = 1;
+    final int pniRegistrationId = 2;
+
+    final byte[] newRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    final Set<DeviceCapability> deviceCapabilities = DeviceCapability.CAPABILITIES_REQUIRED_FOR_NEW_DEVICES;
+
+    final AccountAttributes accountAttributes =
+        new AccountAttributes(true, registrationId, pniRegistrationId, deviceName, null, false, deviceCapabilities, newRecoveryPassword)
+            .setUnidentifiedAccessKey(TestRandomUtil.nextBytes(16));
+
+    final byte[] existingRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    final Account existingAccount = new Account();
+    existingAccount.setAccountIdentifier(UUID.randomUUID());
+    existingAccount.setAccountRecoveryPassword(existingRecoveryPassword);
+
+    if (existingAccountHasPhoneNumber) {
+      existingAccount.setNumber(PhoneNumberUtil.getInstance().format(
+          PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164),
+          UUID.randomUUID());
+
+      existingAccount.setPhoneNumberIdentityKey(pniIdentityKey);
+    }
+
+    when(accountsManager.getByAccountIdentifier(existingAccount.getAccountIdentifier()))
+        .thenReturn(Optional.of(existingAccount));
+
+    when(accountsManager.recover(any(), any(), any(), any(), any(), any()))
+        .thenReturn(mock(Account.class));
+
+    final RegistrationRequest registrationRequest = new RegistrationRequest(null,
+        existingRecoveryPassword,
+        null,
+        null,
+        accountAttributes,
+        true,
+        aciIdentityKey,
+        pniIdentityKey,
+        new DeviceActivationRequest(aciSignedPreKey,
+            Optional.of(pniSignedPreKey),
+            aciPqLastResortPreKey,
+            Optional.of(pniPqLastResortPreKey),
+            Optional.empty(),
+            Optional.empty()));
+
+    final Invocation.Builder request = resources.getJerseyTest()
+        .target("/v1/registration")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getProvisioningAuthHeader(existingAccount.getAccountIdentifier().toString(), PASSWORD));
+
+    try (final Response response = request.post(Entity.json(requestToJson(registrationRequest)))) {
+      assertEquals(200, response.getStatus());
+
+      final AccountCreationResponse creationResponse = response.readEntity(AccountCreationResponse.class);
+      assertTrue(creationResponse.reregistration());
+    }
+
+    verify(accountsManager).recover(
+        eq(existingAccount),
+        argThat(attributes -> accountAttributesEqual(attributes, accountAttributes)),
+        eq(aciIdentityKey),
+        eq(existingAccountHasPhoneNumber ? Optional.of(pniIdentityKey) : Optional.empty()),
+        eq(new DeviceSpec(
+            deviceName,
+            PASSWORD,
+            null,
+            deviceCapabilities,
+            new DeviceIdentityInfo(registrationId, aciSignedPreKey, aciPqLastResortPreKey),
+            existingAccountHasPhoneNumber
+                ? Optional.of(new DeviceIdentityInfo(pniRegistrationId, pniSignedPreKey, pniPqLastResortPreKey))
+                : Optional.empty(),
+            true,
+            Optional.empty(),
+            Optional.empty())),
+        any()
+    );
+
+    verifyNoInteractions(phoneVerificationTokenManager);
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void recoverAccountBadRequest(final Account existingAccount,
+      final UUID accountIdentifier,
+      final RegistrationRequest registrationRequest,
+      final int expectedStatus) {
+
+    when(accountsManager.getByAccountIdentifier(any()))
+        .thenReturn(Optional.empty());
+
+    when(accountsManager.getByAccountIdentifier(existingAccount.getAccountIdentifier()))
+        .thenReturn(Optional.of(existingAccount));
+
+    final Invocation.Builder request = resources.getJerseyTest()
+        .target("/v1/registration")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getProvisioningAuthHeader(accountIdentifier.toString(), PASSWORD));
+
+    try (final Response response = request.post(Entity.json(requestToJson(registrationRequest)))) {
+      assertEquals(expectedStatus, response.getStatus());
+    }
+
+    verify(accountsManager, never()).recover(any(), any(), any(), any(), any(), any());
+    verifyNoInteractions(phoneVerificationTokenManager);
+  }
+
+  private static List<Arguments> recoverAccountBadRequest() {
+    final IdentityKey aciIdentityKey;
+    final IdentityKey pniIdentityKey;
+    final ECSignedPreKey aciSignedPreKey;
+    final ECSignedPreKey pniSignedPreKey;
+    final KEMSignedPreKey aciPqLastResortPreKey;
+    final KEMSignedPreKey pniPqLastResortPreKey;
+    {
+      final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
+      final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+
+      aciIdentityKey = new IdentityKey(aciIdentityKeyPair.getPublicKey());
+      pniIdentityKey = new IdentityKey(pniIdentityKeyPair.getPublicKey());
+      aciSignedPreKey = KeysHelper.signedECPreKey(1, aciIdentityKeyPair);
+      pniSignedPreKey = KeysHelper.signedECPreKey(2, pniIdentityKeyPair);
+      aciPqLastResortPreKey = KeysHelper.signedKEMPreKey(3, aciIdentityKeyPair);
+      pniPqLastResortPreKey = KeysHelper.signedKEMPreKey(4, pniIdentityKeyPair);
+    }
+
+    final byte[] deviceName = "test".getBytes(StandardCharsets.UTF_8);
+    final int registrationId = 1;
+    final int pniRegistrationId = 2;
+
+    final byte[] newRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    final Set<DeviceCapability> deviceCapabilities = DeviceCapability.CAPABILITIES_REQUIRED_FOR_NEW_DEVICES;
+
+    final AccountAttributes accountAttributes =
+        new AccountAttributes(true, registrationId, pniRegistrationId, deviceName, null, false, deviceCapabilities, newRecoveryPassword)
+            .setUnidentifiedAccessKey(TestRandomUtil.nextBytes(16));
+
+    final byte[] existingRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    final Account existingAccount = new Account();
+    existingAccount.setAccountIdentifier(UUID.randomUUID());
+    existingAccount.setAccountRecoveryPassword(existingRecoveryPassword);
+    existingAccount.setNumber(PhoneNumberUtil.getInstance().format(
+            PhoneNumberUtil.getInstance().getExampleNumber("US"), PhoneNumberUtil.PhoneNumberFormat.E164),
+        UUID.randomUUID());
+
+    existingAccount.setPhoneNumberIdentityKey(pniIdentityKey);
+
+    final Device primaryDevice = new Device();
+    primaryDevice.setId(Device.PRIMARY_ID);
+    primaryDevice.setCapabilities(Set.of(DeviceCapability.TRANSFER));
+
+    existingAccount.addDevice(primaryDevice);
+
+    return List.of(
+        Arguments.argumentSet("Missing recovery password",
+            existingAccount,
+            existingAccount.getAccountIdentifier(),
+            new RegistrationRequest(null,
+                null,
+                null,
+                null,
+                accountAttributes,
+                true,
+                aciIdentityKey,
+                pniIdentityKey,
+                new DeviceActivationRequest(aciSignedPreKey,
+                    Optional.of(pniSignedPreKey),
+                    aciPqLastResortPreKey,
+                    Optional.of(pniPqLastResortPreKey),
+                    Optional.empty(),
+                    Optional.empty())),
+            422),
+
+        Arguments.argumentSet("Session ID instead of recovery password",
+            existingAccount,
+            existingAccount.getAccountIdentifier(),
+            new RegistrationRequest("session-id",
+                null,
+                null,
+                null,
+                accountAttributes,
+                true,
+                aciIdentityKey,
+                pniIdentityKey,
+                new DeviceActivationRequest(aciSignedPreKey,
+                    Optional.of(pniSignedPreKey),
+                    aciPqLastResortPreKey,
+                    Optional.of(pniPqLastResortPreKey),
+                    Optional.empty(),
+                    Optional.empty())),
+            400),
+
+        Arguments.argumentSet("Receipt credential presentation instead of recovery password",
+            existingAccount,
+            existingAccount.getAccountIdentifier(),
+            new RegistrationRequest(null,
+                null,
+                TestRandomUtil.nextBytes(16),
+                null,
+                accountAttributes,
+                true,
+                aciIdentityKey,
+                pniIdentityKey,
+                new DeviceActivationRequest(aciSignedPreKey,
+                    Optional.of(pniSignedPreKey),
+                    aciPqLastResortPreKey,
+                    Optional.of(pniPqLastResortPreKey),
+                    Optional.empty(),
+                    Optional.empty())),
+            400),
+
+        Arguments.argumentSet("Missing PNI identity key",
+            existingAccount,
+            existingAccount.getAccountIdentifier(),
+            new RegistrationRequest(null,
+                existingRecoveryPassword,
+                null,
+                null,
+                accountAttributes,
+                true,
+                aciIdentityKey,
+                null,
+                new DeviceActivationRequest(aciSignedPreKey,
+                    Optional.of(pniSignedPreKey),
+                    aciPqLastResortPreKey,
+                    Optional.of(pniPqLastResortPreKey),
+                    Optional.empty(),
+                    Optional.empty())),
+            422),
+
+        Arguments.argumentSet("Account not found",
+            existingAccount,
+            UUID.randomUUID(),
+            new RegistrationRequest(null,
+                existingRecoveryPassword,
+                null,
+                null,
+                accountAttributes,
+                true,
+                aciIdentityKey,
+                pniIdentityKey,
+                new DeviceActivationRequest(aciSignedPreKey,
+                    Optional.of(pniSignedPreKey),
+                    aciPqLastResortPreKey,
+                    Optional.of(pniPqLastResortPreKey),
+                    Optional.empty(),
+                    Optional.empty())),
+            403),
+
+        Arguments.argumentSet("Incorrect password",
+            existingAccount,
+            existingAccount.getAccountIdentifier(),
+            new RegistrationRequest(null,
+                TestRandomUtil.nextBytes(32),
+                null,
+                null,
+                accountAttributes,
+                true,
+                aciIdentityKey,
+                pniIdentityKey,
+                new DeviceActivationRequest(aciSignedPreKey,
+                    Optional.of(pniSignedPreKey),
+                    aciPqLastResortPreKey,
+                    Optional.of(pniPqLastResortPreKey),
+                    Optional.empty(),
+                    Optional.empty())),
+            403),
+
+        Arguments.argumentSet("Device transfer opt-out required",
+            existingAccount,
+            existingAccount.getAccountIdentifier(),
+            new RegistrationRequest(null,
+                existingRecoveryPassword,
+                null,
+                null,
+                accountAttributes,
+                false,
+                aciIdentityKey,
+                pniIdentityKey,
+                new DeviceActivationRequest(aciSignedPreKey,
+                    Optional.of(pniSignedPreKey),
+                    aciPqLastResortPreKey,
+                    Optional.of(pniPqLastResortPreKey),
+                    Optional.empty(),
+                    Optional.empty())),
+            409)
+    );
+  }
+
+  @Test
+  void recoverAccountInvalidTotp() {
+    final IdentityKey aciIdentityKey;
+    final IdentityKey pniIdentityKey;
+    final ECSignedPreKey aciSignedPreKey;
+    final ECSignedPreKey pniSignedPreKey;
+    final KEMSignedPreKey aciPqLastResortPreKey;
+    final KEMSignedPreKey pniPqLastResortPreKey;
+    {
+      final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
+      final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+
+      aciIdentityKey = new IdentityKey(aciIdentityKeyPair.getPublicKey());
+      pniIdentityKey = new IdentityKey(pniIdentityKeyPair.getPublicKey());
+      aciSignedPreKey = KeysHelper.signedECPreKey(1, aciIdentityKeyPair);
+      pniSignedPreKey = KeysHelper.signedECPreKey(2, pniIdentityKeyPair);
+      aciPqLastResortPreKey = KeysHelper.signedKEMPreKey(3, aciIdentityKeyPair);
+      pniPqLastResortPreKey = KeysHelper.signedKEMPreKey(4, pniIdentityKeyPair);
+    }
+
+    final byte[] deviceName = "test".getBytes(StandardCharsets.UTF_8);
+    final int registrationId = 1;
+    final int pniRegistrationId = 2;
+
+    final byte[] newRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    final Set<DeviceCapability> deviceCapabilities = DeviceCapability.CAPABILITIES_REQUIRED_FOR_NEW_DEVICES;
+
+    final AccountAttributes accountAttributes =
+        new AccountAttributes(true, registrationId, pniRegistrationId, deviceName, null, false, deviceCapabilities, newRecoveryPassword)
+            .setUnidentifiedAccessKey(TestRandomUtil.nextBytes(16));
+
+    final byte[] existingRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    final Account existingAccount = new Account();
+    existingAccount.setAccountIdentifier(UUID.randomUUID());
+    existingAccount.setAccountRecoveryPassword(existingRecoveryPassword);
+
+    when(accountsManager.getByAccountIdentifier(existingAccount.getAccountIdentifier()))
+        .thenReturn(Optional.of(existingAccount));
+
+    final Invocation.Builder request = resources.getJerseyTest()
+        .target("/v1/registration")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getProvisioningAuthHeader(existingAccount.getAccountIdentifier().toString(), PASSWORD));
+
+    when(accountsManager.verifyTotp(any(), any(), any()))
+        .thenReturn(false);
+
+    final RegistrationRequest registrationRequest = new RegistrationRequest(null,
+        existingRecoveryPassword,
+        null,
+        null,
+        accountAttributes,
+        true,
+        aciIdentityKey,
+        pniIdentityKey,
+        new DeviceActivationRequest(aciSignedPreKey,
+            Optional.of(pniSignedPreKey),
+            aciPqLastResortPreKey,
+            Optional.of(pniPqLastResortPreKey),
+            Optional.empty(),
+            Optional.empty()));
+
+    try (final Response response = request.post(Entity.json(requestToJson(registrationRequest)))) {
+      assertEquals(441, response.getStatus());
+    }
+
+    verify(accountsManager, never()).recover(any(), any(), any(), any(), any(), any());
+    verifyNoInteractions(phoneVerificationTokenManager);
+  }
+
+  @Test
+  void recoverAccountTotpRateLimited() throws RateLimitExceededException {
+    final IdentityKey aciIdentityKey;
+    final IdentityKey pniIdentityKey;
+    final ECSignedPreKey aciSignedPreKey;
+    final ECSignedPreKey pniSignedPreKey;
+    final KEMSignedPreKey aciPqLastResortPreKey;
+    final KEMSignedPreKey pniPqLastResortPreKey;
+    {
+      final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
+      final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+
+      aciIdentityKey = new IdentityKey(aciIdentityKeyPair.getPublicKey());
+      pniIdentityKey = new IdentityKey(pniIdentityKeyPair.getPublicKey());
+      aciSignedPreKey = KeysHelper.signedECPreKey(1, aciIdentityKeyPair);
+      pniSignedPreKey = KeysHelper.signedECPreKey(2, pniIdentityKeyPair);
+      aciPqLastResortPreKey = KeysHelper.signedKEMPreKey(3, aciIdentityKeyPair);
+      pniPqLastResortPreKey = KeysHelper.signedKEMPreKey(4, pniIdentityKeyPair);
+    }
+
+    final byte[] deviceName = "test".getBytes(StandardCharsets.UTF_8);
+    final int registrationId = 1;
+    final int pniRegistrationId = 2;
+
+    final byte[] newRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    final Set<DeviceCapability> deviceCapabilities = DeviceCapability.CAPABILITIES_REQUIRED_FOR_NEW_DEVICES;
+
+    final AccountAttributes accountAttributes =
+        new AccountAttributes(true, registrationId, pniRegistrationId, deviceName, null, false, deviceCapabilities, newRecoveryPassword)
+            .setUnidentifiedAccessKey(TestRandomUtil.nextBytes(16));
+
+    final byte[] existingRecoveryPassword = TestRandomUtil.nextBytes(32);
+
+    final Account existingAccount = new Account();
+    existingAccount.setAccountIdentifier(UUID.randomUUID());
+    existingAccount.setAccountRecoveryPassword(existingRecoveryPassword);
+
+    when(accountsManager.getByAccountIdentifier(existingAccount.getAccountIdentifier()))
+        .thenReturn(Optional.of(existingAccount));
+
+    final Invocation.Builder request = resources.getJerseyTest()
+        .target("/v1/registration")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getProvisioningAuthHeader(existingAccount.getAccountIdentifier().toString(), PASSWORD));
+
+    doThrow(new RateLimitExceededException(Duration.ofSeconds(5)))
+        .when(totpLimiter).validate(any(UUID.class));
+
+    final RegistrationRequest registrationRequest = new RegistrationRequest(null,
+        existingRecoveryPassword,
+        null,
+        null,
+        accountAttributes,
+        true,
+        aciIdentityKey,
+        pniIdentityKey,
+        new DeviceActivationRequest(aciSignedPreKey,
+            Optional.of(pniSignedPreKey),
+            aciPqLastResortPreKey,
+            Optional.of(pniPqLastResortPreKey),
+            Optional.empty(),
+            Optional.empty()));
+
+    try (final Response response = request.post(Entity.json(requestToJson(registrationRequest)))) {
+      assertEquals(429, response.getStatus());
+    }
+
+    verify(accountsManager, never()).verifyTotp(any(), any(), any());
+    verify(accountsManager, never()).recover(any(), any(), any(), any(), any(), any());
+    verifyNoInteractions(phoneVerificationTokenManager);
+  }
+
   private static boolean accountAttributesEqual(final AccountAttributes a, final AccountAttributes b) {
     return a.getFetchesMessages() == b.getFetchesMessages()
         && a.getRegistrationId() == b.getRegistrationId()
@@ -1142,7 +1679,7 @@ class RegistrationControllerTest {
   void atomicAccountCreationSuccess(final RegistrationRequest registrationRequest,
       final IdentityKey expectedAciIdentityKey,
       final IdentityKey expectedPniIdentityKey,
-      final DeviceSpec expectedDeviceSpec) throws InterruptedException {
+      final DeviceSpec expectedDeviceSpec) {
 
     final UUID accountIdentifier = UUID.randomUUID();
     final UUID phoneNumberIdentifier = UUID.randomUUID();
@@ -1150,7 +1687,7 @@ class RegistrationControllerTest {
 
     final Account account = mock(Account.class);
     when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
-    when(account.getPhoneNumberIdentifierOptional()).thenReturn(Optional.of(phoneNumberIdentifier));
+    when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(phoneNumberIdentifier));
     when(account.getPrimaryDevice()).thenReturn(device);
 
     when(accountsManager.create(any(), any(), any(), any(), any(), any()))
@@ -1217,6 +1754,7 @@ class RegistrationControllerTest {
             new RegistrationRequest("session-id",
                 new byte[0],
                 null,
+                null,
                 fetchesMessagesAccountAttributes,
                 true,
                 aciIdentityKey,
@@ -1245,6 +1783,7 @@ class RegistrationControllerTest {
             new RegistrationRequest("session-id",
                 new byte[0],
                 null,
+                null,
                 pushAccountAttributes,
                 true,
                 aciIdentityKey,
@@ -1271,6 +1810,7 @@ class RegistrationControllerTest {
         Arguments.argumentSet("Has GCM token",
             new RegistrationRequest("session-id",
                 new byte[0],
+                null,
                 null,
                 pushAccountAttributes,
                 true,
@@ -1318,6 +1858,7 @@ class RegistrationControllerTest {
     return new RegistrationRequest(
         Base64.getEncoder().encodeToString(sessionId.getBytes(StandardCharsets.UTF_8)),
         recoveryPassword,
+        null,
         null,
         accountAttributes,
         skipDeviceTransfer,
