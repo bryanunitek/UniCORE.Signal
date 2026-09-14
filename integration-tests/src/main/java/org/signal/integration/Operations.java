@@ -10,10 +10,27 @@ import static java.util.Objects.requireNonNull;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.google.common.io.Resources;
 import com.google.common.net.HttpHeaders;
+import com.webauthn4j.data.AuthenticatorAssertionResponse;
+import com.webauthn4j.data.PublicKeyCredential;
+import com.webauthn4j.data.PublicKeyCredentialDescriptor;
+import com.webauthn4j.data.PublicKeyCredentialRequestOptions;
+import com.webauthn4j.data.PublicKeyCredentialType;
+import com.webauthn4j.data.UserVerificationRequirement;
+import com.webauthn4j.data.client.challenge.DefaultChallenge;
+import com.webauthn4j.test.client.ClientPlatform;
 import io.dropwizard.configuration.ConfigurationValidationException;
 import io.dropwizard.jersey.validation.Validators;
+import io.grpc.ChannelCredentials;
+import io.grpc.ClientInterceptor;
+import io.grpc.Grpc;
+import io.grpc.ManagedChannel;
+import io.grpc.Metadata;
+import io.grpc.TlsChannelCredentials;
+import io.grpc.stub.MetadataUtils;
 import jakarta.validation.ConstraintViolation;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.invoke.MethodHandles;
 import java.net.URI;
 import java.net.URL;
@@ -24,6 +41,7 @@ import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.security.cert.CertificateException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
@@ -32,6 +50,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Validate;
 import org.apache.commons.lang3.tuple.Pair;
@@ -43,6 +62,7 @@ import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
 import org.signal.integration.config.Config;
+import org.signal.integration.config.WebAuthnConfiguration;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.protocol.ecc.ECKeyPair;
 import org.signal.libsignal.protocol.ecc.ECPublicKey;
@@ -58,6 +78,7 @@ import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialPresentation;
 import org.signal.libsignal.zkgroup.receipts.ReceiptSerial;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.auth.grpc.RequireAuthenticationInterceptor;
 import org.whispersystems.textsecuregcm.entities.AccountAttributes;
 import org.whispersystems.textsecuregcm.entities.AccountIdentityResponse;
 import org.whispersystems.textsecuregcm.entities.DeviceActivationRequest;
@@ -65,6 +86,7 @@ import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.RegistrationRequest;
 import org.whispersystems.textsecuregcm.http.FaultTolerantHttpClient;
+import org.whispersystems.textsecuregcm.mappers.MfaFailureExceptionMapper;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.util.CertificateUtil;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
@@ -77,6 +99,8 @@ public final class Operations {
 
   private static final Config CONFIG = loadConfigFromClasspath("config.yml");
 
+  private static final String GRPC_DOMAIN = "grpc." + CONFIG.domain();
+
   private static final IntegrationTools INTEGRATION_TOOLS = IntegrationTools.create(CONFIG);
 
   private static final String USER_AGENT = "integration-test";
@@ -85,6 +109,7 @@ public final class Operations {
 
   private static final WebSocketClient WEB_SOCKET_CLIENT = buildWebSocketClient();
 
+  private static final ManagedChannel GRPC_CHANNEL = buildGrpcChannel();
 
   private Operations() {
     // utility class
@@ -97,6 +122,10 @@ public final class Operations {
         new ReceiptSerial(Base64.getUrlDecoder().decode(CONFIG.prescribedReceiptSerial())),
         new ReceiptCredential(Base64.getUrlDecoder().decode(CONFIG.prescribedReceiptCredential()))
     );
+  }
+
+  public static WebAuthnConfiguration getWebAuthnConfiguration() {
+    return CONFIG.webAuthn();
   }
 
   public static TestUser registerNumberlessUser(final ReceiptCredential receiptCredential)
@@ -112,6 +141,7 @@ public final class Operations {
     final RegistrationRequest registrationRequest = new RegistrationRequest(null,
         null,
         receiptCredentialPresentation.serialize(),
+        null,
         null,
         user.accountAttributes(),
         true,
@@ -133,6 +163,109 @@ public final class Operations {
     return user;
   }
 
+  public static TestUser recoverNumberlessUserWithTotp(final TestUser testUser, @Nullable final Integer totp) {
+    final String accountPassword = Base64.getEncoder().encodeToString(randomBytes(32));
+    final TestUser recoveredUser = TestUser.createNumberlessForRecovery(accountPassword, testUser.registrationPassword());
+
+    final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
+    final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+    final RegistrationRequest registrationRequest = new RegistrationRequest(null,
+        testUser.registrationPassword(),
+        null,
+        totp,
+        null,
+        recoveredUser.accountAttributes(),
+        true,
+        new IdentityKey(aciIdentityKeyPair.getPublicKey()),
+        new IdentityKey(pniIdentityKeyPair.getPublicKey()),
+        new DeviceActivationRequest(generateSignedECPreKey(1, aciIdentityKeyPair),
+            Optional.of(generateSignedECPreKey(2, pniIdentityKeyPair)),
+            generateSignedKEMPreKey(3, aciIdentityKeyPair),
+            Optional.of(generateSignedKEMPreKey(4, pniIdentityKeyPair)),
+            Optional.empty(),
+            Optional.empty()));
+
+    final AccountIdentityResponse registrationResponse = apiPost("/v1/registration", registrationRequest)
+        // For a numberless account recovery, the username is the ACI
+        .authorized(testUser.aciUuid().toString(), accountPassword)
+        .executeExpectSuccess(AccountIdentityResponse.class);
+
+    recoveredUser.setAciUuid(registrationResponse.uuid());
+    return recoveredUser;
+  }
+
+  public static TestUser recoverNumberlessUserWithWebAuthn(final TestUser testUser,
+      final ClientPlatform clientPlatform,
+      final byte[] credentialId,
+      final String relyingPartyId) {
+    final String accountPassword = Base64.getEncoder().encodeToString(randomBytes(32));
+    final TestUser recoveredUser = TestUser.createNumberlessForRecovery(accountPassword, testUser.registrationPassword());
+
+    final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
+    final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+    final RegistrationRequest initialRequest = new RegistrationRequest(null,
+        testUser.registrationPassword(),
+        null,
+        null,
+        null,
+        recoveredUser.accountAttributes(),
+        true,
+        new IdentityKey(aciIdentityKeyPair.getPublicKey()),
+        new IdentityKey(pniIdentityKeyPair.getPublicKey()),
+        new DeviceActivationRequest(generateSignedECPreKey(1, aciIdentityKeyPair),
+            Optional.of(generateSignedECPreKey(2, pniIdentityKeyPair)),
+            generateSignedKEMPreKey(3, aciIdentityKeyPair),
+            Optional.of(generateSignedKEMPreKey(4, pniIdentityKeyPair)),
+            Optional.empty(),
+            Optional.empty()));
+
+    final Pair<Integer, MfaFailureExceptionMapper.MfaFailureResponse> initialResponse = apiPost("/v1/registration", initialRequest)
+        // For a numberless account recovery, the username is the ACI
+        .authorized(testUser.aciUuid().toString(), accountPassword)
+        .execute(MfaFailureExceptionMapper.MfaFailureResponse.class);
+
+    // we expect (and need) failure with status 441, which will contain the WebAuthn challenge
+    assert initialResponse.getLeft() == 441;
+
+    final MfaFailureExceptionMapper.MfaFailureResponse mfaFailureResponse = initialResponse.getRight();
+    assert mfaFailureResponse.webAuthnParameters().allowedCredentialIds()
+        .stream()
+        .anyMatch(allowedId -> Arrays.equals(allowedId, credentialId));
+
+    final PublicKeyCredential<AuthenticatorAssertionResponse, ?> credential =
+        clientPlatform.get(new PublicKeyCredentialRequestOptions(
+            new DefaultChallenge(mfaFailureResponse.webAuthnParameters().challenge()),
+            null,
+            relyingPartyId,
+            List.of(new PublicKeyCredentialDescriptor(PublicKeyCredentialType.PUBLIC_KEY, credentialId, null)),
+            UserVerificationRequirement.DISCOURAGED,
+            null));
+
+    final RegistrationRequest registrationRequest = new RegistrationRequest(null,
+        testUser.registrationPassword(),
+        null,
+        null,
+        webAuthnVerificationResponseJson(credential),
+        recoveredUser.accountAttributes(),
+        true,
+        new IdentityKey(aciIdentityKeyPair.getPublicKey()),
+        new IdentityKey(pniIdentityKeyPair.getPublicKey()),
+        new DeviceActivationRequest(generateSignedECPreKey(1, aciIdentityKeyPair),
+            Optional.of(generateSignedECPreKey(2, pniIdentityKeyPair)),
+            generateSignedKEMPreKey(3, aciIdentityKeyPair),
+            Optional.of(generateSignedKEMPreKey(4, pniIdentityKeyPair)),
+            Optional.empty(),
+            Optional.empty()));
+
+    final AccountIdentityResponse registrationResponse = apiPost("/v1/registration", registrationRequest)
+        // For a numberless account recovery, the username is the ACI
+        .authorized(testUser.aciUuid().toString(), accountPassword)
+        .executeExpectSuccess(AccountIdentityResponse.class);
+
+    recoveredUser.setAciUuid(registrationResponse.uuid());
+    return recoveredUser;
+  }
+
   public static TestUser newRegisteredUser(final String number) {
     final byte[] registrationPassword = populateRandomRecoveryPassword(number);
     final String accountPassword = Base64.getEncoder().encodeToString(randomBytes(32));
@@ -146,6 +279,7 @@ public final class Operations {
     // register account
     final RegistrationRequest registrationRequest = new RegistrationRequest(null,
         registrationPassword,
+        null,
         null,
         null,
         accountAttributes,
@@ -239,7 +373,7 @@ public final class Operations {
     }
   }
 
-  private static byte[] randomBytes(int numBytes) {
+  public static byte[] randomBytes(final int numBytes) {
     final byte[] bytes = new byte[numBytes];
     new SecureRandom().nextBytes(bytes);
     return bytes;
@@ -270,6 +404,33 @@ public final class Operations {
         ? StringUtils.EMPTY
         : "?" + String.join("&", queryParams);
     return URI.create("https://" + CONFIG.domain() + endpoint + query);
+  }
+
+  public static ManagedChannel grpcChannel() {
+    return GRPC_CHANNEL;
+  }
+
+  public static ClientInterceptor authorizationInterceptor(final TestUser user, final byte deviceId) {
+    final String username = "%s.%d".formatted(user.aciUuid().toString(), deviceId);
+
+    final Metadata metadata = new Metadata();
+    metadata.put(RequireAuthenticationInterceptor.AUTHORIZATION_METADATA_KEY,
+        HeaderUtils.basicAuthHeader(username, user.accountPassword()));
+
+    return MetadataUtils.newAttachHeadersInterceptor(metadata);
+  }
+
+  private static ManagedChannel buildGrpcChannel() {
+    try {
+      final ByteArrayInputStream rootCert =
+          new ByteArrayInputStream(CONFIG.rootCert().getBytes(StandardCharsets.UTF_8));
+      final ChannelCredentials credentials = TlsChannelCredentials.newBuilder().trustManager(rootCert).build();
+      return Grpc.newChannelBuilderForAddress(GRPC_DOMAIN, 443, credentials)
+          .userAgent(USER_AGENT)
+          .build();
+    } catch (final IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   public static class RequestBuilder {
@@ -416,7 +577,7 @@ public final class Operations {
       final String path,
       final Map<String, String> headers) throws IOException {
 
-    final URI uri = URI.create("wss://grpc." + CONFIG.domain() + path);
+    final URI uri = URI.create("wss://" + GRPC_DOMAIN + path);
     final ClientUpgradeRequest request = new ClientUpgradeRequest(uri);
     headers.forEach(request::setHeader);
 
@@ -465,5 +626,35 @@ public final class Operations {
     } catch (final JsonProcessingException e) {
       throw new RuntimeException(e);
     }
+  }
+
+  /// Serializes an assertion into the [specification](https://www.w3.org/TR/webauthn/#dictdef-authenticationresponsejson) format.
+  static String webAuthnVerificationResponseJson(final PublicKeyCredential<AuthenticatorAssertionResponse, ?> credential) {
+    final AuthenticatorAssertionResponse response = credential.getResponse();
+
+    return """
+        {
+          "id": "%s",
+          "rawId": "%s",
+          "type": "public-key",
+          "clientExtensionResults": {},
+          "response": {
+            "clientDataJSON": "%s",
+            "authenticatorData": "%s",
+            "signature": "%s",
+            "userHandle": %s
+          }
+        }
+        """.formatted(
+        base64Url(credential.getRawId()),
+        base64Url(credential.getRawId()),
+        base64Url(response.getClientDataJSON()),
+        base64Url(response.getAuthenticatorData()),
+        base64Url(response.getSignature()),
+        response.getUserHandle() == null ? "null" : "\"" + base64Url(response.getUserHandle()) + "\"");
+  }
+
+  private static String base64Url(@Nullable final byte[] bytes) {
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
   }
 }

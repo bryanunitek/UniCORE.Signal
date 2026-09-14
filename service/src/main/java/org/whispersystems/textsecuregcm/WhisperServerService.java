@@ -97,6 +97,7 @@ import org.whispersystems.textsecuregcm.auth.ExternalServiceCredentialsGenerator
 import org.whispersystems.textsecuregcm.auth.IdlePrimaryDeviceAuthenticatedWebSocketUpgradeFilter;
 import org.whispersystems.textsecuregcm.auth.PhoneVerificationTokenManager;
 import org.whispersystems.textsecuregcm.auth.RegistrationLockVerificationManager;
+import org.whispersystems.textsecuregcm.auth.webauthn.WebAuthnCeremonyManager;
 import org.whispersystems.textsecuregcm.auth.grpc.ProhibitAuthenticationInterceptor;
 import org.whispersystems.textsecuregcm.auth.grpc.RequireAuthenticationInterceptor;
 import org.whispersystems.textsecuregcm.backup.BackupAuthManager;
@@ -111,6 +112,7 @@ import org.whispersystems.textsecuregcm.captcha.CaptchaClient;
 import org.whispersystems.textsecuregcm.captcha.RegistrationCaptchaManager;
 import org.whispersystems.textsecuregcm.captcha.ShortCodeExpander;
 import org.whispersystems.textsecuregcm.configuration.BadgeConfiguration;
+import org.whispersystems.textsecuregcm.configuration.FoundationDbExternalClientConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.configuration.secrets.SecretStore;
 import org.whispersystems.textsecuregcm.configuration.secrets.SecretsModule;
@@ -212,6 +214,7 @@ import org.whispersystems.textsecuregcm.mappers.IllegalStateExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.ImpossiblePhoneNumberExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.InvalidWebsocketAddressExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.JsonMappingExceptionMapper;
+import org.whispersystems.textsecuregcm.mappers.MfaFailureExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.NonNormalizedPhoneNumberExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.ObsoletePhoneNumberFormatExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.RateLimitExceededExceptionMapper;
@@ -294,7 +297,9 @@ import org.whispersystems.textsecuregcm.storage.VerificationSessions;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceCheckManager;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceCheckTrustAnchor;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceChecks;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDBWarmup;
 import org.whispersystems.textsecuregcm.storage.foundationdb.VersionstampUUIDCipher;
 import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreClient;
 import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreManager;
@@ -498,9 +503,20 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     // we'd like, but is the least bad option given current constraints.
     fdb.disableShutdownHook();
 
-    final Map<Integer, List<Database>> messageDatabasesByEpoch;
+    final FoundationDbExternalClientConfiguration externalClientConfiguration = config.getFoundationDbMessagesConfiguration()
+        .externalClientConfiguration();
+    if (externalClientConfiguration != null) {
+      // If threadsPerClient is not specified, we default to the cluster size so that there is 1:1 correspondence between
+      // Database objects and threads.
+      final int clientThreadsPerVersion = externalClientConfiguration.threadsPerClient()
+          .orElseGet(() -> config.getFoundationDbMessagesConfiguration().clusters().size());
+      externalClientConfiguration.clientLibraryPaths().forEach(path -> fdb.options().setExternalClientLibrary(path));
+      fdb.options().setClientThreadsPerVersion(clientThreadsPerVersion);
+    }
+
+    final Map<Integer, List<FaultTolerantDatabase>> messageDatabasesByEpoch;
     {
-      final Map<String, Database> databasesByName =
+      final Map<String, FaultTolerantDatabase> faultTolerantDatabasesByName =
           config.getFoundationDbMessagesConfiguration().clusters().entrySet().stream()
               .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
                   entry -> {
@@ -512,7 +528,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
                       database.options().setTransactionRetryLimit(
                           config.getFoundationDbMessagesConfiguration().transactionRetryLimit());
 
-                      return database;
+                      return new FaultTolerantDatabase(database, entry.getKey(),
+                          config.getFoundationDbMessagesConfiguration().circuitBreakerConfigurationName());
                     } catch (final IOException e) {
                       throw new UncheckedIOException(e);
                     }
@@ -521,8 +538,10 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
       messageDatabasesByEpoch = config.getFoundationDbMessagesConfiguration().epochs().entrySet().stream()
           .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
               entry -> entry.getValue().stream()
-                  .map(databasesByName::get)
+                  .map(faultTolerantDatabasesByName::get)
                   .toList()));
+
+      environment.lifecycle().manage(new FoundationDBWarmup(faultTolerantDatabasesByName));
     }
 
     final AwsCredentialsProvider cdnCredentialsProvider = config.getCdnConfiguration().credentials().build();
@@ -794,12 +813,19 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         changeNumberWaitingPeriods, config.getChangeNumber().postRegistrationWaitingPeriod(), clock);
     AccountLockManager accountLockManager = new AccountLockManager(dynamoDbClient,
         config.getDynamoDbTables().getDeletedAccountsLock().getTableName());
+    final WebAuthnCeremonyManager webAuthnCeremonyManager = new WebAuthnCeremonyManager(
+        config.getRegistrationWebAuthnConfiguration().relyingPartyId(),
+        config.getRegistrationWebAuthnConfiguration().origin(),
+        config.getRegistrationWebAuthnConfiguration().challengeTtl(),
+        config.getRegistrationWebAuthnConfiguration().userHandleBlindingSecret().value(),
+        rateLimitersCluster);
     final AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keysManager, messagesManager, profilesManager,
         changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
         phoneNumberRecoveryPasswordsManager, messagePollExecutor,
         retryExecutor, clock, config.getLinkDeviceSecretConfiguration().secret().value(),
-        config.getRegistrationTotpConfiguration().maxValidationDelay());
+        config.getRegistrationTotpConfiguration().maxValidationDelay(),
+            webAuthnCeremonyManager);
     RemoteConfigsManager remoteConfigsManager = new RemoteConfigsManager(remoteConfigs, config.getRemoteConfigConfiguration().globalConfig());
     APNSender apnSender = new APNSender(apnSenderExecutor, Clock.systemUTC(), config.getApnConfiguration());
     FcmSender fcmSender = new FcmSender(fcmSenderExecutor, config.getFcmConfiguration().credentials().value());
@@ -1051,7 +1077,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final HttpClient shortCodeRetrieverHttpClient = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
         .connectTimeout(Duration.ofSeconds(10)).build();
     final ShortCodeExpander shortCodeRetriever = new ShortCodeExpander(shortCodeRetrieverHttpClient, config.getShortCodeRetrieverConfiguration().baseUrl());
-    final CaptchaChecker captchaChecker = new CaptchaChecker(shortCodeRetriever, captchaClientSupplier);
+    final CaptchaChecker captchaChecker = new CaptchaChecker(shortCodeRetriever, captchaClientSupplier, dynamicConfigurationManager);
 
     final RegistrationCaptchaManager registrationCaptchaManager = new RegistrationCaptchaManager(captchaChecker);
 
@@ -1372,7 +1398,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new SubscriptionExceptionMapper(),
         new BackupExceptionMapper(),
         new JsonMappingExceptionMapper(),
-        new RegistrationLockFailureExceptionMapper()
+        new RegistrationLockFailureExceptionMapper(),
+        new MfaFailureExceptionMapper()
     ).forEach(exceptionMapper -> {
       environment.jersey().register(exceptionMapper);
       webSocketEnvironment.jersey().register(exceptionMapper);

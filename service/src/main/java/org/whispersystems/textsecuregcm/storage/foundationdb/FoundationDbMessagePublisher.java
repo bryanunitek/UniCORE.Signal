@@ -1,6 +1,5 @@
 package org.whispersystems.textsecuregcm.storage.foundationdb;
 
-import com.apple.foundationdb.Database;
 import com.apple.foundationdb.KeySelector;
 import com.apple.foundationdb.StreamingMode;
 import com.apple.foundationdb.Transaction;
@@ -35,7 +34,7 @@ import reactor.core.publisher.Mono;
 /// catching up to end-of-queue,and an infinite stream for live updates.
 class FoundationDbMessagePublisher {
 
-  private final Database database;
+  private final FaultTolerantDatabase database;
   private final Clock clock;
   /// Keeps track of the key from which to start reading on the next iteration
   private volatile KeySelector beginKeyCursor;
@@ -123,12 +122,10 @@ class FoundationDbMessagePublisher {
     MESSAGE_AVAILABLE_WATCH_TRIGGERED,
     /// Internal self-trigger used to immediately transition to the next state.
     INTERNAL_TRIGGER,
-    /// An error occurred during fetching from FoundationDB or publishing messages to the sink.
-    FETCH_OR_PUBLISH_ERROR_OCCURRED
   }
 
   FoundationDbMessagePublisher(
-      final Database database,
+      final FaultTolerantDatabase database,
       final Clock clock,
       final KeySelector beginKeyInclusive,
       final KeySelector endKeyExclusive,
@@ -175,7 +172,7 @@ class FoundationDbMessagePublisher {
   /// cases when callers need to "catch up" on stored messages without following fresh updates (for example, when a
   /// client first connects and needs to load stored messages before receiving a "live" stream of new messages).
   public static FoundationDbMessagePublisher createFinitePublisher(
-      final Database database,
+      final FaultTolerantDatabase database,
       final Clock clock,
       final KeySelector beginKeyInclusive,
       final KeySelector endKeyExclusive) {
@@ -195,7 +192,7 @@ class FoundationDbMessagePublisher {
   /// It waits for new messages and publishes them in a loop. Useful when a client has finished receiving its stored
   /// messages and is now waiting for a live stream of new messages.
   public static FoundationDbMessagePublisher createInfinitePublisher(
-      final Database database,
+      final FaultTolerantDatabase database,
       final Clock clock,
       final KeySelector beginKeyInclusive,
       final KeySelector endKeyExclusive,
@@ -252,7 +249,6 @@ class FoundationDbMessagePublisher {
             transitionStateOnEvent(Event.INTERNAL_TRIGGER);
           }
           case MESSAGE_AVAILABLE_WATCH_TRIGGERED -> setState(State.MESSAGE_AVAILABLE_SIGNAL_BUFFERED, event);
-          case FETCH_OR_PUBLISH_ERROR_OCCURRED -> setState(State.ERROR, event);
           default -> knownTransition = false;
         }
       }
@@ -312,7 +308,7 @@ class FoundationDbMessagePublisher {
       throw new IllegalArgumentException("Max messages must be positive");
     }
 
-    return FoundationDbUtil.safeRunAsync(database, transaction -> {
+    return database.runAsync(transaction -> {
           final CompletableFuture<Void> checkPresenceFuture;
 
           if (!terminateOnQueueEmpty) {
@@ -339,7 +335,7 @@ class FoundationDbMessagePublisher {
 
                 return keyValues;
               });
-        }, FoundationDbUtil.Context.GET_MESSAGES_BATCH)
+        }, FaultTolerantDatabase.Context.GET_MESSAGES_BATCH)
         .thenApply(keyValues -> {
           if (keyValues.size() < maxMessages) {
             transitionStateOnEvent(Event.FETCHED_ALL_AVAILABLE_MESSAGES);
@@ -391,7 +387,7 @@ class FoundationDbMessagePublisher {
   /// operation returns fewer items than the batch size, we infer that we have fetched all available messages and
   /// [Event#FETCHED_ALL_AVAILABLE_MESSAGES] is sent to the state machine. See [#getMessagesBatch(int)] for details.
   /// Additionally, after we successfully publish the batch of messages, {@link Event#PUBLISHED_MESSAGES} is emitted. If
-  /// there's an error while fetching or publishing, [Event#FETCH_OR_PUBLISH_ERROR_OCCURRED] is emitted instead.
+  /// there's an error while fetching or publishing, the stream is terminated with the error.
   private void emitMessages() {
     final int maxMessages = Math.min(getOutstandingDemand(), MAX_MESSAGES_PER_PAGE);
 
@@ -402,8 +398,7 @@ class FoundationDbMessagePublisher {
           transitionStateOnEvent(Event.PUBLISHED_MESSAGES);
         })
         .exceptionally(t -> {
-          transitionStateOnEvent(Event.FETCH_OR_PUBLISH_ERROR_OCCURRED);
-          emitter.error(ExceptionUtils.unwrap(t));
+          terminateWithError(ExceptionUtils.unwrap(t));
           return null;
         });
   }
@@ -489,10 +484,10 @@ class FoundationDbMessagePublisher {
       return CompletableFuture.failedFuture(new IllegalStateException("Publisher already terminated"));
     }
 
-    return FoundationDbUtil.safeRunAsync(database, transaction -> {
+    return database.runAsync(transaction -> {
       transaction.set(presenceKey, FoundationDbMessageStore.getPresenceValue(clock.instant(), streamId));
       return CompletableFuture.completedFuture(null);
-    }, FoundationDbUtil.Context.SET_PRESENCE);
+    }, FaultTolerantDatabase.Context.SET_PRESENCE);
   }
 
   @VisibleForTesting
@@ -501,11 +496,11 @@ class FoundationDbMessagePublisher {
       renewPresenceFuture.cancel(true);
 
       renewPresenceFuture.whenComplete((_, _) ->
-          FoundationDbUtil.safeRunAsync(database, transaction -> transaction.get(presenceKey).thenAccept(presenceValue -> {
+          database.runAsync(transaction -> transaction.get(presenceKey).thenAccept(presenceValue -> {
                 if (!isPresenceContested(presenceValue)) {
                   transaction.clear(presenceKey);
                 }
-              }), FoundationDbUtil.Context.CLEAR_PRESENCE)
+              }), FaultTolerantDatabase.Context.CLEAR_PRESENCE)
               .whenComplete((_, throwable) -> {
                 if (throwable != null) {
                   LOGGER.warn("Failed to clear presence on disposal", throwable);
@@ -526,7 +521,7 @@ class FoundationDbMessagePublisher {
 
   @VisibleForTesting
   synchronized void terminateWithError(final Throwable throwable) {
-    if (state != State.TERMINATED && state != State.ERROR) {
+    if (state != State.TERMINATED && state != State.ERROR && !emitter.isCancelled()) {
       setState(State.ERROR, Event.INTERNAL_TRIGGER);
       emitter.error(throwable);
     }

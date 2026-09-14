@@ -7,7 +7,6 @@ package org.whispersystems.textsecuregcm.workers;
 
 import static org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore.getAccountSubspace;
 
-import com.apple.foundationdb.Database;
 import com.apple.foundationdb.FDB;
 import com.apple.foundationdb.KeySelector;
 import com.apple.foundationdb.Range;
@@ -27,7 +26,6 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -42,10 +40,13 @@ import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.storage.AccountLockManager;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
 import org.whispersystems.textsecuregcm.util.ManagedExecutors;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.util.retry.Retry;
 
 public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithDependencies {
@@ -129,10 +130,11 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
 
     final FDB fdb = commandDependencies.fdb();
 
-    final Stream<Database> databases = configuration.getFoundationDbMessagesConfiguration().clusters().values().stream()
-        .map(databaseFactory -> {
+    final Stream<FaultTolerantDatabase> databases = configuration.getFoundationDbMessagesConfiguration().clusters().entrySet().stream()
+        .map(entry -> {
           try {
-            return databaseFactory.build(fdb);
+            return new FaultTolerantDatabase(entry.getValue().build(fdb), entry.getKey(),
+                configuration.getFoundationDbMessagesConfiguration().circuitBreakerConfigurationName());
           } catch (final IOException e) {
             throw new UncheckedIOException(e);
           }
@@ -148,33 +150,34 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
   }
 
   @VisibleForTesting
-  void clearOrphanedQueues(final Stream<Database> databases, final AccountsManager accountsManager,
+  void clearOrphanedQueues(final Stream<FaultTolerantDatabase> databases, final AccountsManager accountsManager,
       final int concurrency, final boolean dryRun, final int maxAcisPerTransaction, final long transactionRetryLimit,
       final Duration transactionTimeout, final int numChunks, final AccountLockManager accountLockManager,
-      final Executor executor) {
+      final ExecutorService executor) {
+    final Scheduler scheduler = Schedulers.fromExecutorService(executor);
     Flux.fromStream(databases)
         .flatMap(database -> crawlAcisInShard(database, accountsManager, concurrency, dryRun, maxAcisPerTransaction,
-            transactionRetryLimit, transactionTimeout, numChunks, accountLockManager, executor))
+            transactionRetryLimit, transactionTimeout, numChunks, accountLockManager, scheduler))
         .then()
         .block();
   }
 
-  private Mono<Void> crawlAcisInShard(final Database database, final AccountsManager accountsManager,
+  private Mono<Void> crawlAcisInShard(final FaultTolerantDatabase database, final AccountsManager accountsManager,
       final int concurrency, final boolean dryRun, final int maxAcisPerTransaction, final long transactionRetryLimit,
       final Duration transactionTimeout, final int numChunks, final AccountLockManager accountLockManager,
-      final Executor executor) {
+      final Scheduler scheduler) {
     return getAcisInShard(database, maxAcisPerTransaction, transactionRetryLimit, transactionTimeout, numChunks)
         .doOnNext(_ -> Metrics.counter(ACCOUNTS_CRAWLED_COUNTER, "dryRun", String.valueOf(dryRun)).increment())
-        .flatMap(aci -> Mono.fromFuture(() -> accountsManager.getByAccountIdentifierAsync(aci.uuid()))
-                .flatMap(maybeAccount -> {
-                  if (maybeAccount.isEmpty()) {
-                    return Mono.just(aci);
-                  }
-                  return Mono.empty();
+        .flatMap(aci -> Mono.fromCallable(() -> accountsManager.accountExists(aci))
+                .subscribeOn(scheduler)
+                .flatMap(exists -> {
+                  // This looks odd, but we want to delete accounts that don't exist i.e deleted accounts, so only
+                  // pass the ACI downstream if the account does not exist.
+                  return exists ? Mono.empty() : Mono.just(aci);
                 })
                 .retryWhen(Retry.backoff(2, Duration.ofSeconds(1)))
                 .onErrorResume(t -> {
-                  logger.warn("Failed to fetch account by ACI", t);
+                  logger.warn("Failed to check account existence by ACI", t);
                   return Mono.empty();
                 })
             , concurrency)
@@ -184,7 +187,7 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
             return Mono.just(true);
           }
           return clearQueueWithAciLock(database, aci, transactionRetryLimit, transactionTimeout, accountsManager,
-              accountLockManager, executor)
+              accountLockManager, scheduler)
               .thenReturn(true)
               .onErrorResume(t -> {
                 logger.error("Failed to clear orphaned queue for ACI: {}", aci.uuid(), t);
@@ -197,22 +200,22 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
         .then();
   }
 
-  private Mono<Void> clearQueueWithAciLock(final Database database, final AciServiceIdentifier aci,
+  private Mono<Void> clearQueueWithAciLock(final FaultTolerantDatabase database, final AciServiceIdentifier aci,
       final long transactionRetryLimit, final Duration transactionTimeout, final AccountsManager accountsManager,
       final AccountLockManager accountLockManager,
-      final Executor executor) {
-    return Mono.fromFuture(
-        () -> CompletableFuture.runAsync(() -> accountLockManager.withLock(Set.of(aci.uuid()), () -> {
-          if (accountsManager.getByAccountIdentifier(aci.uuid()).isPresent()) {
+      final Scheduler scheduler) {
+    return Mono.<Void>fromRunnable(() -> accountLockManager.withLock(Set.of(aci.uuid()), () -> {
+          if (accountsManager.accountExists(aci)) {
             logger.info("ACI re-used after we checked for existence, not clearing its queues: {}", aci.uuid());
             return null;
           }
           clearQueue(database, aci, transactionRetryLimit, transactionTimeout);
           return null;
-        }), executor));
+        }))
+        .subscribeOn(scheduler);
   }
 
-  private void clearQueue(final Database database, final AciServiceIdentifier aci, final long transactionRetryLimit,
+  private void clearQueue(final FaultTolerantDatabase database, final AciServiceIdentifier aci, final long transactionRetryLimit,
       final Duration transactionTimeout) {
     database.run(transaction -> {
       transaction.options().setPriorityBatch();
@@ -220,11 +223,11 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
       transaction.options().setTimeout(transactionTimeout.toMillis());
       transaction.clear(getAccountSubspace(messagesSubspace, aci).range());
       return null;
-    });
+    }, FaultTolerantDatabase.Context.CLEAR_ACCOUNT_SUBSPACE);
   }
 
   @VisibleForTesting
-  Flux<AciServiceIdentifier> getAcisInShard(final Database database, final int maxAcisPerTransaction,
+  Flux<AciServiceIdentifier> getAcisInShard(final FaultTolerantDatabase database, final int maxAcisPerTransaction,
       final long transactionRetryLimit, final Duration transactionTimeout, final int numChunks) {
     return Mono.fromFuture(() -> splitSubspace(database, numChunks))
         .flatMapIterable(Function.identity())
@@ -238,12 +241,12 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
   /// @param database  the FDB instance
   /// @param numChunks the number of chunks to split the subspace into
   /// @return a list of key [Range]s representing chunk boundaries
-  CompletableFuture<List<Range>> splitSubspace(final Database database, final int numChunks) {
+  CompletableFuture<List<Range>> splitSubspace(final FaultTolerantDatabase database, final int numChunks) {
     return database.runAsync(transaction -> transaction.getEstimatedRangeSizeBytes(messagesSubspace.range())
             .thenCompose(rangeSize -> {
               final long chunkSize = Math.ceilDiv(rangeSize, numChunks);
               return transaction.getRangeSplitPoints(messagesSubspace.range(), chunkSize);
-            }))
+            }), FaultTolerantDatabase.Context.GET_RANGE_SPLITS)
         .thenApply(result -> splitPointsToRanges(result.getKeys()));
   }
 
@@ -259,7 +262,7 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
     return ranges;
   }
 
-  Flux<AciServiceIdentifier> getAcisInChunk(final Database database, final int maxAcisPerTransaction,
+  Flux<AciServiceIdentifier> getAcisInChunk(final FaultTolerantDatabase database, final int maxAcisPerTransaction,
       final long transactionRetryLimit, final Duration transactionTimeout, final Range range) {
     return readAciBatch(database, range.begin, range.end, maxAcisPerTransaction, transactionRetryLimit,
         transactionTimeout)
@@ -277,7 +280,7 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
   private record BatchReadResult(List<AciServiceIdentifier> acis, byte[] cursor) {}
 
   private Mono<BatchReadResult> readAciBatch(
-      final Database database,
+      final FaultTolerantDatabase database,
       final byte[] beginInclusive,
       final byte[] endExclusive,
       final int maxAcisPerTransaction,
@@ -310,7 +313,7 @@ public class ClearOrphanedFoundationDbQueuesCommand extends AbstractCommandWithD
                     });
                   })
                   .thenApply(_ -> acis);
-            })
+            }, FaultTolerantDatabase.Context.READ_ACIS)
             .thenApply(acis -> new BatchReadResult(acis, cursor.get()))
     );
   }

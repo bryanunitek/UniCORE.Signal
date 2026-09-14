@@ -5,7 +5,6 @@
 
 package org.whispersystems.textsecuregcm.storage.foundationdb;
 
-import com.apple.foundationdb.Database;
 import com.apple.foundationdb.KeyValue;
 import com.apple.foundationdb.MutationType;
 import com.apple.foundationdb.subspace.Subspace;
@@ -29,15 +28,15 @@ public class VersionstampClock {
   @VisibleForTesting
   static final Subspace SUBSPACE = new Subspace(Tuple.from("V"));
 
-  private final Database database;
+  private final FaultTolerantDatabase database;
   private final Clock clock;
 
-  public VersionstampClock(final Database database) {
+  public VersionstampClock(final FaultTolerantDatabase database) {
     this(database, Clock.systemUTC());
   }
 
   @VisibleForTesting
-  public VersionstampClock(final Database database, final Clock clock) {
+  public VersionstampClock(final FaultTolerantDatabase database, final Clock clock) {
     this.database = database;
     this.clock = clock;
   }
@@ -54,7 +53,7 @@ public class VersionstampClock {
               Tuple.from(Versionstamp.incomplete()).packWithVersionstamp());
 
           return transaction.getVersionstamp();
-        })
+        }, FaultTolerantDatabase.Context.RECORD_VERSIONSTAMP_AND_TIME)
         .thenApply(Versionstamp::complete)
         .join();
   }
@@ -77,7 +76,7 @@ public class VersionstampClock {
       }
 
       return Optional.empty();
-    });
+    }, FaultTolerantDatabase.Context.READ_VERSIONSTAMP);
   }
 
   /// Remove any entries from the versionstamp-clock namespace that are strictly older than the given timestamp
@@ -87,7 +86,7 @@ public class VersionstampClock {
     database.run(transaction -> {
       transaction.clear(SUBSPACE.getKey(), getTimestampKey(oldestRetainedEntryTimestamp));
       return null;
-    });
+    }, FaultTolerantDatabase.Context.CLEAR_EXPIRED_VERSIONSTAMPS);
   }
 
   private byte[] getTimestampKey(final Instant timestamp) {

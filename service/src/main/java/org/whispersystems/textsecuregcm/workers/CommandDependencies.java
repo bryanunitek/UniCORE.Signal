@@ -32,11 +32,13 @@ import org.whispersystems.textsecuregcm.WhisperServerService.ScheduledExecutorSe
 import org.whispersystems.textsecuregcm.attachments.TusAttachmentGenerator;
 import org.whispersystems.textsecuregcm.auth.DisconnectionRequestManager;
 import org.whispersystems.textsecuregcm.auth.ExternalServiceCredentialsGenerator;
+import org.whispersystems.textsecuregcm.auth.webauthn.WebAuthnCeremonyManager;
 import org.whispersystems.textsecuregcm.backup.BackupManager;
 import org.whispersystems.textsecuregcm.backup.BackupsDb;
 import org.whispersystems.textsecuregcm.backup.Cdn3BackupCredentialGenerator;
 import org.whispersystems.textsecuregcm.backup.Cdn3RemoteStorageManager;
 import org.whispersystems.textsecuregcm.backup.SecureValueRecoveryBCredentialsGeneratorFactory;
+import org.whispersystems.textsecuregcm.configuration.FoundationDbExternalClientConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.controllers.SecureStorageController;
 import org.whispersystems.textsecuregcm.controllers.SecureValueRecovery2Controller;
@@ -69,12 +71,12 @@ import org.whispersystems.textsecuregcm.storage.MessagesDynamoDb;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
 import org.whispersystems.textsecuregcm.storage.PagedSingleUseKEMPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswords;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.ProfileAvatars;
 import org.whispersystems.textsecuregcm.storage.Profiles;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesV2;
-import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswords;
-import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseECSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseKEMSignedPreKeyStore;
@@ -83,6 +85,7 @@ import org.whispersystems.textsecuregcm.storage.ReportMessageManager;
 import org.whispersystems.textsecuregcm.storage.SingleUseECPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.SubscriptionManager;
 import org.whispersystems.textsecuregcm.storage.Subscriptions;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
 import org.whispersystems.textsecuregcm.storage.foundationdb.VersionstampUUIDCipher;
 import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreClient;
@@ -150,9 +153,20 @@ public record CommandDependencies(
     // we'd like, but is the least bad option given current constraints.
     fdb.disableShutdownHook();
 
-    final Map<Integer, List<Database>> messageDatabasesByEpoch;
+    final FoundationDbExternalClientConfiguration externalClientConfiguration = configuration.getFoundationDbMessagesConfiguration()
+        .externalClientConfiguration();
+    if (externalClientConfiguration != null) {
+      // If threadsPerClient is not specified, we default to the cluster size so that there is 1:1 correspondence between
+      // Database objects and threads.
+      final int clientThreadsPerVersion = externalClientConfiguration.threadsPerClient()
+          .orElseGet(() -> configuration.getFoundationDbMessagesConfiguration().clusters().size());
+      externalClientConfiguration.clientLibraryPaths().forEach(path -> fdb.options().setExternalClientLibrary(path));
+      fdb.options().setClientThreadsPerVersion(clientThreadsPerVersion);
+    }
+
+    final Map<Integer, List<FaultTolerantDatabase>> messageDatabasesByEpoch;
     {
-      final Map<String, Database> databasesByName =
+      final Map<String, FaultTolerantDatabase> faultTolerantDatabasesByName =
           configuration.getFoundationDbMessagesConfiguration().clusters().entrySet().stream()
               .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
                   entry -> {
@@ -164,16 +178,17 @@ public record CommandDependencies(
                       database.options().setTransactionRetryLimit(
                           configuration.getFoundationDbMessagesConfiguration().transactionRetryLimit());
 
-                      return database;
+                      return new FaultTolerantDatabase(database, entry.getKey(),
+                          configuration.getFoundationDbMessagesConfiguration().circuitBreakerConfigurationName());
                     } catch (final IOException e) {
-                      throw new UncheckedIOException(e);
+                      throw new UncheckedIOException("Failed to construct FoundationDB database", e);
                     }
                   }));
 
       messageDatabasesByEpoch = configuration.getFoundationDbMessagesConfiguration().epochs().entrySet().stream()
           .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
               entry -> entry.getValue().stream()
-                  .map(databasesByName::get)
+                  .map(faultTolerantDatabasesByName::get)
                   .toList()));
     }
 
@@ -353,12 +368,19 @@ public record CommandDependencies(
         configuration.getDynamoDbTables().getChangeNumberWaitingPeriods().getTableName(), dynamoDbClient);
     final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager = new ChangeNumberWaitingPeriodManager(
         changeNumberWaitingPeriods, configuration.getChangeNumber().postRegistrationWaitingPeriod(), clock);
+    final WebAuthnCeremonyManager webAuthnCeremonyManager = new WebAuthnCeremonyManager(
+        configuration.getRegistrationWebAuthnConfiguration().relyingPartyId(),
+        configuration.getRegistrationWebAuthnConfiguration().origin(),
+        configuration.getRegistrationWebAuthnConfiguration().challengeTtl(),
+        configuration.getRegistrationWebAuthnConfiguration().userHandleBlindingSecret().value(),
+        rateLimitersCluster);
     AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keys, messagesManager, profilesManager,
         changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
         phoneNumberRecoveryPasswordsManager, messagePollExecutor,
         retryExecutor, clock, configuration.getLinkDeviceSecretConfiguration().secret().value(),
-        configuration.getRegistrationTotpConfiguration().maxValidationDelay());
+        configuration.getRegistrationTotpConfiguration().maxValidationDelay(),
+        webAuthnCeremonyManager);
     RateLimiters rateLimiters = RateLimiters.create(dynamicConfigurationManager, rateLimitersCluster, retryExecutor);
     final BackupsDb backupsDb =
         new BackupsDb(dynamoDbAsyncClient, configuration.getDynamoDbTables().getBackups().getTableName(), clock);

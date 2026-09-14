@@ -12,7 +12,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-import com.apple.foundationdb.Database;
 import com.apple.foundationdb.KeyValue;
 import com.apple.foundationdb.Range;
 import com.apple.foundationdb.async.AsyncUtil;
@@ -27,10 +26,8 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,11 +35,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountLockManager;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.FoundationDbClusterExtension;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
 import org.whispersystems.textsecuregcm.storage.foundationdb.VersionstampUUIDCipher;
 import org.whispersystems.textsecuregcm.util.TestClock;
@@ -65,7 +62,7 @@ class ClearOrphanedFoundationDbQueuesCommandTest {
     final byte[] versionstampCipherKey = new byte[16];
     new SecureRandom().nextBytes(versionstampCipherKey);
 
-    final List<Database> databases = Arrays.asList(FOUNDATION_DB_EXTENSION.getDatabases());
+    final List<FaultTolerantDatabase> databases = Arrays.asList(FOUNDATION_DB_EXTENSION.getDatabases());
 
     accountsManager = mock(AccountsManager.class);
     accountLockManager = mock(AccountLockManager.class);
@@ -100,11 +97,9 @@ class ClearOrphanedFoundationDbQueuesCommandTest {
     // Assume that a subset of accounts are deleted
     final Set<AciServiceIdentifier> deletedAccounts = new HashSet<>(accounts.subList(0, 3));
 
-    when(accountsManager.getByAccountIdentifierAsync(any()))
-        .thenReturn(CompletableFuture.completedFuture(Optional.of(mock(Account.class))));
+    when(accountsManager.accountExists(any())).thenReturn(true);
     for (final AciServiceIdentifier deletedAccount : deletedAccounts) {
-      when(accountsManager.getByAccountIdentifierAsync(deletedAccount.uuid()))
-          .thenReturn(CompletableFuture.completedFuture(Optional.empty()));
+      when(accountsManager.accountExists(deletedAccount)).thenReturn(false);
     }
 
     final ClearOrphanedFoundationDbQueuesCommand command = new ClearOrphanedFoundationDbQueuesCommand();
@@ -132,7 +127,7 @@ class ClearOrphanedFoundationDbQueuesCommandTest {
     final List<AciServiceIdentifier> acis = IntStream.range(0, 128)
         .mapToObj(_ -> new AciServiceIdentifier(UUID.randomUUID()))
         .toList();
-    final Database database = FOUNDATION_DB_EXTENSION.getDatabases()[0];
+    final FaultTolerantDatabase database = FOUNDATION_DB_EXTENSION.getDatabases()[0];
     database.run(transaction -> {
       acis.forEach(aci -> {
         transaction.set(FoundationDbMessageStore.getAccountSubspace(testMessagesSubspace, aci).pack(Tuple.from("foo")),
@@ -141,7 +136,7 @@ class ClearOrphanedFoundationDbQueuesCommandTest {
             new byte[]{43});
       });
       return null;
-    });
+    }, FaultTolerantDatabase.Context.TEST);
     final List<AciServiceIdentifier> fetchedAcis = command.getAcisInShard(database, 2, 3, Duration.ofSeconds(2), 5)
         .collectList()
         .block();
@@ -155,11 +150,9 @@ class ClearOrphanedFoundationDbQueuesCommandTest {
     foundationDbMessageStore.insert(aci, Map.of(Device.PRIMARY_ID, generateRandomMessage())).join();
     foundationDbMessageStore.insert(aci, Map.of(Device.PRIMARY_ID, generateRandomMessage())).join();
 
-    // Stub that the initial existence check returns empty, but the second check under the ACI lock returns present i.e the ACI has been re-used
+    // Stub that the initial existence check returns absent, but the second check under the ACI lock returns present i.e the ACI has been re-used
     // since the initial check
-    when(accountsManager.getByAccountIdentifierAsync(aci.uuid()))
-        .thenReturn(CompletableFuture.completedFuture(Optional.empty()));
-    when(accountsManager.getByAccountIdentifier(aci.uuid())).thenReturn(Optional.of(mock(Account.class)));
+    when(accountsManager.accountExists(aci)).thenReturn(false, true);
 
     final ClearOrphanedFoundationDbQueuesCommand command = new ClearOrphanedFoundationDbQueuesCommand();
     command.clearOrphanedQueues(
@@ -178,9 +171,9 @@ class ClearOrphanedFoundationDbQueuesCommandTest {
   private boolean queueExists(final Subspace accountSpace) {
     final Range accountRange = accountSpace.range();
 
-    for (final Database database : FOUNDATION_DB_EXTENSION.getDatabases()) {
+    for (final FaultTolerantDatabase database : FOUNDATION_DB_EXTENSION.getDatabases()) {
       final List<KeyValue> keyValues = database.readAsync(transaction ->
-          AsyncUtil.collect(transaction.getRange(accountRange, 1))).join();
+          AsyncUtil.collect(transaction.getRange(accountRange, 1)), FaultTolerantDatabase.Context.TEST).join();
 
       if (!keyValues.isEmpty()) {
         return true;
