@@ -91,9 +91,9 @@ import org.whispersystems.textsecuregcm.spam.SpamChecker;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
+import org.whispersystems.textsecuregcm.storage.ReportMessageHelper;
 import org.whispersystems.textsecuregcm.storage.ReportMessageManager;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
-import org.whispersystems.textsecuregcm.util.Util;
 
 @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
 @Path("/v1/messages")
@@ -605,7 +605,7 @@ public class MessageController {
 
     CompletableFuture.allOf(resolvedRecipients.values()
             .stream()
-            .map(account -> account.getAccountIdentifier())
+            .map(Account::getAccountIdentifier)
             .map(accountIdentifier ->
                 rateLimiters.getStoriesLimiter().validateAsync(accountIdentifier).toCompletableFuture())
             .toList()
@@ -731,45 +731,10 @@ public class MessageController {
   @Path("/report/{source}/{messageGuid}")
   public Response reportSpamMessage(
       @Auth AuthenticatedDevice auth,
-      @PathParam("source") String source,
+      @PathParam("source") UUID source,
       @PathParam("messageGuid") UUID messageGuid,
       @Nullable SpamReport spamReport,
-      @HeaderParam(HttpHeaders.USER_AGENT) String userAgent
-  ) {
-    final Optional<String> sourceNumber;
-    final Optional<UUID> sourceAci;
-    final Optional<UUID> sourcePni;
-
-    boolean sourceAccountDeleted = false;
-    if (source.startsWith("+")) {
-      sourceNumber = Optional.of(source);
-      final Optional<Account> maybeAccount = accountsManager.getByE164(source);
-      if (maybeAccount.isPresent()) {
-        sourceAci = maybeAccount.map(Account::getAccountIdentifier);
-        sourcePni = maybeAccount.flatMap(Account::getPhoneNumberIdentifier);
-      } else {
-        sourcePni = Optional.ofNullable(phoneNumberIdentifiers.getPhoneNumberIdentifier(source).join());
-        sourceAci = sourcePni.flatMap(accountsManager::findRecentlyDeletedAccountIdentifier);
-        sourceAccountDeleted = true;
-      }
-    } else {
-      sourceAci = Optional.of(UUID.fromString(source));
-
-      final Optional<Account> sourceAccount = accountsManager.getByAccountIdentifier(sourceAci.get());
-
-      if (sourceAccount.isEmpty()) {
-        logger.warn("Could not find source: {}", sourceAci.get());
-        sourcePni = accountsManager.findRecentlyDeletedPhoneNumberIdentifier(sourceAci.get());
-        sourceNumber = sourcePni.flatMap(pni ->
-            Util.getCanonicalNumber(phoneNumberIdentifiers.getPhoneNumber(pni).join()));
-        sourceAccountDeleted = true;
-      } else {
-        sourceNumber = sourceAccount.flatMap(Account::getNumber);
-        sourcePni = sourceAccount.flatMap(Account::getPhoneNumberIdentifier);
-      }
-    }
-
-    final UUID spamReporterUuid = auth.accountIdentifier();
+      @HeaderParam(HttpHeaders.USER_AGENT) String userAgent) {
 
     // spam report token is optional, but if provided ensure it is non-empty.
     final Optional<byte[]> maybeSpamReportToken =
@@ -777,7 +742,14 @@ public class MessageController {
             .flatMap(r -> Optional.ofNullable(r.token()))
             .filter(t -> t.length > 0);
 
-    reportMessageManager.report(sourceNumber, sourceAci, sourcePni, messageGuid, spamReporterUuid, maybeSpamReportToken, userAgent, sourceAccountDeleted);
+    ReportMessageHelper.reportMessage(new AciServiceIdentifier(source),
+        new AciServiceIdentifier(auth.accountIdentifier()),
+        messageGuid,
+        maybeSpamReportToken.orElse(null),
+        userAgent,
+        accountsManager,
+        phoneNumberIdentifiers,
+        reportMessageManager);
 
     return Response.status(Status.ACCEPTED)
         .build();
