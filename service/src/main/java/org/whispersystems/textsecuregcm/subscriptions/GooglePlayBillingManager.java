@@ -270,7 +270,7 @@ public class GooglePlayBillingManager implements SubscriptionPaymentProcessor, O
     final Money price = lineItem.getAutoRenewingPlan().getRecurringPrice();
     return new SubscriptionPrice(
         price.getCurrencyCode().toUpperCase(Locale.ROOT),
-        SubscriptionCurrencyUtil.convertGoogleMoneyToApiAmount(price));
+        SubscriptionCurrencyUtil.convertGoogleMoneyToMinorUnits(price));
   }
 
   @Override
@@ -380,7 +380,7 @@ public class GooglePlayBillingManager implements SubscriptionPaymentProcessor, O
   }
 
   /**
-   * Asynchronously execute a synchronous API call on a purchaseToken, mapping expected errors to the appropriate
+   * Execute a synchronous API call on a purchaseToken, mapping expected errors to the appropriate
    * {@link SubscriptionException}
    *
    * @param apiCall An API call that operates on a purchaseToken

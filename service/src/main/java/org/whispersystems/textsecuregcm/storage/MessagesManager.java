@@ -17,6 +17,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -151,43 +152,54 @@ public class MessagesManager {
       foundationDbInsertFuture = CompletableFuture.completedFuture(Collections.emptyMap());
     }
 
-    return foundationDbInsertFuture.thenCompose(foundationDbInsertResults ->
-            CompletableFuture.allOf(messagesByDeviceId.entrySet().stream()
-                .map(deviceIdAndMessage -> {
-                  final byte deviceId = deviceIdAndMessage.getKey();
+    return foundationDbInsertFuture.thenCompose(foundationDbInsertResults -> {
+      final boolean useFoundationDbPresence =
+          experimentEnrollmentManager.isEnrolled(accountIdentifier, READ_LIVE_MESSAGES_FROM_FOUNDATIONDB_EXPERIMENT_NAME);
 
-                  // Multi-recipient messages will have both a "shared MRM key" and actual message content; we only
-                  // need/want the former for Redis
-                  final Envelope message = deviceIdAndMessage.getValue().hasSharedMrmKey()
-                      ? deviceIdAndMessage.getValue().toBuilder().clearContent().build()
-                      : deviceIdAndMessage.getValue();
+      if (useFoundationDbPresence) {
+        foundationDbInsertResults.forEach((deviceId, insertResult) ->
+            devicePresenceById.put(deviceId, insertResult.present()));
+      }
 
-                  final UUID messageGuid = Optional.ofNullable(foundationDbInsertResults.get(deviceId))
-                      .flatMap(FoundationDbMessageStore.InsertResult::messageGuid)
-                      .orElseGet(UUID::randomUUID);
+      return CompletableFuture.allOf(messagesByDeviceId.entrySet().stream()
+          .map(deviceIdAndMessage -> {
+            final byte deviceId = deviceIdAndMessage.getKey();
 
-                  return messagesCache.insert(messageGuid, accountIdentifier, deviceId, message)
-                      .thenAccept(present -> {
-                        if (message.hasSourceServiceId()) {
-                          final ServiceIdentifier sourceServiceIdentifier =
-                              ServiceIdentifier.fromByteString(message.getSourceServiceId());
+            // Multi-recipient messages will have both a "shared MRM key" and actual message content; we only
+            // need/want the former for Redis
+            final Envelope message = deviceIdAndMessage.getValue().hasSharedMrmKey()
+                ? deviceIdAndMessage.getValue().toBuilder().clearContent().build()
+                : deviceIdAndMessage.getValue();
 
-                          if (!accountIdentifier.equals(sourceServiceIdentifier.uuid())) {
-                            // Note that this is an asynchronous, best-effort, fire-and-forget operation
-                            reportMessageManager.store(sourceServiceIdentifier.toServiceIdentifierString(), messageGuid);
-                          }
-                        }
+            final UUID messageGuid = Optional.ofNullable(foundationDbInsertResults.get(deviceId))
+                .flatMap(FoundationDbMessageStore.InsertResult::messageGuid)
+                .orElseGet(UUID::randomUUID);
 
-                        devicePresenceById.put(deviceId, present);
+            return messagesCache.insert(messageGuid, accountIdentifier, deviceId, message)
+                .thenAccept(present -> {
+                  if (message.hasSourceServiceId()) {
+                    final ServiceIdentifier sourceServiceIdentifier =
+                        ServiceIdentifier.fromByteString(message.getSourceServiceId());
 
-                        if (foundationDbInsertResults.containsKey(deviceId)) {
-                          Metrics.counter(PRESENCE_MATCH_COUNTER_NAME,
-                                  "match", String.valueOf(present == foundationDbInsertResults.get(deviceId).present()))
-                              .increment();
-                        }
-                      });
-                })
-                .toArray(CompletableFuture[]::new)))
+                    if (!accountIdentifier.equals(sourceServiceIdentifier.uuid())) {
+                      // Note that this is an asynchronous, best-effort, fire-and-forget operation
+                      reportMessageManager.store(sourceServiceIdentifier.toServiceIdentifierString(), messageGuid);
+                    }
+                  }
+
+                  if (!useFoundationDbPresence) {
+                    devicePresenceById.put(deviceId, present);
+                  }
+
+                  if (foundationDbInsertResults.containsKey(deviceId)) {
+                    Metrics.counter(PRESENCE_MATCH_COUNTER_NAME,
+                            "match", String.valueOf(present == foundationDbInsertResults.get(deviceId).present()))
+                        .increment();
+                  }
+                });
+          })
+          .toArray(CompletableFuture[]::new));
+        })
         .thenApply(ignored -> devicePresenceById);
   }
 
@@ -218,15 +230,17 @@ public class MessagesManager {
 
     final long serverTimestamp = clock.millis();
 
-    return insertSharedMultiRecipientMessagePayload(multiRecipientMessage)
-        .thenCompose(sharedMrmKey -> {
+    return insertSharedMultiRecipientMessagePayload(multiRecipientMessage, resolvedRecipients.keySet())
+        .thenCompose(maybeSharedMrmKey -> {
           final Envelope.Builder envelopeBuilder = Envelope.newBuilder()
               .setType(Envelope.Type.UNIDENTIFIED_SENDER)
               .setClientTimestamp(clientTimestamp == 0 ? serverTimestamp : clientTimestamp)
               .setServerTimestamp(serverTimestamp)
               .setEphemeral(isEphemeral)
-              .setUrgent(isUrgent)
-              .setSharedMrmKey(ByteString.copyFrom(sharedMrmKey));
+              .setUrgent(isUrgent);
+
+          maybeSharedMrmKey
+              .ifPresent(sharedMrmKey -> envelopeBuilder.setSharedMrmKey(ByteString.copyFrom(sharedMrmKey)));
 
           if (isStory) {
             // Avoid sending this field if it's false.
@@ -396,15 +410,21 @@ public class MessagesManager {
         .toFuture();
   }
 
-  /**
-   * Inserts the shared multi-recipient message payload to storage.
-   *
-   * @return a key where the shared data is stored
-   * @see MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript
-   */
-  private CompletableFuture<byte[]> insertSharedMultiRecipientMessagePayload(
-      final SealedSenderMultiRecipientMessage sealedSenderMultiRecipientMessage) {
-    return messagesCache.insertSharedMultiRecipientMessagePayload(sealedSenderMultiRecipientMessage);
+  /// Inserts the shared multi-recipient message payload to storage.
+  ///
+  /// @return a future that yields a key where the shared data is stored or empty if the resolved recipient set is empty
+  ///
+  /// @see MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript
+  private CompletableFuture<Optional<byte[]>> insertSharedMultiRecipientMessagePayload(
+      final SealedSenderMultiRecipientMessage sealedSenderMultiRecipientMessage,
+      final Set<SealedSenderMultiRecipientMessage.Recipient> resolvedRecipients) {
+
+    if (resolvedRecipients.isEmpty()) {
+      return CompletableFuture.completedFuture(Optional.empty());
+    }
+
+    return messagesCache.insertSharedMultiRecipientMessagePayload(sealedSenderMultiRecipientMessage, resolvedRecipients)
+        .thenApply(Optional::of);
   }
 
   /// Record versionstamps for the current time in the FoundationDB database(s).

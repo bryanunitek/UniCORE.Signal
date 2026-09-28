@@ -7,6 +7,7 @@ package org.whispersystems.textsecuregcm.grpc;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.Empty;
+import io.micrometer.core.instrument.Metrics;
 import java.time.Clock;
 import java.util.Base64;
 import java.util.Optional;
@@ -20,10 +21,10 @@ import org.signal.chat.profile.ExtendAvatarTTLRequest;
 import org.signal.chat.profile.ExtendAvatarTTLResponse;
 import org.signal.chat.profile.GetAvatarUploadFormRequest;
 import org.signal.chat.profile.GetAvatarUploadFormResponse;
-import org.signal.chat.profile.GetExpiringProfileKeyCredentialAnonymousRequest;
-import org.signal.chat.profile.GetExpiringProfileKeyCredentialAnonymousResponse;
 import org.signal.chat.profile.GetProfileAnonymousRequest;
 import org.signal.chat.profile.GetProfileAnonymousResponse;
+import org.signal.chat.profile.GetProfileKeyCredentialRequest;
+import org.signal.chat.profile.GetProfileKeyCredentialResponse;
 import org.signal.chat.profile.SimpleProfileAnonymousGrpc;
 import org.signal.libsignal.zkgroup.GenericServerSecretParams;
 import org.signal.libsignal.zkgroup.InvalidInputException;
@@ -36,6 +37,7 @@ import org.whispersystems.textsecuregcm.badges.ProfileBadgeConverter;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
+import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -43,6 +45,9 @@ import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.util.ProfileHelper;
 
 public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.ProfileAnonymousImplBase {
+
+  private static final String GET_PROFILE_RESPONSE_CASE_COUNTER_NAME = MetricsUtil.name(ProfileAnonymousGrpcService.class, "getProfile");
+
   private final AccountsManager accountsManager;
   private final ProfilesManager profilesManager;
   private final ProfileBadgeConverter profileBadgeConverter;
@@ -118,7 +123,7 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
     }
     final byte[] version = request.getRequest().getVersion().toByteArray();
 
-    return targetAccount.flatMap(account -> ProfileGrpcHelper
+    final GetProfileAnonymousResponse response = targetAccount.flatMap(account -> ProfileGrpcHelper
             .getProfile(account, profilesManager, profileBadgeConverter, version)
 
             // If the etag matches, drop the result
@@ -131,39 +136,51 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
                 .getProfileV1(account, profilesManager, profileBadgeConverter, version)
                 .map(v1Result -> GetProfileAnonymousResponse.newBuilder().setProfileV1(v1Result).build())))
         .orElseGet(() -> GetProfileAnonymousResponse.newBuilder().setNotFound(NotFound.getDefaultInstance()).build());
+
+    Metrics.counter(GET_PROFILE_RESPONSE_CASE_COUNTER_NAME, "responseCase", response.getResponseCase().name())
+        .increment();
+
+    return response;
   }
 
   @Override
-  public GetExpiringProfileKeyCredentialAnonymousResponse getExpiringProfileKeyCredential(
-      final GetExpiringProfileKeyCredentialAnonymousRequest request) {
-    final ServiceIdentifier targetIdentifier = GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getRequest().getAccountIdentifier());
+  public GetProfileKeyCredentialResponse getProfileKeyCredential(
+      final GetProfileKeyCredentialRequest request) {
+    final ServiceIdentifier targetIdentifier = GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getAccountIdentifier());
 
-    if (request.getRequest().getCredentialType() != CredentialType.CREDENTIAL_TYPE_EXPIRING_PROFILE_KEY) {
+    if (request.getCredentialType() != CredentialType.CREDENTIAL_TYPE_EXPIRING_PROFILE_KEY) {
       throw GrpcExceptions.invalidArguments("invalid credential type");
     }
 
-    final Optional<Account> maybeAccount = getTargetAccountAndValidateUnidentifiedAccess(
-        targetIdentifier, request.getUnidentifiedAccessKey().toByteArray());
+    final Optional<Account> maybeAccount = accountsManager.getByServiceIdentifier(targetIdentifier);
+    if (maybeAccount.isEmpty()) {
+      return GetProfileKeyCredentialResponse.newBuilder()
+          .setNotFound(NotFound.getDefaultInstance())
+          .build();
+    }
 
-    return maybeAccount.map(account ->
-        ProfileGrpcHelper.getExpiringProfileKeyCredentialResult(account,
-                request.getRequest().getVersion().toByteArray(), request.getRequest().getCredentialRequest().toByteArray(),
-                profilesManager, zkProfileOperations)
-            .map(result -> GetExpiringProfileKeyCredentialAnonymousResponse.newBuilder()
-                .setResult(result)
-                .build())
-            .orElseGet(() -> GetExpiringProfileKeyCredentialAnonymousResponse.newBuilder()
-                .setNotFound(NotFound.getDefaultInstance())
-                .build())).orElseGet(() -> GetExpiringProfileKeyCredentialAnonymousResponse.newBuilder()
-        .setNotFound(NotFound.getDefaultInstance())
-        .build());
+    final Account account = maybeAccount.get();
 
-  }
+    if (!UnidentifiedAccessUtil.checkUnidentifiedAccess(account, request.getUnidentifiedAccessKey().toByteArray())) {
+      return GetProfileKeyCredentialResponse.newBuilder()
+          .setFailedUnidentifiedAuthorization(FailedUnidentifiedAuthorization.getDefaultInstance())
+          .build();
+    }
 
-  private Optional<Account> getTargetAccountAndValidateUnidentifiedAccess(final ServiceIdentifier targetIdentifier, final byte[] unidentifiedAccessKey)  {
-
-    return accountsManager.getByServiceIdentifier(targetIdentifier)
-        .filter(targetAccount -> UnidentifiedAccessUtil.checkUnidentifiedAccess(targetAccount, unidentifiedAccessKey));
+    // By presenting the correct unidentified access key, the client has confirmed they have the current profile key.
+    // If the credential request is somehow for a different profile version, then the below will fail (and it’s
+    // a client bug).
+    return account.getCurrentProfileVersion()
+        .flatMap(currentVersion ->
+            ProfileGrpcHelper.getProfileKeyCredentialResult(account,
+                    currentVersion, request.getCredentialRequest().toByteArray(),
+                    profilesManager, zkProfileOperations)
+                .map(result -> GetProfileKeyCredentialResponse.newBuilder()
+                    .setResult(result)
+                    .build()))
+        .orElseGet(() -> GetProfileKeyCredentialResponse.newBuilder()
+            .setNotFound(NotFound.getDefaultInstance())
+            .build());
   }
 
   @Override
@@ -172,7 +189,7 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
 
     try {
       presentation = new AvatarUploadCredentialPresentation(
-          request.getAvatarCredentialsPresentation().toByteArray());
+          request.getAvatarCredentialPresentation().toByteArray());
 
       presentation.verify(clock.instant(), this.genericServerSecretParams);
 
@@ -181,7 +198,7 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
 
     } catch (VerificationFailedException _) {
       return GetAvatarUploadFormResponse.newBuilder()
-          .setInvalidCredentialsPresentation(FailedZkAuthentication.getDefaultInstance())
+          .setInvalidCredentialPresentation(FailedZkAuthentication.getDefaultInstance())
           .build();
     }
 
@@ -203,7 +220,7 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
     final AvatarUploadCredentialPresentation presentation;
     try {
       presentation = new AvatarUploadCredentialPresentation(
-          request.getAvatarCredentialsPresentation().toByteArray());
+          request.getAvatarCredentialPresentation().toByteArray());
     } catch (InvalidInputException _) {
       throw GrpcExceptions.invalidArguments("invalid credential presentation");
     }
@@ -213,7 +230,7 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
 
     } catch (VerificationFailedException _) {
       return ExtendAvatarTTLResponse.newBuilder()
-          .setInvalidCredentialsPresentation(FailedZkAuthentication.getDefaultInstance())
+          .setInvalidCredentialPresentation(FailedZkAuthentication.getDefaultInstance())
           .build();
     }
 
@@ -233,7 +250,7 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
     final AvatarUploadCredentialPresentation presentation;
     try {
       presentation = new AvatarUploadCredentialPresentation(
-          request.getAvatarCredentialsPresentation().toByteArray());
+          request.getAvatarCredentialPresentation().toByteArray());
     } catch (InvalidInputException _) {
       throw GrpcExceptions.invalidArguments("invalid credential presentation");
     }
@@ -243,7 +260,7 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
 
     } catch (VerificationFailedException _) {
       return DeleteAvatarResponse.newBuilder()
-          .setInvalidCredentialsPresentation(FailedZkAuthentication.getDefaultInstance())
+          .setInvalidCredentialPresentation(FailedZkAuthentication.getDefaultInstance())
           .build();
     }
 

@@ -85,6 +85,7 @@ import org.whispersystems.textsecuregcm.storage.ReportMessageManager;
 import org.whispersystems.textsecuregcm.storage.SingleUseECPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.SubscriptionManager;
 import org.whispersystems.textsecuregcm.storage.Subscriptions;
+import org.whispersystems.textsecuregcm.storage.TotpManager;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
 import org.whispersystems.textsecuregcm.storage.foundationdb.VersionstampUUIDCipher;
@@ -93,6 +94,7 @@ import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreManager;
 import org.whispersystems.textsecuregcm.subscriptions.GooglePlayBillingManager;
 import org.whispersystems.textsecuregcm.util.ManagedAwsCrt;
 import org.whispersystems.textsecuregcm.util.ManagedExecutors;
+import org.whispersystems.textsecuregcm.util.ResilienceUtil;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
@@ -139,6 +141,15 @@ public record CommandDependencies(
       throws IOException, GeneralSecurityException, InvalidInputException {
     Clock clock = Clock.systemUTC();
 
+    configuration.getCircuitBreakerConfigurations().forEach((configName, config) ->
+        ResilienceUtil.getCircuitBreakerRegistry().addConfiguration(configName, config.toCircuitBreakerConfig()));
+
+    configuration.getRetryConfigurations().forEach((configName, config) ->
+        ResilienceUtil.getRetryRegistry().addConfiguration(configName, config.toRetryConfigBuilder().build()));
+
+    configuration.getBulkheadConfigurations().forEach((configName, config) ->
+        ResilienceUtil.getBulkheadRegistry().addConfiguration(configName, config.toBulkheadConfig().build()));
+
     MetricsUtil.configureLogging(configuration, environment);
 
     environment.getObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
@@ -179,7 +190,8 @@ public record CommandDependencies(
                           configuration.getFoundationDbMessagesConfiguration().transactionRetryLimit());
 
                       return new FaultTolerantDatabase(database, entry.getKey(),
-                          configuration.getFoundationDbMessagesConfiguration().circuitBreakerConfigurationName());
+                          configuration.getFoundationDbMessagesConfiguration().circuitBreakerConfigurationName(),
+                          configuration.getFoundationDbMessagesConfiguration().bulkheadConfigurationName());
                     } catch (final IOException e) {
                       throw new UncheckedIOException("Failed to construct FoundationDB database", e);
                     }
@@ -368,9 +380,12 @@ public record CommandDependencies(
         configuration.getDynamoDbTables().getChangeNumberWaitingPeriods().getTableName(), dynamoDbClient);
     final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager = new ChangeNumberWaitingPeriodManager(
         changeNumberWaitingPeriods, configuration.getChangeNumber().postRegistrationWaitingPeriod(), clock);
+    final TotpManager totpManager = new TotpManager(
+        rateLimitersCluster,
+        configuration.getRegistrationTotpConfiguration().maxValidationDelay());
     final WebAuthnCeremonyManager webAuthnCeremonyManager = new WebAuthnCeremonyManager(
         configuration.getRegistrationWebAuthnConfiguration().relyingPartyId(),
-        configuration.getRegistrationWebAuthnConfiguration().origin(),
+        configuration.getRegistrationWebAuthnConfiguration().origins(),
         configuration.getRegistrationWebAuthnConfiguration().challengeTtl(),
         configuration.getRegistrationWebAuthnConfiguration().userHandleBlindingSecret().value(),
         rateLimitersCluster);
@@ -379,8 +394,7 @@ public record CommandDependencies(
         changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
         phoneNumberRecoveryPasswordsManager, messagePollExecutor,
         retryExecutor, clock, configuration.getLinkDeviceSecretConfiguration().secret().value(),
-        configuration.getRegistrationTotpConfiguration().maxValidationDelay(),
-        webAuthnCeremonyManager);
+         webAuthnCeremonyManager, totpManager);
     RateLimiters rateLimiters = RateLimiters.create(dynamicConfigurationManager, rateLimitersCluster, retryExecutor);
     final BackupsDb backupsDb =
         new BackupsDb(dynamoDbAsyncClient, configuration.getDynamoDbTables().getBackups().getTableName(), clock);

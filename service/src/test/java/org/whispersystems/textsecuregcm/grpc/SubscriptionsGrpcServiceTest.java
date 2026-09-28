@@ -8,7 +8,6 @@ package org.whispersystems.textsecuregcm.grpc;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -20,17 +19,15 @@ import static org.mockito.Mockito.when;
 
 import com.google.common.net.InetAddresses;
 import com.google.protobuf.ByteString;
+import io.grpc.Status;
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
-import io.grpc.Status;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -45,8 +42,8 @@ import org.signal.chat.purchase.DeleteSubscriberRequest;
 import org.signal.chat.purchase.DeleteSubscriberResponse;
 import org.signal.chat.purchase.GetBankMandateRequest;
 import org.signal.chat.purchase.GetBankMandateResponse;
-import org.signal.chat.purchase.GetReceiptCredentialsRequest;
-import org.signal.chat.purchase.GetReceiptCredentialsResponse;
+import org.signal.chat.purchase.GetReceiptCredentialRequest;
+import org.signal.chat.purchase.GetReceiptCredentialResponse;
 import org.signal.chat.purchase.GetSubscriptionInformationRequest;
 import org.signal.chat.purchase.GetSubscriptionInformationResponse;
 import org.signal.chat.purchase.PaymentMethod;
@@ -532,7 +529,7 @@ public class SubscriptionsGrpcServiceTest extends
   void getSubscriptionInformation()
       throws SubscriptionNotFoundException, SubscriptionForbiddenException, RateLimitExceededException {
     final SubscriptionInformation info = new SubscriptionInformation(
-        new SubscriptionPrice(CURRENCY, BigDecimal.valueOf(500)),
+        new SubscriptionPrice(CURRENCY, 500),
         LEVEL,
         Instant.ofEpochSecond(100),
         Instant.ofEpochSecond(1000),
@@ -572,39 +569,39 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void getReceiptCredentials() throws Exception {
+  void getReceiptCredential() throws Exception {
     final ReceiptCredentialResponse receiptCredentialResponse = mock(ReceiptCredentialResponse.class);
     final byte[] responseBytes = TestRandomUtil.nextBytes(16);
     when(receiptCredentialResponse.serialize()).thenReturn(responseBytes);
-    when(subscriptionManager.createReceiptCredentials(any(), any(), any(), any()))
+    when(subscriptionManager.createReceiptCredential(any(), any(), any(), any()))
         .thenReturn(new SubscriptionManager.ReceiptResult(receiptCredentialResponse, new SubscriptionPaymentProcessor.ReceiptItem("test-item-id", null, 5), PaymentProvider.STRIPE));
-    final GetReceiptCredentialsResponse response = unauthenticatedServiceStub().getReceiptCredentials(
-        GetReceiptCredentialsRequest.newBuilder()
+    final GetReceiptCredentialResponse response = unauthenticatedServiceStub().getReceiptCredential(
+        GetReceiptCredentialRequest.newBuilder()
             .setSubscriberId(SUBSCRIBER_ID)
             .setReceiptCredentialRequest(ByteString.copyFrom(TestRandomUtil.nextBytes(97)))
             .build());
-    assertEquals(GetReceiptCredentialsResponse.ResponseCase.SUCCESS, response.getResponseCase());
+    assertEquals(GetReceiptCredentialResponse.ResponseCase.SUCCESS, response.getResponseCase());
     assertArrayEquals(responseBytes, response.getSuccess().getReceiptCredentialResponse().toByteArray());
   }
 
-  static Stream<Arguments> getReceiptCredentialsExceptions() {
+  static Stream<Arguments> getReceiptCredentialExceptions() {
     return Stream.of(
         Arguments.of(new SubscriptionReceiptRequestedForOpenPaymentException(),
-            GetReceiptCredentialsResponse.ResponseCase.NO_PAID_INVOICE),
+            GetReceiptCredentialResponse.ResponseCase.NO_PAID_INVOICE),
         Arguments.of(new SubscriptionPaymentRequiredException(),
-            GetReceiptCredentialsResponse.ResponseCase.PAYMENT_REQUIRED),
+            GetReceiptCredentialResponse.ResponseCase.PAYMENT_REQUIRED),
         Arguments.of(new SubscriptionReceiptAlreadyRedeemedException(),
-            GetReceiptCredentialsResponse.ResponseCase.ALREADY_REDEEMED)
+            GetReceiptCredentialResponse.ResponseCase.ALREADY_REDEEMED)
     );
   }
 
   @ParameterizedTest
   @MethodSource
-  void getReceiptCredentialsExceptions(final SubscriptionException exception,
-      final GetReceiptCredentialsResponse.ResponseCase expectedCase) throws Exception {
-    doThrow(exception).when(subscriptionManager).createReceiptCredentials(any(), any(), any(), any());
-    final GetReceiptCredentialsResponse response = unauthenticatedServiceStub().getReceiptCredentials(
-        GetReceiptCredentialsRequest.newBuilder()
+  void getReceiptCredentialExceptions(final SubscriptionException exception,
+      final GetReceiptCredentialResponse.ResponseCase expectedCase) throws Exception {
+    doThrow(exception).when(subscriptionManager).createReceiptCredential(any(), any(), any(), any());
+    final GetReceiptCredentialResponse response = unauthenticatedServiceStub().getReceiptCredential(
+        GetReceiptCredentialRequest.newBuilder()
             .setSubscriberId(SUBSCRIBER_ID)
             .setReceiptCredentialRequest(ByteString.copyFrom(TestRandomUtil.nextBytes(97)))
             .build());
@@ -612,16 +609,16 @@ public class SubscriptionsGrpcServiceTest extends
   }
 
   @Test
-  void getReceiptCredentialsChargeFailure() throws Exception {
+  void getReceiptCredentialChargeFailure() throws Exception {
     doThrow(new SubscriptionChargeFailurePaymentRequiredException(PaymentProvider.STRIPE,
         new ChargeFailure("card_declined", "Insufficient funds", null, null, null)))
-        .when(subscriptionManager).createReceiptCredentials(any(), any(), any(), any());
-    final GetReceiptCredentialsResponse response = unauthenticatedServiceStub().getReceiptCredentials(
-        GetReceiptCredentialsRequest.newBuilder()
+        .when(subscriptionManager).createReceiptCredential(any(), any(), any(), any());
+    final GetReceiptCredentialResponse response = unauthenticatedServiceStub().getReceiptCredential(
+        GetReceiptCredentialRequest.newBuilder()
             .setSubscriberId(SUBSCRIBER_ID)
             .setReceiptCredentialRequest(ByteString.copyFrom(TestRandomUtil.nextBytes(97)))
             .build());
-    assertEquals(GetReceiptCredentialsResponse.ResponseCase.PAYMENT_REQUIRED, response.getResponseCase());
+    assertEquals(GetReceiptCredentialResponse.ResponseCase.PAYMENT_REQUIRED, response.getResponseCase());
     assertEquals(org.signal.chat.purchase.PaymentProvider.PAYMENT_PROVIDER_STRIPE,
         response.getPaymentRequired().getChargeFailure().getProcessor());
     assertEquals("card_declined", response.getPaymentRequired().getChargeFailure().getCode());

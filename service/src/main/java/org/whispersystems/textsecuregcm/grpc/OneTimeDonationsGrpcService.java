@@ -8,17 +8,16 @@ import static org.whispersystems.textsecuregcm.grpc.SubscriptionsUtil.getClientP
 import static org.whispersystems.textsecuregcm.grpc.SubscriptionsUtil.toChargeFailure;
 
 import com.google.protobuf.ByteString;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Tag;
+import io.micrometer.core.instrument.Tags;
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
-import io.micrometer.core.instrument.Metrics;
-import io.micrometer.core.instrument.Tag;
-import io.micrometer.core.instrument.Tags;
 import org.signal.chat.errors.FailedPrecondition;
 import org.signal.chat.errors.FailedZkAuthentication;
 import org.signal.chat.errors.NotFound;
@@ -26,14 +25,14 @@ import org.signal.chat.purchase.AmountAboveSepaLimitError;
 import org.signal.chat.purchase.AmountBelowMinimumError;
 import org.signal.chat.purchase.ConfirmPayPalBoostRequest;
 import org.signal.chat.purchase.ConfirmPayPalBoostResponse;
-import org.signal.chat.purchase.CreateBoostReceiptCredentialsRequest;
-import org.signal.chat.purchase.CreateBoostReceiptCredentialsResponse;
+import org.signal.chat.purchase.CreateBoostReceiptCredentialRequest;
+import org.signal.chat.purchase.CreateBoostReceiptCredentialResponse;
 import org.signal.chat.purchase.CreateBoostRequest;
 import org.signal.chat.purchase.CreateBoostResponse;
 import org.signal.chat.purchase.CreatePayPalBoostRequest;
 import org.signal.chat.purchase.CreatePayPalBoostResponse;
-import org.signal.chat.purchase.SimpleOneTimeDonationsGrpc;
 import org.signal.chat.purchase.PaymentRequired;
+import org.signal.chat.purchase.SimpleOneTimeDonationsGrpc;
 import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.VerificationFailedException;
 import org.signal.libsignal.zkgroup.donation.DonationPermit;
@@ -54,6 +53,7 @@ import org.whispersystems.textsecuregcm.subscriptions.PaymentDetails;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
 import org.whispersystems.textsecuregcm.subscriptions.PaymentStatus;
 import org.whispersystems.textsecuregcm.subscriptions.StripeManager;
+import org.whispersystems.textsecuregcm.subscriptions.SubscriptionCurrencyUtil;
 import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidAmountException;
 import org.whispersystems.textsecuregcm.subscriptions.SubscriptionProcessorException;
 
@@ -126,7 +126,7 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
     final OneTimeDonationUtil.OneTimeDonationRequestValidationResult validationResult =
         OneTimeDonationUtil.validateOneTimeDonationRequest(
             request.getCurrency(),
-            BigDecimal.valueOf(request.getAmount()),
+            request.getAmount(),
             request.getLevel(),
             paymentMethod,
             oneTimeDonationConfiguration,
@@ -142,11 +142,15 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
       case final OneTimeDonationUtil.OneTimeDonationRequestValidationResult.AmountBelowMinimum r ->
           CreateBoostResponse.newBuilder()
               .setAmountBelowMinimum(AmountBelowMinimumError.newBuilder()
-                  .setMinimum(r.minimum().toString()).build()).build();
+                  .setMinimum(SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(request.getCurrency(),
+                      r.minimum()))
+                  .build()).build();
       case final OneTimeDonationUtil.OneTimeDonationRequestValidationResult.AmountAboveSepaLimit r ->
           CreateBoostResponse.newBuilder()
               .setAmountAboveSepaLimit(AmountAboveSepaLimitError.newBuilder()
-                  .setMaximum(r.maximum().toString()).build()).build();
+                  .setMaximum(SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(
+                      OneTimeDonationUtil.EURO_CURRENCY_CODE, r.maximum()))
+                  .build()).build();
       case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.Success _ -> {
         try {
           final com.stripe.model.PaymentIntent paymentIntent = stripeManager.createPaymentIntent(
@@ -169,7 +173,7 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
     final OneTimeDonationUtil.OneTimeDonationRequestValidationResult validationResult =
         OneTimeDonationUtil.validateOneTimeDonationRequest(
             request.getCurrency(),
-            BigDecimal.valueOf(request.getAmount()),
+            request.getAmount(),
             request.getLevel(),
             org.whispersystems.textsecuregcm.subscriptions.PaymentMethod.PAYPAL,
             oneTimeDonationConfiguration,
@@ -185,7 +189,9 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
       case final OneTimeDonationUtil.OneTimeDonationRequestValidationResult.AmountBelowMinimum r ->
           CreatePayPalBoostResponse.newBuilder()
               .setAmountBelowMinimum(AmountBelowMinimumError.newBuilder()
-                  .setMinimum(r.minimum().toString()).build()).build();
+                  .setMinimum(SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(request.getCurrency(),
+                      r.minimum()))
+                  .build()).build();
       case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.AmountAboveSepaLimit _ ->
           throw new IllegalStateException("SEPA limit should not trigger for PayPal");
       case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.Success _ -> {
@@ -213,7 +219,7 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
     final OneTimeDonationUtil.OneTimeDonationRequestValidationResult validationResult =
         OneTimeDonationUtil.validateOneTimeDonationRequest(
             request.getCurrency(),
-            BigDecimal.valueOf(request.getAmount()),
+            request.getAmount(),
             request.getLevel(),
             org.whispersystems.textsecuregcm.subscriptions.PaymentMethod.PAYPAL,
             oneTimeDonationConfiguration,
@@ -229,7 +235,9 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
       case final OneTimeDonationUtil.OneTimeDonationRequestValidationResult.AmountBelowMinimum r ->
           ConfirmPayPalBoostResponse.newBuilder()
               .setAmountBelowMinimum(AmountBelowMinimumError.newBuilder()
-                  .setMinimum(r.minimum().toString()).build()).build();
+                  .setMinimum(SubscriptionCurrencyUtil.convertPrimaryToMinorUnits(request.getCurrency(),
+                      r.minimum()))
+                  .build()).build();
       case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.AmountAboveSepaLimit _ ->
           throw new IllegalStateException("SEPA limit should not trigger for PayPal");
       case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.Success _ -> {
@@ -253,8 +261,8 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
   }
 
   @Override
-  public CreateBoostReceiptCredentialsResponse createBoostReceiptCredentials(
-      final CreateBoostReceiptCredentialsRequest request) throws IOException {
+  public CreateBoostReceiptCredentialResponse createBoostReceiptCredential(
+      final CreateBoostReceiptCredentialRequest request) throws IOException {
 
     final PaymentProvider processor = PaymentProvider.fromProto(request.getProcessor())
         .orElseThrow(() -> GrpcExceptions.fieldViolation("processor", "Unsupported payment processor"));
@@ -266,12 +274,12 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
     };
 
     if (maybePaymentDetails.isEmpty()) {
-      return CreateBoostReceiptCredentialsResponse.newBuilder()
+      return CreateBoostReceiptCredentialResponse.newBuilder()
           .setPaymentNotFound(NotFound.getDefaultInstance()).build();
     }
     final PaymentDetails paymentDetails = maybePaymentDetails.get();
     if (paymentDetails.status() == PaymentStatus.PROCESSING) {
-      return CreateBoostReceiptCredentialsResponse.newBuilder()
+      return CreateBoostReceiptCredentialResponse.newBuilder()
           .setPaymentStillProcessing(FailedPrecondition.getDefaultInstance()).build();
     }
     if (paymentDetails.status() != PaymentStatus.SUCCEEDED) {
@@ -279,7 +287,7 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
       if (paymentDetails.chargeFailure() != null) {
         paymentRequiredBuilder.setChargeFailure(toChargeFailure(processor, paymentDetails.chargeFailure()));
       }
-      return CreateBoostReceiptCredentialsResponse.newBuilder()
+      return CreateBoostReceiptCredentialResponse.newBuilder()
           .setPaymentRequired(paymentRequiredBuilder).build();
     }
 
@@ -308,7 +316,7 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
       issuedReceiptsManager.recordOneTimeIssuance(
           paymentDetails.id(), processor, receiptCredentialRequest, expiration);
     } catch (final WriteConflictException e) {
-      return CreateBoostReceiptCredentialsResponse.newBuilder()
+      return CreateBoostReceiptCredentialResponse.newBuilder()
           .setReceiptAlreadyIssued(FailedPrecondition.getDefaultInstance()).build();
     }
 
@@ -328,8 +336,8 @@ public class OneTimeDonationsGrpcService extends SimpleOneTimeDonationsGrpc.OneT
                 UserAgentTagUtil.getPlatformTag(RequestAttributesUtil.getUserAgent().orElse(null))))
         .increment();
 
-    return CreateBoostReceiptCredentialsResponse.newBuilder()
-        .setResult(CreateBoostReceiptCredentialsResponse.CreateBoostReceiptCredentialsResult.newBuilder()
+    return CreateBoostReceiptCredentialResponse.newBuilder()
+        .setResult(CreateBoostReceiptCredentialResponse.CreateBoostReceiptCredentialResult.newBuilder()
             .setReceiptCredentialResponse(ByteString.copyFrom(receiptCredentialResponse.serialize()))
             .build())
         .build();
