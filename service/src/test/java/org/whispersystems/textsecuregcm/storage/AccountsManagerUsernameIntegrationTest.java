@@ -153,6 +153,7 @@ class AccountsManagerUsernameIntegrationTest {
         mock(SecureValueRecoveryClient.class),
         disconnectionRequestManager,
         phoneNumberRecoveryPasswordsManager,
+        mock(SandboxAccounts.class),
         Executors.newSingleThreadScheduledExecutor(),
         Executors.newSingleThreadScheduledExecutor(),
         Clock.systemUTC(),

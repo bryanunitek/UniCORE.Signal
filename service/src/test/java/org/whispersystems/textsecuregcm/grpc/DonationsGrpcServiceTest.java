@@ -23,8 +23,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
 import org.mockito.Mock;
-import org.signal.chat.donations.CreateDonationPermitRequest;
-import org.signal.chat.donations.CreateDonationPermitResponse;
+import org.signal.chat.donations.CreateDonationPermitsRequest;
+import org.signal.chat.donations.CreateDonationPermitsResponse;
 import org.signal.chat.donations.DonationsGrpc;
 import org.signal.chat.donations.RedeemReceiptRequest;
 import org.signal.chat.donations.RedeemReceiptResponse;
@@ -47,8 +47,8 @@ import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.DonationPermits;
 import org.whispersystems.textsecuregcm.storage.DonationPermitsManager;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptCredentialPresentationFactory;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
+import org.whispersystems.textsecuregcm.purchases.ReceiptCredentialPresentationFactory;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.tests.util.AccountsHelper;
 import org.whispersystems.textsecuregcm.util.TestClock;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
@@ -182,12 +182,12 @@ class DonationsGrpcServiceTest extends SimpleBaseGrpcTest<DonationsGrpcService, 
     final int permitCount = 10;
     final DonationPermitRequestContext context = DonationPermitRequestContext.forCount(permitCount);
 
-    final CreateDonationPermitResponse response = authenticatedServiceStub().createDonationPermit(
-        CreateDonationPermitRequest.newBuilder()
-            .setDonationPermitRequest(ByteString.copyFrom(context.request().serialize()))
+    final CreateDonationPermitsResponse response = authenticatedServiceStub().createDonationPermits(
+        CreateDonationPermitsRequest.newBuilder()
+            .setDonationPermitsRequest(ByteString.copyFrom(context.request().serialize()))
             .build());
 
-    final DonationPermitResponse donationPermitResponse = new DonationPermitResponse(response.getDonationPermitResponse().toByteArray());
+    final DonationPermitResponse donationPermitResponse = new DonationPermitResponse(response.getDonationPermitsResponse().toByteArray());
     final List<DonationPermit> donationPermits = context.receive(donationPermitResponse,
         donationsPermitSecretParams.getPublicParams(),
         clock.instant());
@@ -201,8 +201,8 @@ class DonationsGrpcServiceTest extends SimpleBaseGrpcTest<DonationsGrpcService, 
     final DonationPermitRequestContext context = DonationPermitRequestContext.forCount(permitCount);
 
     GrpcTestUtils.assertStatusInvalidArgument(() ->
-        authenticatedServiceStub().createDonationPermit(CreateDonationPermitRequest.newBuilder()
-            .setDonationPermitRequest(ByteString.copyFrom(new byte[]{1, 2, 3}))
+        authenticatedServiceStub().createDonationPermits(CreateDonationPermitsRequest.newBuilder()
+            .setDonationPermitsRequest(ByteString.copyFrom(new byte[]{1, 2, 3}))
             .build()));
   }
 
@@ -216,8 +216,8 @@ class DonationsGrpcServiceTest extends SimpleBaseGrpcTest<DonationsGrpcService, 
     final DonationPermitRequestContext context = DonationPermitRequestContext.forCount(permitCount);
 
     GrpcTestUtils.assertRateLimitExceeded(retryDuration, () ->
-        authenticatedServiceStub().createDonationPermit(CreateDonationPermitRequest.newBuilder()
-            .setDonationPermitRequest(ByteString.copyFrom(context.request().serialize()))
+        authenticatedServiceStub().createDonationPermits(CreateDonationPermitsRequest.newBuilder()
+            .setDonationPermitsRequest(ByteString.copyFrom(context.request().serialize()))
             .build()));
 
   }

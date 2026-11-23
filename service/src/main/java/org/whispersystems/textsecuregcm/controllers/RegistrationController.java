@@ -45,6 +45,7 @@ import java.util.UUID;
 import javax.annotation.Nullable;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.VerificationFailedException;
 import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialPresentation;
@@ -80,8 +81,8 @@ import org.whispersystems.textsecuregcm.storage.DeviceSpec;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.ReceiptAlreadyRedeemedException;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptCredentialPresentationFactory;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
+import org.whispersystems.textsecuregcm.purchases.ReceiptCredentialPresentationFactory;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
 import org.whispersystems.textsecuregcm.util.Util;
 
@@ -98,6 +99,7 @@ public class RegistrationController {
   private static final String COUNTRY_CODE_TAG_NAME = "countryCode";
   private static final String REGION_CODE_TAG_NAME = "regionCode";
   private static final String VERIFICATION_TYPE_TAG_NAME = "verification";
+  private static final String FICTITIOUS_NUMBER_TAG_NAME = "fictitiousNumber";
 
   private final AccountsManager accounts;
   private final PhoneVerificationTokenManager phoneVerificationTokenManager;
@@ -160,6 +162,7 @@ public class RegistrationController {
           """,
       content = @Content(schema = @Schema(implementation = MfaFailureExceptionMapper.MfaFailureResponse.class)))
   @ApiResponse(responseCode = "499", description = "Client must support post-quantum ratchet")
+  @ManagedAsync
   public AccountCreationResponse register(
       @Parameter(
           in = ParameterIn.HEADER,
@@ -320,7 +323,8 @@ public class RegistrationController {
     Metrics.counter(ACCOUNT_CREATED_COUNTER_NAME, Tags.of(UserAgentTagUtil.getPlatformTag(userAgent),
             Tag.of(COUNTRY_CODE_TAG_NAME, Util.getCountryCode(number)),
             Tag.of(REGION_CODE_TAG_NAME, Util.getRegion(number)),
-            Tag.of(VERIFICATION_TYPE_TAG_NAME, verificationType.name())))
+            Tag.of(VERIFICATION_TYPE_TAG_NAME, verificationType.name()),
+            Tag.of(FICTITIOUS_NUMBER_TAG_NAME, String.valueOf(Util.isFictitiousNumber(number)))))
         .increment();
 
     final AccountIdentityResponse identityResponse = new AccountIdentityResponseBuilder(account)
@@ -366,7 +370,7 @@ public class RegistrationController {
     }
 
     final long receiptLevel = receiptCredentialPresentation.getReceiptLevel();
-    if (receiptLevel != ReceiptLevel.LOGIN.getValue()) {
+    if (receiptLevel != ReceiptLevel.LOGIN.getValue() && receiptLevel != ReceiptLevel.LOGIN_SANDBOX.getValue()) {
       throw new BadRequestException("Invalid receipt level");
     }
 

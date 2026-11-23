@@ -36,14 +36,11 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import org.glassfish.jersey.server.ManagedAsync;
@@ -62,21 +59,23 @@ import org.whispersystems.textsecuregcm.grpc.SubscriptionsUtil;
 import org.whispersystems.textsecuregcm.limits.RateLimitedByIp;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
+import org.whispersystems.textsecuregcm.purchases.BraintreeManager;
+import org.whispersystems.textsecuregcm.purchases.ChargeFailure;
+import org.whispersystems.textsecuregcm.purchases.CustomerAwareSubscriptionPaymentProcessor;
+import org.whispersystems.textsecuregcm.purchases.PayPalDonationsTranslator;
+import org.whispersystems.textsecuregcm.purchases.PaymentDetails;
+import org.whispersystems.textsecuregcm.purchases.PaymentMethod;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
+import org.whispersystems.textsecuregcm.purchases.PurchaseAmountTooLargeException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseNotFoundException;
+import org.whispersystems.textsecuregcm.purchases.PurchasePaymentRequiredException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseProcessorException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseReceiptRequestedForOpenPaymentException;
+import org.whispersystems.textsecuregcm.purchases.StripeManager;
 import org.whispersystems.textsecuregcm.storage.DonationPermitsManager;
 import org.whispersystems.textsecuregcm.storage.IssuedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.OneTimeDonationsManager;
 import org.whispersystems.textsecuregcm.storage.WriteConflictException;
-import org.whispersystems.textsecuregcm.subscriptions.BraintreeManager;
-import org.whispersystems.textsecuregcm.subscriptions.ChargeFailure;
-import org.whispersystems.textsecuregcm.subscriptions.CustomerAwareSubscriptionPaymentProcessor;
-import org.whispersystems.textsecuregcm.subscriptions.PayPalDonationsTranslator;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentDetails;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentMethod;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentStatus;
-import org.whispersystems.textsecuregcm.subscriptions.StripeManager;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidAmountException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionProcessorException;
 import org.whispersystems.textsecuregcm.util.ExactlySize;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
 
@@ -179,7 +178,7 @@ public class OneTimeDonationController {
       @HeaderParam(HeaderUtils.DONATION_PERMIT) final Optional<DonationPermitHeader> donationPermitHeader,
 
       @NotNull @Valid final CreateBoostRequest request,
-      @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent) throws SubscriptionInvalidAmountException {
+      @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent) throws PurchaseAmountTooLargeException {
 
     if (authenticatedAccount.isPresent()) {
       throw new ForbiddenException("must not use authenticated connection for one-time donation operations");
@@ -215,24 +214,13 @@ public class OneTimeDonationController {
   private void validateRequestCurrencyAmount(final CreateBoostRequest request, final long amount,
       final CustomerAwareSubscriptionPaymentProcessor manager) {
 
-    final Map<String, String> errorBody = switch (OneTimeDonationUtil.validateOneTimeDonationRequest(request.currency,
-        amount, request.level, request.paymentMethod, oneTimeDonationConfiguration, manager)) {
-      case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.UnsupportedLevel _ ->
-          Map.of("error", "invalid_level");
-      case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.UnsupportedCurrency _ ->
-          Map.of("error", "unsupported_currency");
-      case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.AmountBelowMinimum(final BigDecimal min) ->
-          Map.of("error", "amount_below_currency_minimum", "minimum", min.toString());
-      case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.AmountAboveSepaLimit(final BigDecimal max) ->
-          Map.of("error", "amount_above_sepa_limit", "maximum", max.toString());
-      case OneTimeDonationUtil.OneTimeDonationRequestValidationResult.Success _ -> Collections.emptyMap();
-    };
-
-    if (!errorBody.isEmpty()) {
+    try {
+      OneTimeDonationUtil.validateOneTimeDonationRequest(request.currency, amount, request.level, request.paymentMethod,
+          oneTimeDonationConfiguration, manager);
+    } catch (OneTimeDonationUtil.ValidationException e) {
       throw new BadRequestException(
-          Response.status(Response.Status.BAD_REQUEST).entity(errorBody).build());
+          Response.status(Response.Status.BAD_REQUEST).entity(e.getErrorBody()).build());
     }
-
   }
 
   public static class CreatePayPalBoostRequest extends CreateBoostRequest {
@@ -299,7 +287,7 @@ public class OneTimeDonationController {
   public ConfirmPayPalBoostResponse confirmPayPalBoost(
       @Auth final Optional<AuthenticatedDevice> authenticatedAccount,
       @NotNull @Valid final ConfirmPayPalBoostRequest request,
-      @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent) throws SubscriptionProcessorException, IOException {
+      @HeaderParam(HttpHeaders.USER_AGENT) final String userAgent) throws PurchaseProcessorException, IOException {
 
     if (authenticatedAccount.isPresent()) {
       throw new ForbiddenException("must not use authenticated connection for one-time donation operations");
@@ -347,26 +335,22 @@ public class OneTimeDonationController {
       throw new ForbiddenException("must not use authenticated connection for one-time donation operations");
     }
 
-    final Optional<PaymentDetails> maybePaymentDetails = (switch (request.processor) {
-      case STRIPE -> stripeManager.claimOneTimePurchase(request.paymentIntentId);
-      case BRAINTREE -> braintreeManager.claimOneTimePurchase(request.paymentIntentId);
-      case GOOGLE_PLAY_BILLING -> throw new BadRequestException("cannot use play billing for one-time donations");
-      case APPLE_APP_STORE -> throw new BadRequestException("cannot use app store purchases for one-time donations");
-    });
-
-    if (maybePaymentDetails.isEmpty()) {
+    final PaymentDetails paymentDetails;
+    try {
+      paymentDetails = (switch (request.processor) {
+        case STRIPE -> stripeManager.claimOneTimePurchase(request.paymentIntentId);
+        case BRAINTREE -> braintreeManager.claimOneTimePurchase(request.paymentIntentId);
+        case GOOGLE_PLAY_BILLING -> throw new BadRequestException("cannot use play billing for one-time donations");
+        case APPLE_APP_STORE -> throw new BadRequestException("cannot use app store purchases for one-time donations");
+      });
+    } catch (PurchaseNotFoundException _) {
       throw new WebApplicationException(Response.Status.NOT_FOUND);
-    }
-    final PaymentDetails paymentDetails = maybePaymentDetails.get();
-    if (paymentDetails.status() == PaymentStatus.PROCESSING) {
+    } catch (PurchaseReceiptRequestedForOpenPaymentException _) {
       return Response.noContent().build();
-    }
-    if (paymentDetails.status() != PaymentStatus.SUCCEEDED) {
+    } catch (PurchasePaymentRequiredException e) {
       throw new WebApplicationException(Response.status(Response.Status.PAYMENT_REQUIRED)
-          .entity(new CreateBoostReceiptCredentialErrorResponse(paymentDetails.chargeFailure())).build());
+          .entity(new CreateBoostReceiptCredentialErrorResponse(e.getChargeFailure().orElse(null))).build());
     }
-
-    // The payment was successful, try to issue the receipt credential
 
     final OneTimeDonationUtil.DonationLevelDetails levelDetails;
     try {
@@ -375,6 +359,7 @@ public class OneTimeDonationController {
       throw new WebApplicationException(Response.Status.INTERNAL_SERVER_ERROR);
     }
 
+    // try to issue the receipt credential
     final ReceiptCredentialRequest receiptCredentialRequest;
     try {
       receiptCredentialRequest = new ReceiptCredentialRequest(request.receiptCredentialRequest);

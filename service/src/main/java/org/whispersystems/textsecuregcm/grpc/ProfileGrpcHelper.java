@@ -14,6 +14,7 @@ import java.time.Clock;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.Optional;
+import org.apache.commons.lang3.Strings;
 import org.bouncycastle.crypto.digests.TupleHash;
 import org.signal.chat.common.S3UploadForm;
 import org.signal.chat.profile.AccountInfo;
@@ -32,7 +33,6 @@ import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessChecksum;
 import org.whispersystems.textsecuregcm.badges.ProfileBadgeConverter;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
-import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.VersionedProfile;
 import org.whispersystems.textsecuregcm.storage.VersionedProfileV1;
@@ -47,9 +47,14 @@ public class ProfileGrpcHelper {
       .setAlgorithm(PostPolicyGenerator.ALGORITHM)
       .build();
 
+  static String cdnUrl(final String cdnBaseUrl, final String path) {
+    return Strings.CS.removeEnd(cdnBaseUrl, "/") + "/" + Strings.CS.removeStart(path, "/");
+  }
+
   static Optional<LegacyProfileResult> getProfileV1(final Account account,
       final ProfilesManager profilesManager,
       final ProfileBadgeConverter profileBadgeConverter,
+      final String cdnBaseUrl,
       final byte[] requestVersion) {
     final Optional<VersionedProfileV1> maybeV1Profile =
         profilesManager.getV1(account.getAccountIdentifier(), HexFormat.of().formatHex(requestVersion));
@@ -74,7 +79,7 @@ public class ProfileGrpcHelper {
       builder.setPhoneNumberSharing(ByteString.copyFrom(v1Profile.phoneNumberSharing()));
     }
     if (v1Profile.avatar() != null) {
-      builder.setAvatar(v1Profile.avatar());
+      builder.setAvatarUrl(cdnUrl(cdnBaseUrl, v1Profile.avatar()));
     }
 
     // If present, include the payment address if the version matches the latest version on Account or the latest
@@ -91,9 +96,7 @@ public class ProfileGrpcHelper {
       final ProfileBadgeConverter profileBadgeConverter,
       final byte[] requestVersion) {
 
-    final Optional<VersionedProfile> maybeProfile = account.hasCapability(DeviceCapability.PROFILES_V2)
-        ? profilesManager.get(account.getAccountIdentifier(), requestVersion)
-        : Optional.empty();
+    final Optional<VersionedProfile> maybeProfile = profilesManager.get(account.getAccountIdentifier(), requestVersion);
     if (maybeProfile.isEmpty()) {
       return Optional.empty();
     }
@@ -135,14 +138,8 @@ public class ProfileGrpcHelper {
       final ProfilesManager profilesManager,
       final ServerZkProfileOperations zkProfileOperations) {
 
-    final Optional<VersionedProfile> versionedProfile;
-    if (account.hasCapability(DeviceCapability.PROFILES_V2)) {
-      versionedProfile = profilesManager.get(account.getAccountIdentifier(), version);
-    } else {
-      versionedProfile = Optional.empty();
-    }
-
-    return versionedProfile.map(VersionedProfile::commitment)
+    return profilesManager.get(account.getAccountIdentifier(), version)
+        .map(VersionedProfile::commitment)
         .or(() -> profilesManager.getV1(account.getAccountIdentifier(), HexFormat.of().formatHex(version))
             .map(VersionedProfileV1::commitment))
         .map(commitment -> {
@@ -151,7 +148,8 @@ public class ProfileGrpcHelper {
           try {
             profileKeyCredentialResponse = ProfileHelper.getExpiringProfileKeyCredential(
                 new ProfileKeyCredentialRequest(encodedCredentialRequest),
-                new ProfileKeyCommitment(commitment), new ServiceId.Aci(account.getAccountIdentifier()), zkProfileOperations);
+                new ProfileKeyCommitment(commitment), new ServiceId.Aci(account.getAccountIdentifier()),
+                zkProfileOperations);
           } catch (VerificationFailedException | InvalidInputException e) {
             throw GrpcExceptions.invalidArguments("invalid credential request");
           }

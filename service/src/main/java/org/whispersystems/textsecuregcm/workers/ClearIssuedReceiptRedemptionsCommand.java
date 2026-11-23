@@ -8,7 +8,6 @@ package org.whispersystems.textsecuregcm.workers;
 import io.dropwizard.core.Application;
 import io.dropwizard.core.setup.Environment;
 import java.time.Clock;
-import java.util.Base64;
 import java.util.Optional;
 import net.sourceforge.argparse4j.inf.Namespace;
 import net.sourceforge.argparse4j.inf.Subparser;
@@ -19,8 +18,8 @@ import org.whispersystems.textsecuregcm.storage.IssuedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.SubscriberCredentials;
 import org.whispersystems.textsecuregcm.storage.SubscriptionManager;
 import org.whispersystems.textsecuregcm.storage.Subscriptions;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionPaymentProcessor;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionPaymentProcessor;
 
 public class ClearIssuedReceiptRedemptionsCommand extends AbstractCommandWithDependencies {
 
@@ -69,8 +68,8 @@ public class ClearIssuedReceiptRedemptionsCommand extends AbstractCommandWithDep
       };
       final SubscriptionPaymentProcessor.ReceiptItem receiptItem = processor.getReceiptItem(subscriber.subscriptionId);
       final boolean deleted = issuedReceiptsManager.clearIssuance(receiptItem.itemId(), processorType);
-      logger.info("Deleted issuances for receiptItem: {}, subscriberId: {}, hadExistingIssuances: {}",
-          receiptItem.itemId(), subscriberId, deleted);
+      logger.info("Deleted issuances for receiptItem: {}, subscriberId: {}***, hadExistingIssuances: {}",
+          receiptItem.itemId(), subscriberId.substring(0, subscriberId.length() / 2), deleted);
     } catch (Exception ex) {
       logger.warn("Removal Exception", ex);
       throw new RuntimeException(ex);

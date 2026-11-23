@@ -33,6 +33,7 @@ import org.whispersystems.textsecuregcm.entities.AccountAttributes;
 import org.whispersystems.textsecuregcm.entities.DeviceAttributes;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
@@ -356,7 +357,7 @@ public class AccountsHelper {
 
     private static ReceiptCredentialPresentation generateReceiptCredentialPresentation() {
       try {
-        return ReceiptCredentialTestUtil.receiptPresentation();
+        return ReceiptCredentialTestUtil.receiptPresentation(ReceiptLevel.LOGIN.getValue());
       } catch (final InvalidInputException | VerificationFailedException e) {
         throw new AssertionError("Failed to generate receipt credential presentation", e);
       }

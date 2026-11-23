@@ -126,12 +126,14 @@ class AccountsTest {
       Tables.DELETED_ACCOUNTS,
       Tables.USED_LINK_DEVICE_TOKENS,
       Tables.REDEEMED_RECEIPTS,
+      Tables.SANDBOX_ACCOUNTS,
 
       // This is an unrelated table used to test "tag-along" transactional updates
       Tables.CLIENT_RELEASES);
 
   private final TestClock clock = TestClock.pinned(Instant.EPOCH);
   private Accounts accounts;
+  private SandboxAccounts sandboxAccounts;
 
   private record UsernameConstraint(UUID accountIdentifier, boolean confirmed, Optional<Instant> expiration) {
   }
@@ -157,6 +159,8 @@ class AccountsTest {
         Tables.USERNAMES.tableName(),
         Tables.DELETED_ACCOUNTS.tableName(),
         Tables.USED_LINK_DEVICE_TOKENS.tableName());
+
+    sandboxAccounts = new SandboxAccounts(Tables.SANDBOX_ACCOUNTS.tableName(), DYNAMO_DB_EXTENSION.getDynamoDbClient());
   }
 
   @ParameterizedTest
@@ -224,17 +228,16 @@ class AccountsTest {
       assertRedeemedReceiptConstraintExists(receiptCredentialPresentation, account.getAccountIdentifier());
     }
 
-    freshUser = number != null ? createAccount(account) : createNumberlessAccount(account, receiptCredentialPresentation, TestRandomUtil.nextBytes(16));
-
-    assertThat(freshUser).isTrue();
-    verifyStoredState(Optional.ofNullable(number), account.getAccountIdentifier(), account.getPhoneNumberIdentifier(), null, account, number != null);
-
     if (number != null) {
+      // For an account with a number only, try creating it again. Numberless accounts cannot be created with an old ACI
+      freshUser = createAccount(account);
+
+      assertThat(freshUser).isTrue();
+      verifyStoredState(Optional.ofNullable(number), account.getAccountIdentifier(), account.getPhoneNumberIdentifier(), null, account, number != null);
+
       assertThat(account.getPhoneNumberIdentifier()).isPresent();
       assertPhoneNumberConstraintExists(number, account.getAccountIdentifier());
       assertPhoneNumberIdentifierConstraintExists(account.getPhoneNumberIdentifier().get(), account.getAccountIdentifier());
-    } else {
-      assertRedeemedReceiptConstraintExists(receiptCredentialPresentation, account.getAccountIdentifier());
     }
   }
 
@@ -580,8 +583,43 @@ class AccountsTest {
     final Account secondAccount =
         generateAccount(null, UUID.randomUUID(), null, List.of(generateDevice(DEVICE_ID_1)), accountRecoveryPassword);
     assertThrows(ReceiptAlreadyRedeemedException.class,
-        () -> accounts.create(secondAccount, receiptCredentialPresentation, accountRecoveryPassword,
-            Collections.emptyList()));
+        () -> accounts.create(secondAccount, receiptCredentialPresentation, accountRecoveryPassword, Collections.emptyList()));
+  }
+
+  @Test
+  void testCreateSandboxAccount() throws Exception {
+    final UUID uuid = UUID.randomUUID();
+    sandboxAccounts.add(uuid);
+
+    final byte[] accountRecoveryPassword = TestRandomUtil.nextBytes(16);
+    final Account account =
+        generateAccount(null, uuid, null, List.of(generateDevice(DEVICE_ID_1)), accountRecoveryPassword);
+    accounts.create(account, receiptPresentation(), accountRecoveryPassword,
+        List.of(sandboxAccounts.buildClaimWriteItem(uuid, clock.instant())));
+
+    assertTrue(accounts.getByAccountIdentifier(uuid).isPresent());
+    assertEquals(List.of(new SandboxAccounts.SandboxAccountReservation(uuid, Optional.of(clock.instant()))),
+        sandboxAccounts.getAll());
+  }
+
+  @Test
+  void testCreateSandboxAccountAlreadyClaimed() throws Exception {
+    final UUID uuid = UUID.randomUUID();
+    sandboxAccounts.add(uuid);
+
+    // Mark the sandbox ACI as already used
+    DYNAMO_DB_EXTENSION.getDynamoDbClient().transactWriteItems(TransactWriteItemsRequest.builder()
+        .transactItems(sandboxAccounts.buildClaimWriteItem(uuid, clock.instant()))
+        .build());
+
+    final byte[] accountRecoveryPassword = TestRandomUtil.nextBytes(16);
+    final Account account =
+        generateAccount(null, uuid, null, List.of(generateDevice(DEVICE_ID_1)), accountRecoveryPassword);
+    assertThrows(AccountCreationConditionException.class,
+        () -> accounts.create(account, receiptPresentation(), accountRecoveryPassword,
+            List.of(sandboxAccounts.buildClaimWriteItem(uuid, clock.instant().plusSeconds(1)))));
+
+    assertTrue(accounts.getByAccountIdentifier(uuid).isEmpty());
   }
 
   @ParameterizedTest
@@ -2430,7 +2468,7 @@ class AccountsTest {
   private boolean createNumberlessAccount(final Account account, final ReceiptCredentialPresentation receiptCredentialPresentation, final byte[] accountRecoveryPassword) {
     try {
       return accounts.create(account, receiptCredentialPresentation, accountRecoveryPassword, Collections.emptyList());
-    } catch (final AccountAlreadyExistsException | ReceiptAlreadyRedeemedException e) {
+    } catch (final AccountAlreadyExistsException | ReceiptAlreadyRedeemedException | AccountCreationConditionException e) {
       throw new IllegalStateException(e);
     }
   }

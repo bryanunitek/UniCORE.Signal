@@ -298,11 +298,25 @@ public class Accounts {
     return true;
   }
 
+  /// Create an account record via a receipt presentation
+  ///
+  /// @param account                          The account to create
+  /// @param receiptCredentialPresentation    A presentation of a receipt credential that grants the ability to create
+  /// one account
+  /// @param accountRecoveryPasswordInRequest The account-recovery-password supplied in the request
+  /// @param additionalWriteItems             Additional items to include in the transaction
+  ///
+  /// @return true
+  /// @throws AccountAlreadyExistsException     An account was already created using this receipt
+  /// @throws ReceiptAlreadyRedeemedException   The receipt was already used to create an account and this creation
+  ///                                           request would require a new account
+  /// @throws AccountCreationConditionException One of the conditions in `additionalWriteItems` failed. The exception
+  ///                                           contains the index of the [TransactWriteItem] that failed
   boolean create(final Account account,
       final ReceiptCredentialPresentation receiptCredentialPresentation,
       final byte[] accountRecoveryPasswordInRequest,
       final List<TransactWriteItem> additionalWriteItems)
-      throws AccountAlreadyExistsException, ReceiptAlreadyRedeemedException {
+      throws AccountAlreadyExistsException, ReceiptAlreadyRedeemedException, AccountCreationConditionException {
 
     final Timer.Sample sample = Timer.start();
 
@@ -320,6 +334,7 @@ public class Accounts {
       final Collection<TransactWriteItem> writeItems = new ArrayList<>(
           List.of(signalLoginReceiptConstraintPut, accountPut));
 
+      final int additionalWriteItemsStart = writeItems.size();
       writeItems.addAll(additionalWriteItems);
 
       final TransactWriteItemsRequest request = TransactWriteItemsRequest.builder()
@@ -358,7 +373,18 @@ public class Accounts {
           throw new AccountAlreadyExistsException(existingAccount);
         }
 
+        for (int i = additionalWriteItemsStart; i < e.cancellationReasons().size(); i++) {
+          if (conditionalCheckFailed(e.cancellationReasons().get(i))) {
+            // Indicate the first caller-supplied TransactWriteItem that failed
+            throw new AccountCreationConditionException(i - additionalWriteItemsStart);
+          }
+        }
+
         final CancellationReason accountCancellationReason = e.cancellationReasons().get(1);
+        if (conditionalCheckFailed(accountCancellationReason)) {
+          throw new IllegalStateException("Tried to create an account with an ACI that already exists " + account.getAccountIdentifier());
+        }
+
         if (TRANSACTION_CONFLICT.equals(accountCancellationReason.code())) {
           // this should only happen if two clients manage to make concurrent create() calls
           throw new ContestedOptimisticLockException();
@@ -1632,6 +1658,8 @@ public class Accounts {
         .orElseGet(() -> Put.builder()
             .tableName(accountsTableName)
             .item(item)
+            .conditionExpression("attribute_not_exists(#uuid)")
+            .expressionAttributeNames(Map.of("#uuid", KEY_ACCOUNT_UUID))
             .build());
 
     return TransactWriteItem.builder()

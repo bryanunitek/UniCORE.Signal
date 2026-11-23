@@ -47,6 +47,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.BasicAuthorizationHeader;
 import org.whispersystems.textsecuregcm.auth.ChangesLinkedDevices;
@@ -72,6 +73,7 @@ import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.DeviceIdentityInfo;
+import org.whispersystems.textsecuregcm.storage.DeviceLimitExceededException;
 import org.whispersystems.textsecuregcm.storage.DeviceSpec;
 import org.whispersystems.textsecuregcm.storage.LinkDeviceTokenAlreadyUsedException;
 import org.whispersystems.textsecuregcm.storage.PersistentTimer;
@@ -87,8 +89,6 @@ import org.whispersystems.textsecuregcm.util.ua.UserAgentUtil;
 @Path("/v1/devices")
 @Tag(name = "Devices")
 public class DeviceController {
-
-  static final int MAX_DEVICES = 6;
 
   private final AccountsManager accounts;
   private final RateLimiters rateLimiters;
@@ -136,6 +136,7 @@ public class DeviceController {
 
   @GET
   @Produces(MediaType.APPLICATION_JSON)
+  @ManagedAsync
   public DeviceInfoList getDevices(@Auth AuthenticatedDevice auth) {
     // Devices may change their own names (and primary devices may change the names of linked devices) and so the device
     // state associated with the authenticated account may be stale. Fetch a fresh copy to compensate.
@@ -150,6 +151,7 @@ public class DeviceController {
   @Produces(MediaType.APPLICATION_JSON)
   @Path("/{device_id}")
   @ChangesLinkedDevices
+  @ManagedAsync
   public void removeDevice(@Auth AuthenticatedDevice auth, @PathParam("device_id") byte deviceId) {
     if (auth.deviceId() != Device.PRIMARY_ID && auth.deviceId() != deviceId) {
       throw new WebApplicationException(Response.Status.UNAUTHORIZED);
@@ -190,6 +192,7 @@ public class DeviceController {
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+  @ManagedAsync
   public LinkDeviceToken createDeviceToken(@Auth AuthenticatedDevice auth)
       throws RateLimitExceededException, DeviceLimitExceededException {
 
@@ -198,15 +201,11 @@ public class DeviceController {
 
     rateLimiters.getAllocateDeviceLimiter().validate(account.getAccountIdentifier());
 
-    if (account.getDevices().size() >= MAX_DEVICES) {
-      throw new DeviceLimitExceededException(account.getDevices().size(), MAX_DEVICES);
-    }
-
     if (auth.deviceId() != Device.PRIMARY_ID) {
       throw new WebApplicationException(Response.Status.UNAUTHORIZED);
     }
 
-    final String token = accounts.generateLinkDeviceToken(account.getAccountIdentifier());
+    final String token = accounts.generateLinkDeviceToken(account);
 
     return new LinkDeviceToken(token, AccountsManager.getLinkDeviceTokenIdentifier(token));
   }
@@ -228,6 +227,7 @@ public class DeviceController {
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+  @ManagedAsync
   public LinkDeviceResponse linkDevice(@HeaderParam(HttpHeaders.AUTHORIZATION) @NotNull BasicAuthorizationHeader authorizationHeader,
       @HeaderParam(HttpHeaders.USER_AGENT) @Nullable String userAgent,
       @NotNull @Valid LinkDeviceRequest linkDeviceRequest)
@@ -269,10 +269,6 @@ public class DeviceController {
 
     if (!allKeysValid) {
       throw new WebApplicationException(Response.status(422).build());
-    }
-
-    if (account.getDevices().size() >= MAX_DEVICES) {
-      throw new DeviceLimitExceededException(account.getDevices().size(), MAX_DEVICES);
     }
 
     final Set<DeviceCapability> capabilities = deviceAttributes.capabilities();
@@ -400,6 +396,7 @@ public class DeviceController {
   @PUT
   @Produces(MediaType.APPLICATION_JSON)
   @Path("/capabilities")
+  @ManagedAsync
   public void setCapabilities(@Auth final AuthenticatedDevice auth, @NotNull final Map<String, Boolean> capabilities) {
     accounts.updateDevice(auth.accountIdentifier(), auth.deviceId(),
         d -> d.setCapabilities(DeviceCapabilityAdapter.mapToSet(capabilities)));

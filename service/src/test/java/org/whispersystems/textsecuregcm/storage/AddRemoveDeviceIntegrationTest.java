@@ -152,6 +152,7 @@ public class AddRemoveDeviceIntegrationTest {
         svr2Client,
         mock(DisconnectionRequestManager.class),
         phoneNumberRecoveryPasswordsManager,
+        mock(SandboxAccounts.class),
         scheduledExecutorService,
         scheduledExecutorService,
         clock,
@@ -163,12 +164,12 @@ public class AddRemoveDeviceIntegrationTest {
   }
 
   @AfterEach
-  void tearDown() throws InterruptedException {
+  void tearDown() {
     accountsManager.stop();
   }
 
   @Test
-  void addDevice() throws LinkDeviceTokenAlreadyUsedException {
+  void addDevice() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -190,7 +191,7 @@ public class AddRemoveDeviceIntegrationTest {
                     true,
                     Optional.empty(),
                     Optional.empty()),
-                accountsManager.generateLinkDeviceToken(account.getAccountIdentifier()));
+                accountsManager.generateLinkDeviceToken(account));
 
     assertEquals(2, updatedAccountAndDevice.first().getDevices().size());
 
@@ -212,7 +213,7 @@ public class AddRemoveDeviceIntegrationTest {
   }
 
   @Test
-  void addDeviceReusedToken() throws LinkDeviceTokenAlreadyUsedException {
+  void addDeviceReusedToken() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -223,7 +224,7 @@ public class AddRemoveDeviceIntegrationTest {
     final Account account = AccountsHelper.createAccount(accountsManager, number);
     assertEquals(1, accountsManager.getByAccountIdentifier(account.getAccountIdentifier()).orElseThrow().getDevices().size());
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getAccountIdentifier());
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account);
 
     final Pair<Account, Device> updatedAccountAndDevice =
         accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
@@ -261,7 +262,7 @@ public class AddRemoveDeviceIntegrationTest {
   }
 
   @Test
-  void removeDevice() throws LinkDeviceTokenAlreadyUsedException {
+  void removeDevice()throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -283,7 +284,7 @@ public class AddRemoveDeviceIntegrationTest {
                     true,
                     Optional.empty(),
                     Optional.empty()),
-                accountsManager.generateLinkDeviceToken(account.getAccountIdentifier()));
+                accountsManager.generateLinkDeviceToken(account));
 
     final byte addedDeviceId = updatedAccountAndDevice.second().getId();
 
@@ -306,7 +307,7 @@ public class AddRemoveDeviceIntegrationTest {
   }
 
   @Test
-  void removeDevicePartialFailure() throws LinkDeviceTokenAlreadyUsedException {
+  void removeDevicePartialFailure() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -330,7 +331,7 @@ public class AddRemoveDeviceIntegrationTest {
                     true,
                     Optional.empty(),
                     Optional.empty()),
-                accountsManager.generateLinkDeviceToken(account.getAccountIdentifier()));
+                accountsManager.generateLinkDeviceToken(account));
 
     final byte addedDeviceId = updatedAccountAndDevice.second().getId();
 
@@ -360,7 +361,7 @@ public class AddRemoveDeviceIntegrationTest {
   }
 
   @Test
-  void waitForNewLinkedDevice() throws LinkDeviceTokenAlreadyUsedException {
+  void waitForNewLinkedDevice() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -370,7 +371,7 @@ public class AddRemoveDeviceIntegrationTest {
 
     final Account account = AccountsHelper.createAccount(accountsManager, number);
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getAccountIdentifier());
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account);
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
     final CompletableFuture<Optional<DeviceInfo>> displacedFuture = accountsManager.waitForNewLinkedDevice(
@@ -409,7 +410,7 @@ public class AddRemoveDeviceIntegrationTest {
   }
 
   @Test
-  void waitForNewLinkedDeviceAlreadyAdded() throws LinkDeviceTokenAlreadyUsedException {
+  void waitForNewLinkedDeviceAlreadyAdded() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -419,7 +420,7 @@ public class AddRemoveDeviceIntegrationTest {
 
     final Account account = AccountsHelper.createAccount(accountsManager, number);
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account.getAccountIdentifier());
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account);
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
     final Pair<Account, Device> updatedAccountAndDevice =
@@ -452,13 +453,13 @@ public class AddRemoveDeviceIntegrationTest {
   }
 
   @Test
-  void waitForNewLinkedDeviceTimeout() {
+  void waitForNewLinkedDeviceTimeout() throws Exception {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
     final Account account = AccountsHelper.createAccount(accountsManager, number);
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(UUID.randomUUID());
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account);
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
     final CompletableFuture<Optional<DeviceInfo>> linkedDeviceFuture = accountsManager.waitForNewLinkedDevice(
@@ -477,7 +478,7 @@ public class AddRemoveDeviceIntegrationTest {
       "10_000,10_001,false",   // pending message after now
   })
   void waitForMessageFetch(long currentTime, Long oldestMessage, boolean shouldWait)
-      throws LinkDeviceTokenAlreadyUsedException {
+      throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -485,7 +486,7 @@ public class AddRemoveDeviceIntegrationTest {
     final ECKeyPair pniKeyPair = ECKeyPair.generate();
     final Account account = AccountsHelper.createAccount(accountsManager, number);
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(UUID.randomUUID());
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account);
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
     accountsManager.addDevice(account.getAccountIdentifier(), new DeviceSpec(
@@ -514,7 +515,7 @@ public class AddRemoveDeviceIntegrationTest {
   // preempted by the timeout check
   @Timeout(value = 10, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
   @Test
-  void waitForMessageFetchRetries() throws LinkDeviceTokenAlreadyUsedException {
+  void waitForMessageFetchRetries() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final String number = PhoneNumberUtil.getInstance().format(
         PhoneNumberUtil.getInstance().getExampleNumber("US"),
         PhoneNumberUtil.PhoneNumberFormat.E164);
@@ -522,7 +523,7 @@ public class AddRemoveDeviceIntegrationTest {
     final ECKeyPair pniKeyPair = ECKeyPair.generate();
     final Account account = AccountsHelper.createAccount(accountsManager, number);
 
-    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(UUID.randomUUID());
+    final String linkDeviceToken = accountsManager.generateLinkDeviceToken(account);
     final String linkDeviceTokenIdentifier = AccountsManager.getLinkDeviceTokenIdentifier(linkDeviceToken);
 
     clock.pin(Instant.ofEpochMilli(0));

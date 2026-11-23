@@ -20,8 +20,14 @@ public class ReceiptCredentialTestUtil {
   public static ReceiptCredentialPresentation receiptPresentation()
       throws InvalidInputException, VerificationFailedException {
 
+    return receiptPresentation(1);
+  }
+
+  public static ReceiptCredentialPresentation receiptPresentation(final long receiptLevel)
+      throws InvalidInputException, VerificationFailedException {
+
     return receiptPresentation(new ReceiptSerial(TestRandomUtil.nextBytes(ReceiptSerial.SIZE)), Instant.now().plus(
-        Duration.ofDays(30)), 1);
+        Duration.ofDays(30)), receiptLevel);
   }
 
   public static ReceiptCredentialPresentation receiptPresentation(final Instant expiresAt, final long receiptLevel)

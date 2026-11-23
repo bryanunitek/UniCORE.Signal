@@ -108,7 +108,7 @@ class AttachmentControllerV4Test {
           .addProvider(new RateLimitExceededExceptionMapper())
           .addProvider(new AttachmentControllerV4(RATE_LIMITERS,
               gcsAttachmentGenerator,
-              new TusAttachmentGenerator(new TusConfiguration(new SecretBytes(TUS_SECRET), TUS_URL)),
+              new TusAttachmentGenerator(new TusConfiguration(new SecretBytes(TUS_SECRET), TUS_URL, TusConfiguration.DEFAULT_TOKEN_EXPIRATION)),
               EXPERIMENT_MANAGER, MAX_UPLOAD_LENGTH))
           .build();
     } catch (IOException | InvalidKeyException | InvalidKeySpecException e) {
@@ -145,21 +145,11 @@ class AttachmentControllerV4Test {
   }
 
   @Test
-  void missingUploadLengthDoesNotRateLimit() throws RateLimitExceededException {
-    doThrow(RateLimitExceededException.class).when(BYTE_RATE_LIMITER).validate(AuthHelper.VALID_UUID);
-
-    assertThatNoException().isThrownBy(() -> resources.getJerseyTest()
-        .target("/v4/attachments/form/upload")
-        .request()
-        .header("Authorization", CDN3_ENABLED_CREDS)
-        .get().getStatus());
-  }
-
-  @Test
   void countRateLimitExceeded() throws RateLimitExceededException {
     doThrow(RateLimitExceededException.class).when(COUNT_RATE_LIMITER).validate(AuthHelper.VALID_UUID);
     assertThat(resources.getJerseyTest()
         .target("/v4/attachments/form/upload")
+        .queryParam("uploadLength", MAX_UPLOAD_LENGTH)
         .request()
         .header("Authorization", CDN3_ENABLED_CREDS)
         .get().getStatus())
@@ -202,11 +192,22 @@ class AttachmentControllerV4Test {
   void testV4GcsForm() throws MalformedURLException {
     AttachmentDescriptorV3 descriptor = resources.getJerseyTest()
         .target("/v4/attachments/form/upload")
+        .queryParam("uploadLength", MAX_UPLOAD_LENGTH)
         .request()
         .header("Authorization", CDN3_DISABLED_CREDS)
         .get(AttachmentDescriptorV3.class);
     assertThat(descriptor.cdn()).isEqualTo(2);
     assertValidCdn2Response(descriptor);
+  }
+
+  @Test
+  void testV4GcsFormNoUploadLength() throws MalformedURLException {
+    assertThat(resources.getJerseyTest()
+        .target("/v4/attachments/form/upload")
+        .request()
+        .header("Authorization", CDN3_DISABLED_CREDS)
+        .get()
+        .getStatus()).isEqualTo(400);
   }
 
   private static void assertValidCdn2Response(final AttachmentDescriptorV3 descriptor) throws MalformedURLException {

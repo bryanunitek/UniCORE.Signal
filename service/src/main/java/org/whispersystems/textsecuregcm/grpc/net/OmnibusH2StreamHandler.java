@@ -7,36 +7,22 @@ package org.whispersystems.textsecuregcm.grpc.net;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import io.micrometer.core.instrument.Metrics;
-import io.micrometer.core.instrument.Timer;
-import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.DefaultEventLoopGroup;
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.local.LocalAddress;
-import io.netty.channel.local.LocalChannel;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http2.DefaultHttp2Headers;
 import io.netty.handler.codec.http2.DefaultHttp2HeadersFrame;
 import io.netty.handler.codec.http2.DefaultHttp2ResetFrame;
 import io.netty.handler.codec.http2.Http2Error;
-import io.netty.handler.codec.http2.Http2FrameCodecBuilder;
 import io.netty.handler.codec.http2.Http2HeadersFrame;
-import io.netty.handler.codec.http2.Http2MultiplexHandler;
-import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.codec.http2.Http2StreamChannel;
 import io.netty.handler.codec.http2.Http2StreamChannelBootstrap;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.ReferenceCounted;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.SocketAddress;
-import java.util.List;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -46,7 +32,7 @@ import org.slf4j.LoggerFactory;
 ///
 /// When this handler receives an H2 header for a new stream-id=X on our parent H2 connection it will
 /// - Receive the stream-id=X header and check the path to determine the correct backend
-/// - Make a new H2 connection to the backend
+/// - Get or create an H2 connection to the backend
 /// - Forward the header with stream-id=Y to the backend
 /// - Install a [H2FrameProxyHandler] on the backend stream pipeline that forwards the received stream-id=Y frames from
 ///   the backend back to the client on stream-id=X
@@ -56,25 +42,13 @@ public class OmnibusH2StreamHandler extends ChannelInboundHandlerAdapter {
 
   private static final Logger logger = LoggerFactory.getLogger(OmnibusH2StreamHandler.class);
 
-  private static final OmnibusExceptionHandler BACKEND_CONNECTION_EXCEPTION_HANDLER =
-      new OmnibusExceptionHandler("backend-connection", List.of());
   private static final String BACKEND_STREAM_COUNTER_NAME = name(OmnibusH2StreamHandler.class, "backendStream");
-  private static final String BACKEND_CONNECT_DURATION_NAME = name(OmnibusH2StreamHandler.class,
-      "backendConnectDuration");
   private static final String BACKEND_TAG = "backend";
 
   private final OmnibusRouter router;
 
-  private final DefaultEventLoopGroup localEventLoopGroup;
-  private final NioEventLoopGroup nioEventLoopGroup;
-
-  public OmnibusH2StreamHandler(
-      final NioEventLoopGroup nioEventLoopGroup,
-      final DefaultEventLoopGroup localEventLoopGroup,
-      final OmnibusRouter router) {
+  public OmnibusH2StreamHandler(final OmnibusRouter router) {
     this.router = router;
-    this.localEventLoopGroup = localEventLoopGroup;
-    this.nioEventLoopGroup = nioEventLoopGroup;
   }
 
   @Override
@@ -96,8 +70,8 @@ public class OmnibusH2StreamHandler extends ChannelInboundHandlerAdapter {
 
     // Select the target backend based on the path
     final String path = Optional.ofNullable(headersFrame.headers().path()).map(CharSequence::toString).orElse("");
-    final SocketAddress target = router.match(path);
-    final String backendTag = target.toString();
+    final H2ConnectionFactory connectionFactory = router.match(path);
+    final String backendTag = connectionFactory.address().toString();
 
     Metrics.counter(BACKEND_STREAM_COUNTER_NAME, BACKEND_TAG, backendTag).increment();
 
@@ -109,55 +83,38 @@ public class OmnibusH2StreamHandler extends ChannelInboundHandlerAdapter {
         ? proxyRemoteAddress.getHostAddress()
         : ((InetSocketAddress) ctx.channel().remoteAddress()).getHostString());
 
-    // Make a new H2 connection to the target backend
-    final Timer.Sample connectSample = Timer.start();
-    new Bootstrap()
-        .group(selectEventLoop(ctx, target))
-        .channel(target instanceof LocalAddress ? LocalChannel.class : NioSocketChannel.class)
-        .handler(new ChannelInitializer<>() {
-          @Override
-          protected void initChannel(final Channel ch) {
-            ch.pipeline()
-                .addLast(Http2FrameCodecBuilder.forClient().initialSettings(Http2Settings.defaultSettings()).build());
-            // Http2MultiplexHandler takes handler that is added to new inbound streams. A client Http2MultiplexHandler
-            // like we're defining here should never receive an inbound H2 stream so we can just pass a noop handler
-            ch.pipeline().addLast(new Http2MultiplexHandler(new NoopInboundStreamHandler()));
-            ch.pipeline().addLast(BACKEND_CONNECTION_EXCEPTION_HANDLER);
-          }
-        })
-        .connect(target)
+    // Make an H2 connection to the target backend
+    connectionFactory.getConnectionChannelFuture(ctx.channel().eventLoop())
         .addListener((ChannelFuture connectFuture) -> {
-          connectSample.stop(Timer.builder(BACKEND_CONNECT_DURATION_NAME)
-              .tag(BACKEND_TAG, backendTag)
-              .tag("outcome", connectFuture.isSuccess() ? "success" : "failure")
-              .register(Metrics.globalRegistry));
-
           if (!connectFuture.isSuccess()) {
             // Close the client stream with a 502: Bad Gateway if the backend wasn't available
-            logger.warn("Failed to connect to backend {}", target, connectFuture.cause());
+            logger.warn("Failed to connect to backend {}", backendTag, connectFuture.cause());
             ctx.channel()
                 .writeAndFlush(new DefaultHttp2HeadersFrame(
                     new DefaultHttp2Headers().status("502"), true))
                 .addListener(ChannelFutureListener.CLOSE);
+            connectionFactory.release(connectFuture.channel());
             return;
           }
 
           // Connected, open a new H2 stream to the backend so we can proxy the client's frames
-          logger.trace("Opening a HTTP/2 stream to the backend {}", target);
+          logger.trace("Opening a HTTP/2 stream to the backend {}", backendTag);
           final Channel backendConnection = connectFuture.channel();
-          createBackendProxyStream(ctx, backendConnection, headersFrame, backendTag);
+          createBackendProxyStream(ctx, connectionFactory, backendConnection, headersFrame, backendTag);
         });
   }
 
   /// Create a proxy stream on the provided `backendConnection` that forwards H2 frames to/from the client H2 stream.
   ///
   /// @param clientStreamCtx   The context for a client H2 stream that targets the backend
+  /// @param connectionFactory The factory `backendConnection` came from
   /// @param backendConnection An established H2 connection [Channel], on which a new h2 stream will be opened
   /// @param headersFrame      The first `headersFrame` from the client h2 stream that should be forwarded to the new
   ///                          backend stream
   /// @param backendTag        The backend this stream targets, for metrics
   private void createBackendProxyStream(
       final ChannelHandlerContext clientStreamCtx,
+      final H2ConnectionFactory connectionFactory,
       final Channel backendConnection,
       final Http2HeadersFrame headersFrame,
       final String backendTag) {
@@ -171,15 +128,13 @@ public class OmnibusH2StreamHandler extends ChannelInboundHandlerAdapter {
             clientStreamCtx.channel()
                 .writeAndFlush(new DefaultHttp2ResetFrame(Http2Error.INTERNAL_ERROR))
                 .addListener(ChannelFutureListener.CLOSE);
-            backendConnection.close();
+            connectionFactory.release(backendConnection);
             return;
           }
 
           final Http2StreamChannel backendStream = streamFuture.getNow();
 
-          // Close the entire H2 connection whenever the stream we just opened closes. We only plan on using
-          // a single stream on this connection.
-          backendStream.closeFuture().addListener(_ -> backendConnection.close());
+          backendStream.closeFuture().addListener(_ -> connectionFactory.release(backendConnection));
 
           // We're going to modify the inbound H2 stream channel, which runs on a different eventloop than the
           // outbound channel we've made to the backend. We have to submit our updates back to the inbound
@@ -188,7 +143,7 @@ public class OmnibusH2StreamHandler extends ChannelInboundHandlerAdapter {
 
             if (!clientStreamCtx.channel().isActive()) {
               // The client disconnected already and the client pipeline is already torn down.
-              backendConnection.close();
+              backendStream.close();
               return;
             }
 
@@ -203,30 +158,5 @@ public class OmnibusH2StreamHandler extends ChannelInboundHandlerAdapter {
             clientStreamCtx.channel().config().setAutoRead(true);
           });
         });
-  }
-
-  private EventLoopGroup selectEventLoop(final ChannelHandlerContext inboundCtx, SocketAddress target) {
-    final boolean localInbound = inboundCtx.channel() instanceof LocalChannel;
-    final boolean localTarget = target instanceof LocalAddress;
-
-    // If the inbound eventloop matches the target type, we can just reuse the inbound's event loop
-    if (localInbound == localTarget) {
-      return inboundCtx.channel().eventLoop();
-    }
-
-    return localTarget ? this.localEventLoopGroup : this.nioEventLoopGroup;
-  }
-
-  private static class NoopInboundStreamHandler extends ChannelInboundHandlerAdapter {
-    @Override
-    public void channelRegistered(final ChannelHandlerContext ctx) {
-      logger.error("Inbound stream handler was registered when no inbound streams expected");
-    }
-
-    @Override
-    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-      logger.error("Received unexpected message: {} on inbound stream from backend", msg);
-      super.channelRead(ctx, msg);
-    }
   }
 }

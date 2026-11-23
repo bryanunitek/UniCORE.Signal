@@ -98,21 +98,21 @@ public class CaptchaChecker {
         });
 
     if (!parsedAction.equals(expectedAction)) {
-      Metrics.counter(INVALID_ACTION_COUNTER_NAME, "action", action).increment();
+      Metrics.counter(INVALID_ACTION_COUNTER_NAME, "action", parsedAction.getActionName()).increment();
       throw new InvalidCaptchaArgumentException("invalid captcha action");
     }
 
     final Set<String> allowedSiteKeys = client.validSiteKeys(parsedAction);
     if (!allowedSiteKeys.contains(siteKey)) {
-      logger.debug("invalid site-key {}, action={}", siteKey, action);
-      Metrics.counter(INVALID_SITEKEY_COUNTER_NAME, "action", action).increment();
+      logger.debug("invalid site-key {}, action={}", siteKey, parsedAction.getActionName());
+      Metrics.counter(INVALID_SITEKEY_COUNTER_NAME, "action", parsedAction.getActionName()).increment();
       throw new InvalidCaptchaArgumentException("invalid captcha site-key");
     }
 
     try {
       final AssessmentResult result = client.verify(maybeAci, siteKey, parsedAction, token, ip, userAgent);
       Metrics.counter(ASSESSMENTS_COUNTER_NAME,
-              "action", action,
+              "action", parsedAction.getActionName(),
               "score", result.getScoreString(),
               "provider", provider)
           .increment();

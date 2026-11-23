@@ -98,7 +98,6 @@ import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
-import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.VersionedProfile;
 import org.whispersystems.textsecuregcm.storage.VersionedProfileV1;
@@ -110,6 +109,8 @@ import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 
 public class ProfileAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<ProfileAnonymousGrpcService, ProfileAnonymousGrpc.ProfileAnonymousBlockingStub> {
+
+  private static final String CDN_BASE_URL = "https://cdn.example.com";
 
   private static final ServerSecretParams SERVER_SECRET_PARAMS = ServerSecretParams.generate();
 
@@ -152,6 +153,7 @@ public class ProfileAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<ProfileA
         profilesManager,
         profileBadgeConverter,
         new PostPolicyGenerator("us-west-1", "profile-bucket", "accessKey", "accessSecret"),
+        CDN_BASE_URL,
         genericServerSecretParams,
         rateLimiters,
         clock,
@@ -211,7 +213,7 @@ public class ProfileAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<ProfileA
         .setName(ByteString.copyFrom(name))
         .setAbout(ByteString.copyFrom(about))
         .setAboutEmoji(ByteString.copyFrom(emoji))
-        .setAvatar(avatar)
+        .setAvatarUrl(CDN_BASE_URL + "/" + avatar)
         .setPhoneNumberSharing(ByteString.copyFrom(phoneNumberSharing))
         .setAccountInfo(AccountInfo.newBuilder()
             .addAllBadgeIds(badgeIds)
@@ -261,7 +263,6 @@ public class ProfileAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<ProfileA
     when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version));
     when(account.isUnrestrictedUnidentifiedAccess()).thenReturn(true);
     when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(unidentifiedAccessKey));
-    when(account.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(true);
     when(account.getAccountIdentityKey()).thenReturn(identityKey);
     when(account.getBadges()).thenReturn(Collections.emptyList());
 
@@ -317,7 +318,6 @@ public class ProfileAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<ProfileA
     when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version));
     when(account.isUnrestrictedUnidentifiedAccess()).thenReturn(true);
     when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(unidentifiedAccessKey));
-    when(account.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(true);
     when(account.getAccountIdentityKey()).thenReturn(identityKey);
     when(account.getBadges()).thenReturn(Collections.emptyList());
 
@@ -515,7 +515,6 @@ public class ProfileAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<ProfileA
     final ProfileKeyCredentialRequestContext profileKeyCredentialRequestContext =
         clientZkProfile.createProfileKeyCredentialRequestContext(new ServiceId.Aci(targetUuid), profileKey);
 
-    when(account.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(hasV2Capability);
     if (hasV2Capability) {
       final VersionedProfile profile = mock(VersionedProfile.class);
       when(profile.commitment()).thenReturn(profileKeyCommitment.serialize());
@@ -790,9 +789,9 @@ public class ProfileAnonymousGrpcServiceTest extends SimpleBaseGrpcTest<ProfileA
 
     final ExtendAvatarTTLResponse response = authenticatedServiceStub().extendAvatarTTL(request);
 
-    assertTrue(response.hasPath());
+    assertTrue(response.hasUrl());
 
-    assertEquals(path, response.getPath());
+    assertEquals(CDN_BASE_URL + "/" + path, response.getUrl());
   }
 
   @Test

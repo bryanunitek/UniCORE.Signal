@@ -34,11 +34,11 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.glassfish.jersey.server.ServerProperties;
@@ -80,6 +80,7 @@ import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
+import org.whispersystems.textsecuregcm.storage.DeviceLimitExceededException;
 import org.whispersystems.textsecuregcm.storage.DeviceSpec;
 import org.whispersystems.textsecuregcm.storage.LinkDeviceTokenAlreadyUsedException;
 import org.whispersystems.textsecuregcm.storage.PersistentTimer;
@@ -216,7 +217,7 @@ class DeviceControllerTest {
     final Optional<ApnRegistrationId> apnRegistrationId,
     final Optional<GcmRegistrationId> gcmRegistrationId,
     final Optional<String> expectedApnsToken,
-    final Optional<String> expectedGcmToken) throws LinkDeviceTokenAlreadyUsedException {
+    final Optional<String> expectedGcmToken) throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
 
     final Device existingDevice = mock(Device.class);
     when(existingDevice.getId()).thenReturn(Device.PRIMARY_ID);
@@ -304,7 +305,7 @@ class DeviceControllerTest {
   void deviceDowngrade(@CartesianTest.Enum(mode = CartesianTest.Enum.Mode.EXCLUDE, names = "SPARSE_POST_QUANTUM_RATCHET") final DeviceCapability capability,
       @CartesianTest.Values(booleans = {true, false}) final boolean accountHasCapability,
       @CartesianTest.Values(booleans = {true, false}) final boolean requestHasCapability)
-      throws LinkDeviceTokenAlreadyUsedException {
+      throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
 
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(account));
     when(accountsManager.addDevice(any(), any(), any()))
@@ -360,7 +361,7 @@ class DeviceControllerTest {
   }
 
   @Test
-  void missingRequiredCapability() throws LinkDeviceTokenAlreadyUsedException {
+  void missingRequiredCapability() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
 
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(account));
     when(accountsManager.addDevice(any(), any(), any()))
@@ -447,7 +448,7 @@ class DeviceControllerTest {
   }
 
   @Test
-  void linkDeviceAtomicReusedToken() throws LinkDeviceTokenAlreadyUsedException {
+  void linkDeviceAtomicReusedToken() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final Device existingDevice = mock(Device.class);
     when(existingDevice.getId()).thenReturn(Device.PRIMARY_ID);
     when(account.getDevices()).thenReturn(List.of(existingDevice));
@@ -490,6 +491,47 @@ class DeviceControllerTest {
 
       assertEquals(403, response.getStatus());
     }
+  }
+
+  @Test
+  void linkDeviceMaxDevices() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
+    final Device existingDevice = mock(Device.class);
+    when(existingDevice.getId()).thenReturn(Device.PRIMARY_ID);
+    when(account.getDevices()).thenReturn(List.of(existingDevice));
+
+    final ECKeyPair aciIdentityKeyPair = ECKeyPair.generate();
+
+    final ECSignedPreKey aciSignedPreKey = KeysHelper.signedECPreKey(1, aciIdentityKeyPair);
+    final KEMSignedPreKey aciPqLastResortPreKey = KeysHelper.signedKEMPreKey(3, aciIdentityKeyPair);
+
+    when(account.getAccountIdentityKey()).thenReturn(new IdentityKey(aciIdentityKeyPair.getPublicKey()));
+    when(account.getPhoneNumberIdentityKey()).thenReturn(Optional.empty());
+
+    when(accountsManager.checkDeviceLinkingToken(anyString())).thenReturn(Optional.of(AuthHelper.VALID_UUID));
+
+    when(accountsManager.addDevice(any(), any(), any()))
+        .thenThrow(new DeviceLimitExceededException(AccountsManager.MAX_DEVICES, AccountsManager.MAX_DEVICES));
+
+    final DeviceAttributes deviceAttributes = new DeviceAttributes(true, 1234, null, null,
+        DeviceCapability.CAPABILITIES_REQUIRED_FOR_NEW_DEVICES);
+
+    final LinkDeviceRequest request = new LinkDeviceRequest("link-device-token",
+        deviceAttributes,
+        new DeviceActivationRequest(aciSignedPreKey, Optional.empty(), aciPqLastResortPreKey, Optional.empty(), Optional.empty(), Optional.empty()));
+
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/devices/link")
+        .request()
+        .header("Authorization", AuthHelper.getProvisioningAuthHeader(AuthHelper.VALID_NUMBER, "password1"))
+        .put(Entity.entity(request, MediaType.APPLICATION_JSON_TYPE))) {
+
+      assertEquals(411, response.getStatus());
+
+      final Map<?, ?> details = response.readEntity(Map.class);
+      assertEquals(Map.of("current", AccountsManager.MAX_DEVICES, "max", AccountsManager.MAX_DEVICES), details);
+    }
+
+    verify(accountsManager).addDevice(eq(AuthHelper.VALID_UUID), any(), eq("link-device-token"));
   }
 
   @Test
@@ -538,7 +580,7 @@ class DeviceControllerTest {
   @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
   void linkDeviceAtomicConflictingChannel(final boolean fetchesMessages,
                                           final Optional<ApnRegistrationId> apnRegistrationId,
-                                          final Optional<GcmRegistrationId> gcmRegistrationId) {
+                                          final Optional<GcmRegistrationId> gcmRegistrationId) throws Exception {
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(account));
     when(accountsManager.generateLinkDeviceToken(any())).thenReturn("test");
 
@@ -849,7 +891,7 @@ class DeviceControllerTest {
   @ParameterizedTest
   @MethodSource
   void linkDeviceRegistrationId(final int registrationId, final int pniRegistrationId, final int expectedStatusCode)
-      throws LinkDeviceTokenAlreadyUsedException {
+      throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
     final Device existingDevice = mock(Device.class);
     when(existingDevice.getId()).thenReturn(Device.PRIMARY_ID);
     when(account.getDevices()).thenReturn(List.of(existingDevice));
@@ -955,12 +997,9 @@ class DeviceControllerTest {
   }
 
   @Test
-  void maxDevicesTest() throws LinkDeviceTokenAlreadyUsedException {
-    final List<Device> devices = IntStream.range(0, DeviceController.MAX_DEVICES + 1)
-        .mapToObj(_ -> mock(Device.class))
-        .toList();
+  void generateTokenMaxDevicesTest() throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
 
-    when(account.getDevices()).thenReturn(devices);
+    when(accountsManager.generateLinkDeviceToken(any())).thenThrow(new DeviceLimitExceededException(5, 5));
 
     Response response = resources.getJerseyTest()
         .target("/v1/devices/provisioning/code")

@@ -18,10 +18,11 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
-import io.netty.channel.DefaultEventLoopGroup;
-import io.netty.channel.MultithreadEventLoopGroup;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.local.LocalAddress;
 import io.netty.channel.local.LocalChannel;
+import io.netty.channel.local.LocalIoHandler;
 import io.netty.channel.local.LocalServerChannel;
 import io.netty.handler.ssl.SniHandler;
 import io.netty.handler.ssl.SslContext;
@@ -33,6 +34,8 @@ import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.pkitesting.CertificateBuilder;
 import io.netty.pkitesting.X509Bundle;
 import io.netty.util.Mapping;
+import io.netty.util.ReferenceCountUtil;
+import io.netty.util.test.LeakPresenceExtension;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.security.KeyStore;
@@ -51,18 +54,22 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
+@ExtendWith(LeakPresenceExtension.class)
 class TlsHandshakeMetricsHandlerTest {
 
   private static final String DOMAIN = "example.org";
 
-  private static MultithreadEventLoopGroup eventLoopGroup;
+  private static EventLoopGroup eventLoopGroup;
   private static byte[] keyStoreBytes;
   private static String keyStorePassword;
 
   private SimpleMeterRegistry meterRegistry;
   private SslContext clientSslContext;
+  private Mapping<String, SslContext> sniMapping;
   private Channel serverChannel;
 
   /// Completed by the server once the handshake event has passed the metrics handler
@@ -88,7 +95,7 @@ class TlsHandshakeMetricsHandlerTest {
     keyStoreBytes = byteArrayOutputStream.toByteArray();
     keyStorePassword = new String(password);
 
-    eventLoopGroup = new DefaultEventLoopGroup();
+    eventLoopGroup = new MultiThreadIoEventLoopGroup(LocalIoHandler.newFactory());
   }
 
   @BeforeEach
@@ -107,6 +114,9 @@ class TlsHandshakeMetricsHandlerTest {
     if (serverChannel != null) {
       serverChannel.close().sync();
     }
+    if (sniMapping != null) {
+      ReferenceCountUtil.release(sniMapping.map(DOMAIN));
+    }
   }
 
   @AfterAll
@@ -114,9 +124,11 @@ class TlsHandshakeMetricsHandlerTest {
     eventLoopGroup.shutdownGracefully(0, 1000, TimeUnit.MILLISECONDS).sync();
   }
 
-  @Test
-  void handshake() throws Exception {
-    final AtomicReference<Channel> lastServerChildChannel = startServer(buildSniMapping());
+  @ParameterizedTest
+  @EnumSource(value = SslProvider.class, names = {"JDK", "OPENSSL"})
+  void handshake(final SslProvider sslProvider) throws Exception {
+    sniMapping = buildSniMapping(sslProvider);
+    final AtomicReference<Channel> lastServerChildChannel = startServer(sniMapping);
     connect(null);
 
     assertEquals(1, getCount(true));
@@ -125,9 +137,12 @@ class TlsHandshakeMetricsHandlerTest {
     assertNull(lastServerChildChannel.get().pipeline().get(TlsHandshakeMetricsHandler.class), "the metrics handler should remove itself");
   }
 
-  @Test
-  void failedHandshake() throws Exception {
-    startServer(buildSniMapping());
+  @ParameterizedTest
+  @EnumSource(value = SslProvider.class, names = {"JDK", "OPENSSL"})
+  void failedHandshake(final SslProvider sslProvider) throws Exception {
+    sniMapping = buildSniMapping(sslProvider);
+    startServer(sniMapping);
+
     // The server only holds an Ed25519 key
     connect(new String[] { "rsa_pss_rsae_sha256" });
 
@@ -136,8 +151,8 @@ class TlsHandshakeMetricsHandlerTest {
     assertEquals(1, getCount(false));
   }
 
-  private static Mapping<String, SslContext> buildSniMapping() throws Exception {
-    return SniMapper.buildSniMapping(new ByteArrayInputStream(keyStoreBytes), keyStorePassword);
+  private static Mapping<String, SslContext> buildSniMapping(final SslProvider sslProvider) throws Exception {
+    return SniMapper.buildSniMapping(new ByteArrayInputStream(keyStoreBytes), keyStorePassword, sslProvider);
   }
 
   /// Starts the server and returns a reference to the child channel, for introspection by tests

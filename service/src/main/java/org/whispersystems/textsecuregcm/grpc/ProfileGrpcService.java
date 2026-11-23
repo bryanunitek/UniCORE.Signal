@@ -18,9 +18,11 @@ import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.Strings;
 import org.signal.chat.common.S3UploadForm;
 import org.signal.chat.errors.FailedPrecondition;
 import org.signal.chat.errors.NotFound;
+import org.signal.chat.profile.ExpectedVersionConflict;
 import org.signal.chat.profile.GetAvatarCredentialRequest;
 import org.signal.chat.profile.GetAvatarCredentialResponse;
 import org.signal.chat.profile.GetProfileRequest;
@@ -72,6 +74,7 @@ public class ProfileGrpcService extends SimpleProfileGrpc.ProfileImplBase {
   private final GenericServerSecretParams genericServerSecretParams;
   private final ProfileBadgeConverter profileBadgeConverter;
   private final RateLimiters rateLimiters;
+  private final String cdnBaseUrl;
 
   private record AvatarData(Optional<String> currentAvatar,
                             Optional<String>  finalAvatar,
@@ -85,6 +88,7 @@ public class ProfileGrpcService extends SimpleProfileGrpc.ProfileImplBase {
       final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
       final BadgesConfiguration badgesConfiguration,
       final PostPolicyGenerator policyGenerator,
+      final String cdnBaseUrl,
       final GenericServerSecretParams genericServerSecretParams,
       final ProfileBadgeConverter profileBadgeConverter,
       final RateLimiters rateLimiters) {
@@ -96,6 +100,7 @@ public class ProfileGrpcService extends SimpleProfileGrpc.ProfileImplBase {
     this.badgeConfigurationMap = badgesConfiguration.getBadges().stream()
         .collect(Collectors.toMap(BadgeConfiguration::getId, Function.identity()));
     this.policyGenerator = policyGenerator;
+    this.cdnBaseUrl = Strings.CS.removeEnd(cdnBaseUrl, "/");
     this.genericServerSecretParams = genericServerSecretParams;
     this.profileBadgeConverter = profileBadgeConverter;
     this.rateLimiters = rateLimiters;
@@ -115,9 +120,11 @@ public class ProfileGrpcService extends SimpleProfileGrpc.ProfileImplBase {
     final boolean currentVersionMatchesExpected = Arrays.equals(account.getCurrentProfileVersion().orElse(new byte[0]), expectedCurrentVersion);
 
     if (!currentVersionMatchesExpected) {
-      return SetProfileResponse.newBuilder().setExpectedVersionWriteConflict(FailedPrecondition.newBuilder()
-          .setDescription("current and expected profile versions must match")
-          .build()).build();
+      final ExpectedVersionConflict conflict = account.getCurrentProfileVersion()
+          .map(v -> ExpectedVersionConflict.newBuilder().setCurrentProfileVersion(ByteString.copyFrom(v)).build())
+          .orElseGet(ExpectedVersionConflict::getDefaultInstance);
+      return SetProfileResponse.newBuilder().setExpectedVersionWriteConflict(conflict)
+          .build();
     }
 
     final byte[] version = request.getVersion().toByteArray();
@@ -190,12 +197,13 @@ public class ProfileGrpcService extends SimpleProfileGrpc.ProfileImplBase {
         a.setBadges(clock, updatedBadges);
       });
 
-    } catch (final WriteConflictException _) {
-      return SetProfileResponse.newBuilder()
-          .setExpectedVersionWriteConflict(FailedPrecondition.newBuilder()
-              .setDescription("current and expected version mismatch")
-              .build())
-          .build();
+    } catch (final WriteConflictException e) {
+
+      final ExpectedVersionConflict conflict = e.getConflictedValue()
+          .map(v -> ExpectedVersionConflict.newBuilder().setCurrentProfileVersion(ByteString.copyFrom(v)).build())
+          .orElseGet(ExpectedVersionConflict::getDefaultInstance);
+
+      return SetProfileResponse.newBuilder().setExpectedVersionWriteConflict(conflict).build();
     }
 
     if (request.getV1Request().getAvatarChange() != AvatarChange.AVATAR_CHANGE_UNCHANGED && avatarData.currentAvatar().isPresent()) {
@@ -264,7 +272,7 @@ public class ProfileGrpcService extends SimpleProfileGrpc.ProfileImplBase {
 
             // If we didn't find a v2 profile, try a v1 profile
             .or(() -> ProfileGrpcHelper
-                .getProfileV1(account, profilesManager, profileBadgeConverter, version)
+                .getProfileV1(account, profilesManager, profileBadgeConverter, cdnBaseUrl, version)
                 .map(v1Result -> GetProfileResponse.newBuilder().setLegacyProfile(v1Result).build())))
         .orElseGet(() -> GetProfileResponse.newBuilder().setNotFound(NotFound.getDefaultInstance()).build());
   }

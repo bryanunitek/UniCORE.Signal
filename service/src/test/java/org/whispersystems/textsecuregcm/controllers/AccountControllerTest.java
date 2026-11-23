@@ -47,6 +47,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.glassfish.jersey.server.ServerProperties;
 import org.glassfish.jersey.test.grizzly.GrizzlyWebTestContainerFactory;
 import org.junit.jupiter.api.AfterEach;
@@ -59,6 +60,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.signal.libsignal.usernames.BaseUsernameException;
+import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.SaltedTokenHash;
 import org.whispersystems.textsecuregcm.auth.StoredRegistrationLock;
@@ -330,6 +332,20 @@ class AccountControllerTest {
   }
 
   @Test
+  void testSetGcmIdExcessiveLength() {
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/gcm/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION,
+            AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_3, AuthHelper.VALID_PASSWORD_3_PRIMARY))
+        .put(Entity.json(new GcmRegistrationId(RandomStringUtils.insecure().nextAlphanumeric(2048))))) {
+
+      assertThat(response.getStatus()).isEqualTo(422);
+      verify(accountsManager, never()).updateDevice(any(), anyByte(), any());
+    }
+  }
+
+  @Test
   void testSetApnId() {
     try (final Response response = resources.getJerseyTest()
         .target("/v1/accounts/apn/")
@@ -342,6 +358,20 @@ class AccountControllerTest {
 
       verify(AuthHelper.VALID_DEVICE_3_PRIMARY, times(1)).setApnId(eq("first"));
       verify(accountsManager, times(1)).updateDevice(eq(AuthHelper.VALID_UUID_3), anyByte(), any());
+    }
+  }
+
+  @Test
+  void testSetApnIdExcessiveLength() {
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/apn/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION,
+            AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_3, AuthHelper.VALID_PASSWORD_3_PRIMARY))
+        .put(Entity.json(new ApnRegistrationId(RandomStringUtils.insecure().nextAlphanumeric(2048))))) {
+
+      assertThat(response.getStatus()).isEqualTo(422);
+      verify(accountsManager, never()).updateDevice(any(), anyByte(), any());
     }
   }
 
@@ -646,7 +676,7 @@ class AccountControllerTest {
 
   @Test
   void testConfirmUsernameHash()
-      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException {
+      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException, InvalidInputException {
     Account account = mock(Account.class);
     final UUID uuid = UUID.randomUUID();
     when(account.getUsernameHash()).thenReturn(Optional.of(USERNAME_HASH_1));
@@ -684,7 +714,7 @@ class AccountControllerTest {
 
   @Test
   void testConfirmUsernameHashOld()
-      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException {
+      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException, InvalidInputException {
     Account account = mock(Account.class);
     when(account.getUsernameHash()).thenReturn(Optional.of(USERNAME_HASH_1));
     when(account.getUsernameLinkHandle()).thenReturn(null);
@@ -708,7 +738,7 @@ class AccountControllerTest {
 
   @Test
   void testConfirmUnreservedUsernameHash()
-      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException {
+      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException, InvalidInputException {
     when(accountsManager.confirmReservedUsernameHash(any(), eq(USERNAME_HASH_1), any()))
         .thenThrow(new UsernameReservationNotFoundException());
 
@@ -725,7 +755,7 @@ class AccountControllerTest {
 
   @Test
   void testConfirmLapsedUsernameHash()
-      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException {
+      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException, InvalidInputException {
     when(accountsManager.confirmReservedUsernameHash(any(), eq(USERNAME_HASH_1), any()))
         .thenThrow(new UsernameHashNotAvailableException());
 
@@ -776,7 +806,7 @@ class AccountControllerTest {
   }
 
   @Test
-  void testCommitUsernameHashWithInvalidProof() throws BaseUsernameException {
+  void testCommitUsernameHashWithInvalidProof() throws BaseUsernameException, InvalidInputException {
     doThrow(new BaseUsernameException("invalid username")).when(usernameZkProofVerifier).verifyProof(eq(ZK_PROOF), eq(USERNAME_HASH_1));
 
     try (final Response response = resources.getJerseyTest()

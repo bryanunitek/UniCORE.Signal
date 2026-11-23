@@ -28,6 +28,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -35,6 +36,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
 import org.mockito.Mock;
+import org.signal.chat.device.ChangeDevicePasswordRequest;
 import org.signal.chat.device.ClearPushTokenRequest;
 import org.signal.chat.device.ClearPushTokenResponse;
 import org.signal.chat.device.DevicesGrpc;
@@ -48,7 +50,6 @@ import org.signal.chat.device.SetDeviceNameRequest;
 import org.signal.chat.device.SetDeviceNameResponse;
 import org.signal.chat.device.SetPushTokenRequest;
 import org.signal.chat.device.SetPushTokenResponse;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
@@ -372,15 +373,32 @@ class DevicesGrpcServiceTest extends SimpleBaseGrpcTest<DevicesGrpcService, Devi
 
   private static Stream<Arguments> setPushTokenIllegalArgument() {
     return Stream.of(
-        Arguments.of(SetPushTokenRequest.newBuilder().build()),
+        Arguments.argumentSet("No token",
+            SetPushTokenRequest.newBuilder().build()),
 
-        Arguments.of(SetPushTokenRequest.newBuilder()
+        Arguments.argumentSet("Empty APNs token",
+            SetPushTokenRequest.newBuilder()
                 .setApnsTokenRequest(SetPushTokenRequest.ApnsTokenRequest.newBuilder().build())
-            .build()),
+                .build()),
 
-        Arguments.of(SetPushTokenRequest.newBuilder()
-            .setFcmTokenRequest(SetPushTokenRequest.FcmTokenRequest.newBuilder().build())
-            .build())
+        Arguments.argumentSet("Empty FCM token",
+            SetPushTokenRequest.newBuilder()
+                .setFcmTokenRequest(SetPushTokenRequest.FcmTokenRequest.newBuilder().build())
+                .build()),
+
+        Arguments.argumentSet("Excessively long APNs token",
+            SetPushTokenRequest.newBuilder()
+                .setApnsTokenRequest(SetPushTokenRequest.ApnsTokenRequest.newBuilder()
+                    .setApnsToken(RandomStringUtils.insecure().nextAlphanumeric(2048))
+                    .build())
+                .build()),
+
+        Arguments.argumentSet("Excessively long FCM token",
+            SetPushTokenRequest.newBuilder()
+                .setFcmTokenRequest(SetPushTokenRequest.FcmTokenRequest.newBuilder()
+                    .setFcmToken(RandomStringUtils.insecure().nextAlphanumeric(2048))
+                    .build())
+                .build())
     );
   }
 
@@ -431,7 +449,10 @@ class DevicesGrpcServiceTest extends SimpleBaseGrpcTest<DevicesGrpcService, Devi
       @CartesianTest.Values(booleans = {true, false}) final boolean transfer,
       @CartesianTest.Values(booleans = {true, false}) final boolean attachmentBackfill,
       @CartesianTest.Values(booleans = {true, false}) final boolean spqr,
-      @CartesianTest.Values(booleans = {true, false}) final boolean usernameChangeSyncMessage) {
+      @CartesianTest.Values(booleans = {true, false}) final boolean usernameChangeSyncMessage,
+      @CartesianTest.Values(booleans = {true, false}) final boolean replyPrivately,
+      @CartesianTest.Values(booleans = {true, false}) final boolean contactDelete,
+      @CartesianTest.Values(booleans = {true, false}) final boolean adminRemoveAndDelete) {
 
     mockAuthenticationInterceptor().setAuthenticatedDevice(AUTHENTICATED_ACI, deviceId);
 
@@ -460,6 +481,18 @@ class DevicesGrpcServiceTest extends SimpleBaseGrpcTest<DevicesGrpcService, Devi
       requestBuilder.addCapabilities(org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_USERNAME_CHANGE_SYNC_MESSAGE);
     }
 
+    if (replyPrivately) {
+      requestBuilder.addCapabilities(org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_REPLY_PRIVATELY);
+    }
+
+    if (contactDelete) {
+      requestBuilder.addCapabilities(org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_CONTACT_DELETE);
+    }
+
+    if (adminRemoveAndDelete) {
+      requestBuilder.addCapabilities(org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_ADMIN_REMOVE_AND_DELETE);
+    }
+
     final SetCapabilitiesResponse ignored = authenticatedServiceStub().setCapabilities(requestBuilder.build());
 
     final Set<DeviceCapability> expectedCapabilities = new HashSet<>();
@@ -485,6 +518,74 @@ class DevicesGrpcServiceTest extends SimpleBaseGrpcTest<DevicesGrpcService, Devi
       expectedCapabilities.add(DeviceCapability.USERNAME_CHANGE_SYNC_MESSAGE);
     }
 
+    if (replyPrivately) {
+      expectedCapabilities.add(DeviceCapability.REPLY_PRIVATELY);
+    }
+
+    if (contactDelete) {
+      expectedCapabilities.add(DeviceCapability.CONTACT_DELETE);
+    }
+
+    if (adminRemoveAndDelete) {
+      expectedCapabilities.add(DeviceCapability.ADMIN_REMOVE_AND_DELETE);
+    }
+
     verify(device).setCapabilities(expectedCapabilities);
+  }
+
+  @Test
+  void changeDevicePassword() {
+    final byte deviceId = 127;
+    mockAuthenticationInterceptor().setAuthenticatedDevice(AUTHENTICATED_ACI, deviceId);
+
+    final String newPassword = RandomStringUtils.insecure().nextAlphanumeric(32);
+
+    when(accountsManager.updateDevicePassword(any(), anyByte(), any())).thenReturn(true);
+
+    authenticatedServiceStub().changeDevicePassword(ChangeDevicePasswordRequest.newBuilder()
+        .setNewPassword(newPassword)
+        .build());
+
+    verify(accountsManager).updateDevicePassword(AUTHENTICATED_ACI, deviceId, newPassword);
+  }
+
+  @Test
+  void changeDevicePasswordNotChanged() {
+    when(accountsManager.updateDevicePassword(any(), anyByte(), any())).thenReturn(false);
+
+    assertStatusException(Status.UNAUTHENTICATED,
+        () -> authenticatedServiceStub().changeDevicePassword(ChangeDevicePasswordRequest.newBuilder()
+            .setNewPassword(RandomStringUtils.insecure().nextAlphanumeric(32))
+            .build()));
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void changeDevicePasswordIllegalArgument(final ChangeDevicePasswordRequest request) {
+    assertStatusException(Status.INVALID_ARGUMENT, () -> authenticatedServiceStub().changeDevicePassword(request));
+    verify(accountsManager, never()).updateDevicePassword(any(), anyByte(), any());
+  }
+
+  private static Stream<Arguments> changeDevicePasswordIllegalArgument() {
+    return Stream.of(
+        Arguments.argumentSet("No new password",
+            ChangeDevicePasswordRequest.newBuilder()
+                .build()),
+
+        Arguments.argumentSet("New password too short",
+            ChangeDevicePasswordRequest.newBuilder()
+                .setNewPassword(RandomStringUtils.insecure().nextAlphanumeric(31))
+                .build()),
+
+        Arguments.argumentSet("New password blank",
+            ChangeDevicePasswordRequest.newBuilder()
+                .setNewPassword(" ".repeat(64))
+                .build()),
+
+        Arguments.argumentSet("New password too long",
+            ChangeDevicePasswordRequest.newBuilder()
+                .setNewPassword(RandomStringUtils.insecure().nextAlphanumeric(256))
+                .build())
+    );
   }
 }

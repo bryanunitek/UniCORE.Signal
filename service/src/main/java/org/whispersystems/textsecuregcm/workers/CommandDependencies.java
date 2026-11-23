@@ -43,15 +43,16 @@ import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfigurati
 import org.whispersystems.textsecuregcm.controllers.SecureStorageController;
 import org.whispersystems.textsecuregcm.controllers.SecureValueRecovery2Controller;
 import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
-import org.whispersystems.textsecuregcm.experiment.PushNotificationExperimentSamples;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.MicrometerAwsSdkMetricPublisher;
+import org.whispersystems.textsecuregcm.purchases.AppleAppStoreClient;
+import org.whispersystems.textsecuregcm.purchases.AppleAppStoreManager;
+import org.whispersystems.textsecuregcm.purchases.GooglePlayBillingManager;
 import org.whispersystems.textsecuregcm.push.APNSender;
 import org.whispersystems.textsecuregcm.push.FcmSender;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
 import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
-import org.whispersystems.textsecuregcm.push.RedisMessageAvailabilityManager;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClient;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.securestorage.SecureStorageClient;
@@ -66,7 +67,6 @@ import org.whispersystems.textsecuregcm.storage.DynamoDbRecoveryManager;
 import org.whispersystems.textsecuregcm.storage.FoundationDbVersion;
 import org.whispersystems.textsecuregcm.storage.IssuedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.KeysManager;
-import org.whispersystems.textsecuregcm.storage.MessagesCache;
 import org.whispersystems.textsecuregcm.storage.MessagesDynamoDb;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
 import org.whispersystems.textsecuregcm.storage.PagedSingleUseKEMPreKeyStore;
@@ -82,6 +82,7 @@ import org.whispersystems.textsecuregcm.storage.RepeatedUseECSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseKEMSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.ReportMessageDynamoDb;
 import org.whispersystems.textsecuregcm.storage.ReportMessageManager;
+import org.whispersystems.textsecuregcm.storage.SandboxAccounts;
 import org.whispersystems.textsecuregcm.storage.SingleUseECPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.SubscriptionManager;
 import org.whispersystems.textsecuregcm.storage.Subscriptions;
@@ -89,9 +90,6 @@ import org.whispersystems.textsecuregcm.storage.TotpManager;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
 import org.whispersystems.textsecuregcm.storage.foundationdb.VersionstampUUIDCipher;
-import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreClient;
-import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreManager;
-import org.whispersystems.textsecuregcm.subscriptions.GooglePlayBillingManager;
 import org.whispersystems.textsecuregcm.util.ManagedAwsCrt;
 import org.whispersystems.textsecuregcm.util.ManagedExecutors;
 import org.whispersystems.textsecuregcm.util.ResilienceUtil;
@@ -110,14 +108,12 @@ public record CommandDependencies(
     AccountsManager accountsManager,
     ProfilesManager profilesManager,
     ReportMessageManager reportMessageManager,
-    MessagesCache messagesCache,
     MessagesManager messagesManager,
     KeysManager keysManager,
     PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager,
     APNSender apnSender,
     FcmSender fcmSender,
     PushNotificationManager pushNotificationManager,
-    PushNotificationExperimentSamples pushNotificationExperimentSamples,
     FaultTolerantRedisClusterClient cacheCluster,
     FaultTolerantRedisClusterClient pushSchedulerCluster,
     ClientResources.Builder redisClusterClientResourcesBuilder,
@@ -132,7 +128,8 @@ public record CommandDependencies(
     PhoneNumberIdentifiers phoneNumberIdentifiers,
     DynamoDbRecoveryManager dynamoDbRecoveryManager,
     FDB fdb,
-    AccountLockManager accountLockManager) {
+    AccountLockManager accountLockManager,
+    SandboxAccounts sandboxAccounts) {
 
   static CommandDependencies build(
       final String name,
@@ -330,8 +327,6 @@ public record CommandDependencies(
         configuration.getDynamoDbTables().getMessages().getTableName(),
         configuration.getDynamoDbTables().getMessages().getExpiration(),
         messageDeletionExecutor);
-    FaultTolerantRedisClusterClient messagesCluster = configuration.getMessageCacheConfiguration()
-        .getRedisClusterConfiguration().build("messages", redisClientResourcesBuilder);
     FaultTolerantRedisClusterClient rateLimitersCluster = configuration.getRateLimitersCluster().build("rate_limiters",
         redisClientResourcesBuilder);
     SecureValueRecoveryClient secureValueRecovery2Client = new SecureValueRecoveryClient(
@@ -350,8 +345,6 @@ public record CommandDependencies(
         storageServiceExecutor, retryExecutor, configuration.getSecureStorageServiceConfiguration());
     DisconnectionRequestManager disconnectionRequestManager = new DisconnectionRequestManager(pubsubClient,
         disconnectionRequestListenerExecutor, retryExecutor);
-    MessagesCache messagesCache = new MessagesCache(messagesCluster,
-        messageDeliveryScheduler, messageDeletionExecutor, retryExecutor, Clock.systemUTC());
     final FoundationDbMessageStore foundationDbMessageStore = new FoundationDbMessageStore(messageDatabasesByEpoch,
         configuration.getFoundationDbMessagesConfiguration().activeEpoch(),
         new VersionstampUUIDCipher(configuration.getFoundationDbMessagesConfiguration().currentVersionstampCipherKey(),
@@ -367,11 +360,8 @@ public record CommandDependencies(
         configuration.getReportMessageConfiguration().getReportTtl());
     ReportMessageManager reportMessageManager = new ReportMessageManager(reportMessageDynamoDb, rateLimitersCluster,
         configuration.getReportMessageConfiguration().getCounterTtl());
-    RedisMessageAvailabilityManager redisMessageAvailabilityManager =
-        new RedisMessageAvailabilityManager(messagesCluster, clientEventExecutor, asyncOperationQueueingExecutor);
     final MessagesManager messagesManager =
-        new MessagesManager(messagesDynamoDb, messagesCache, foundationDbMessageStore, redisMessageAvailabilityManager,
-            reportMessageManager, messageDeletionExecutor, Clock.systemUTC(), experimentEnrollmentManager);
+        new MessagesManager(messagesDynamoDb, foundationDbMessageStore, reportMessageManager, messageDeletionExecutor, Clock.systemUTC());
     AccountLockManager accountLockManager = new AccountLockManager(dynamoDbClient,
         configuration.getDynamoDbTables().getDeletedAccountsLock().getTableName());
     PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager =
@@ -389,10 +379,12 @@ public record CommandDependencies(
         configuration.getRegistrationWebAuthnConfiguration().challengeTtl(),
         configuration.getRegistrationWebAuthnConfiguration().userHandleBlindingSecret().value(),
         rateLimitersCluster);
+    final SandboxAccounts sandboxAccounts = new SandboxAccounts(
+        configuration.getDynamoDbTables().getSandboxAccounts().getTableName(), dynamoDbClient);
     AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keys, messagesManager, profilesManager,
         changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
-        phoneNumberRecoveryPasswordsManager, messagePollExecutor,
+        phoneNumberRecoveryPasswordsManager, sandboxAccounts, messagePollExecutor,
         retryExecutor, clock, configuration.getLinkDeviceSecretConfiguration().secret().value(),
          webAuthnCeremonyManager, totpManager);
     RateLimiters rateLimiters = RateLimiters.create(dynamicConfigurationManager, rateLimitersCluster, retryExecutor);
@@ -457,31 +449,24 @@ public record CommandDependencies(
         apnSender, fcmSender, accountsManager, 0, 0, retryExecutor);
     PushNotificationManager pushNotificationManager = new PushNotificationManager(accountsManager,
         apnSender, fcmSender, pushNotificationScheduler);
-    PushNotificationExperimentSamples pushNotificationExperimentSamples =
-        new PushNotificationExperimentSamples(dynamoDbAsyncClient,
-            configuration.getDynamoDbTables().getPushNotificationExperimentSamples().getTableName(),
-            Clock.systemUTC());
 
     final DynamoDbRecoveryManager dynamoDbRecoveryManager =
         new DynamoDbRecoveryManager(accounts, phoneNumberIdentifiers);
 
     environment.lifecycle().manage(apnSender);
     environment.lifecycle().manage(disconnectionRequestManager);
-    environment.lifecycle().manage(redisMessageAvailabilityManager);
     environment.lifecycle().manage(new ManagedAwsCrt());
 
     return new CommandDependencies(
         accountsManager,
         profilesManager,
         reportMessageManager,
-        messagesCache,
         messagesManager,
         keys,
         phoneNumberRecoveryPasswordsManager,
         apnSender,
         fcmSender,
         pushNotificationManager,
-        pushNotificationExperimentSamples,
         cacheCluster,
         pushSchedulerCluster,
         redisClientResourcesBuilder,
@@ -496,7 +481,8 @@ public record CommandDependencies(
         phoneNumberIdentifiers,
         dynamoDbRecoveryManager,
         fdb,
-        accountLockManager);
+        accountLockManager,
+        sandboxAccounts);
   }
 
 }

@@ -25,6 +25,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 import jakarta.ws.rs.BadRequestException;
@@ -595,7 +596,7 @@ public class ArchiveController {
       @HeaderParam(X_SIGNAL_ZK_AUTH_SIGNATURE) final BackupAuthCredentialPresentationSignature signature,
 
       @Parameter(description = "The size of the message backup to upload in bytes")
-      @QueryParam("uploadLength") final Optional<Long> uploadLength)
+      @QueryParam("uploadLength") final Optional<@Positive Long> uploadLength)
       throws BackupFailedZkAuthenticationException, BackupWrongCredentialTypeException, BackupPermissionException {
     if (account.isPresent()) {
       throw new BadRequestException("must not use authenticated connection for anonymous operations");
@@ -651,7 +652,7 @@ public class ArchiveController {
       @HeaderParam(X_SIGNAL_ZK_AUTH_SIGNATURE) final BackupAuthCredentialPresentationSignature signature,
 
       @Parameter(description = "The size of the temporary attachment to upload in bytes")
-      @QueryParam("uploadLength") final Optional<Long> uploadLength)
+      @QueryParam("uploadLength") final Optional<@Positive Long> uploadLength)
       throws RateLimitExceededException, BackupFailedZkAuthenticationException, BackupWrongCredentialTypeException, BackupPermissionException {
     if (account.isPresent()) {
       throw new BadRequestException("must not use authenticated connection for anonymous operations");

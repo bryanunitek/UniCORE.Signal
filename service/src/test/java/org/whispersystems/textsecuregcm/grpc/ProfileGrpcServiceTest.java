@@ -6,6 +6,7 @@
 package org.whispersystems.textsecuregcm.grpc;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -97,17 +98,16 @@ import org.whispersystems.textsecuregcm.entities.BadgeSvg;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.RateLimiter;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountBadge;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
-import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.VersionedProfile;
 import org.whispersystems.textsecuregcm.storage.VersionedProfileV1;
 import org.whispersystems.textsecuregcm.storage.WriteConflictException;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
 import org.whispersystems.textsecuregcm.tests.util.AuthHelper;
 import org.whispersystems.textsecuregcm.tests.util.ProfileTestHelper;
 import org.whispersystems.textsecuregcm.util.MockUtils;
@@ -116,6 +116,8 @@ import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 
 public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcService, ProfileGrpc.ProfileBlockingStub> {
+
+  private static final String CDN_BASE_URL = "https://cdn.example.com";
 
   private static final byte[] VERSION = TestRandomUtil.nextBytes(32);
 
@@ -191,7 +193,6 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     when(account.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
     when(account.getNumber()).thenReturn(Optional.of(phoneNumber));
     when(account.getBadges()).thenReturn(Collections.emptyList());
-    when(account.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(true);
 
     when(profile.paymentAddress()).thenReturn(null);
     when(profile.avatar()).thenReturn("");
@@ -214,6 +215,7 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
         dynamicConfigurationManager,
         badgesConfiguration,
         policyGenerator,
+        CDN_BASE_URL,
         genericServerSecretParams,
         profileBadgeConverter,
         rateLimiters
@@ -339,7 +341,9 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     final byte[] validPaymentAddress = new byte[582];
     final byte[] validPhoneNumberSharing = new byte[29];
 
-    doThrow(WriteConflictException.class)
+    final byte[] conflictedVersion = TestRandomUtil.nextBytes(32);
+
+    doThrow(new WriteConflictException(conflictedVersion))
         .when(accountsManager).updateCurrentProfileVersion(any(), any(), any(), any());
 
     final SetProfileRequest request = SetProfileRequest.newBuilder()
@@ -358,6 +362,7 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     final SetProfileResponse response = authenticatedServiceStub().setProfile(request);
 
     assertTrue(response.hasExpectedVersionWriteConflict());
+    assertArrayEquals(conflictedVersion, response.getExpectedVersionWriteConflict().getCurrentProfileVersion().toByteArray());
     verify(profilesManager).set(any(), any(), any(), any());
     verify(accountsManager).updateCurrentProfileVersion(any(), any(), any(), any());
   }
@@ -649,7 +654,7 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
         .setName(ByteString.copyFrom(name))
         .setAbout(ByteString.copyFrom(about))
         .setAboutEmoji(ByteString.copyFrom(emoji))
-        .setAvatar(avatar)
+        .setAvatarUrl(CDN_BASE_URL + "/" + avatar)
         .setPhoneNumberSharing(ByteString.copyFrom(phoneNumberSharing))
         .setAccountInfo(AccountInfo.newBuilder()
             .addAllBadgeIds(badgeIds)
@@ -691,7 +696,6 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
 
     when(account.getAccountIdentifier()).thenReturn(targetAci);
     when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version));
-    when(account.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(true);
     when(account.getAccountIdentityKey()).thenReturn(identityKey);
     when(account.isUnrestrictedUnidentifiedAccess()).thenReturn(true);
     when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(unidentifiedAccessKey));
@@ -743,7 +747,6 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
 
     final UUID targetAci = UUID.randomUUID();
     when(account.getAccountIdentifier()).thenReturn(targetAci);
-    when(account.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(true);
     when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(targetAci))).thenReturn(Optional.of(account));
 
     when(account.getAccountIdentityKey()).thenReturn(identityKey);
@@ -969,13 +972,11 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     assertTrue(statusRuntimeException.getStatus().getDescription().toLowerCase(Locale.ROOT).contains("commitment"));
   }
 
-  @ParameterizedTest
-  @ValueSource(ints = {0, 1, 16, 32})
-  void testProfileSerialized(int aboutEmojiLength) {
+  @Test
+  void testProfileSerialized() {
 
-    // This test demonstrates the calculation for the (require.size).max = 909 + 28
-    // in profiles.proto, as well as how padding calculation results in a constant size.
-    //
+    // This test demonstrates the calculation for the (require.size).max = 1202 + 256 + 28
+    // in profiles.proto
     // This should be largely integrated into libsignal in the future.
 
     // in gRPC, field + varint length encoding has:
@@ -983,21 +984,21 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     // varint: 1 byte for length < 128, 2 bytes for < 16,384
     final int serializedSize =
         1 + 257 + 2 +
+        1 + 257 + 2 +
         1 + 512 + 2 +
-        1 + aboutEmojiLength +  1 +
-        1 + 64 + 1 +
-        1 + 1 +
-        1 + (64 - (257 + 512 + aboutEmojiLength + 64 + 1) % 64) + 1;
+        1 + 32 +  1 +
+        1 + 128 + 2 +
+        1 + 1;
 
-    assertEquals(909, serializedSize);
+    assertEquals(1202, serializedSize);
 
     final PlaintextProfileData data = PlaintextProfileData.newBuilder()
-        .setNameBytes(ByteString.copyFrom(new byte[257]))
+        .setGivenNameBytes(ByteString.copyFrom(new byte[257]))
+        .setFamilyNameBytes(ByteString.copyFrom(new byte[257]))
         .setAboutBytes(ByteString.copyFrom(new byte[512]))
-        .setAboutEmojiBytes(ByteString.copyFrom(new byte[aboutEmojiLength]))
-        .setAvatarBytes(ByteString.copyFrom(new byte[64]))
+        .setAboutEmojiBytes(ByteString.copyFrom(new byte[32]))
+        .setAvatarBytes(ByteString.copyFrom(new byte[128]))
         .setPhoneNumberSharing(true)
-        .setPadding(ByteString.copyFrom(new byte[64 - (257 + 512 + aboutEmojiLength + 64 + 1) % 64]))
         .build();
 
     assertEquals(serializedSize, data.getSerializedSize());

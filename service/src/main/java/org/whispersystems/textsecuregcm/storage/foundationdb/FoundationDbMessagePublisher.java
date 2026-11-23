@@ -1,6 +1,7 @@
 package org.whispersystems.textsecuregcm.storage.foundationdb;
 
 import com.apple.foundationdb.KeySelector;
+import com.apple.foundationdb.MutationType;
 import com.apple.foundationdb.StreamingMode;
 import com.apple.foundationdb.Transaction;
 import com.apple.foundationdb.tuple.Versionstamp;
@@ -8,6 +9,8 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.InvalidProtocolBufferException;
 import io.micrometer.core.instrument.Metrics;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.time.Clock;
 import java.util.Arrays;
 import java.util.Collections;
@@ -41,6 +44,8 @@ class FoundationDbMessagePublisher {
   /// The end key at which we stop reading messages. For finite publisher, this is just past the end-of-queue key at the
   /// time the publisher was created. For an infinite publisher, this is the end of subspace range.
   private final KeySelector endKeyExclusive;
+
+  private final byte[] readsSinceLastAcknowledgedMessageKey;
 
   /// The key that stores the server ID/timestamp indicating when/where the connected client was last known to be
   /// present. Active publishers refresh this key at regular intervals (see [#renewPresenceFuture]).
@@ -87,6 +92,12 @@ class FoundationDbMessagePublisher {
 
   private static final int STREAM_ID_UNASSIGNED = -1;
 
+  // FoundationDB's `ADD` mutation operate on little-endian, 64-bit integers rather than on tuple-encoded integers
+  private static final byte[] ONE_LITTLE_ENDIAN = ByteBuffer.allocate(Long.BYTES)
+      .order(ByteOrder.LITTLE_ENDIAN)
+      .putLong(1L)
+      .array();
+
   private static final Logger LOGGER = LoggerFactory.getLogger(FoundationDbMessagePublisher.class);
 
   private static final String WATCHES_COUNTER = MetricsUtil.name(FoundationDbMessagePublisher.class, "watches");
@@ -131,6 +142,7 @@ class FoundationDbMessagePublisher {
       final KeySelector beginKeyInclusive,
       final KeySelector endKeyExclusive,
       final int streamId,
+      final byte[] readsSinceLastAcknowledgedMessageKey,
       @Nullable final byte[] presenceKey,
       @Nullable final ScheduledExecutorService presenceRenewalExecutorService,
       @Nullable final byte[] messagesAvailableWatchKey,
@@ -141,6 +153,7 @@ class FoundationDbMessagePublisher {
     this.beginKeyCursor = beginKeyInclusive;
     this.endKeyExclusive = endKeyExclusive;
     this.streamId = streamId;
+    this.readsSinceLastAcknowledgedMessageKey = readsSinceLastAcknowledgedMessageKey;
     this.presenceKey = presenceKey;
     this.presenceRenewalExecutorService = presenceRenewalExecutorService;
     this.messagesAvailableWatchKey = messagesAvailableWatchKey;
@@ -176,13 +189,15 @@ class FoundationDbMessagePublisher {
       final FaultTolerantDatabase database,
       final Clock clock,
       final KeySelector beginKeyInclusive,
-      final KeySelector endKeyExclusive) {
+      final KeySelector endKeyExclusive,
+      final byte[] readsSinceHeadAcknowledgedKey) {
 
     return new FoundationDbMessagePublisher(database,
         clock,
         beginKeyInclusive,
         endKeyExclusive,
         STREAM_ID_UNASSIGNED,
+        readsSinceHeadAcknowledgedKey,
         null,
         null,
         null,
@@ -198,6 +213,7 @@ class FoundationDbMessagePublisher {
       final KeySelector beginKeyInclusive,
       final KeySelector endKeyExclusive,
       final int streamId,
+      final byte[] readsSinceHeadAcknowledgedKey,
       final byte[] presenceKey,
       final ScheduledExecutorService presenceRenewalExecutorService,
       final byte[] messagesAvailableWatchKey) {
@@ -207,6 +223,7 @@ class FoundationDbMessagePublisher {
         beginKeyInclusive,
         endKeyExclusive,
         streamId,
+        readsSinceHeadAcknowledgedKey,
         presenceKey,
         presenceRenewalExecutorService,
         messagesAvailableWatchKey,
@@ -316,7 +333,22 @@ class FoundationDbMessagePublisher {
             // This is an unbounded publisher and we've established presence, so we should check for conflicts
             checkPresenceFuture = transaction.get(presenceKey)
                 .thenAccept(presenceValue -> {
+                  if (presenceValue == null) {
+                    // We wrote a presence key earlier, but now it is gone. Two possibilities:
+                    // 1. The queue was cleared by an account/device delete. We should eventually get a disconnection
+                    //    request so we should stay present until then.
+                    // 2. Someone else connected, wrote their own presence key, and then disconnected (nulling the key),
+                    //    without us ever noticing an update to messagesAvailableWatchKey. Though we briefly did
+                    //    conflict, we're not conflicting any more so we can continue.
+                    // In either case, we can try to re-establish our presence (unless we've already been disposed)
+                    if (!isTerminated()) {
+                      setPresence(transaction);
+                    }
+                    return;
+                  }
+
                   if (isPresenceContested(presenceValue)) {
+                    // Someone else established presence over us
                     throw new CompletionException(new ConflictingMessageConsumerException());
                   }
                 });
@@ -329,6 +361,18 @@ class FoundationDbMessagePublisher {
               .thenCombine(
                   transaction.getRange(beginKeyCursor, endKeyExclusive, maxMessages, false, StreamingMode.EXACT).asList(),
                   (_, keyValues) -> keyValues)
+              .thenCompose(keyValues -> {
+                if (!keyValues.isEmpty() && !hasEmittedEntry()) {
+                  // We're about to emit our first message; increment the "sent head of queue since last ACK" counter.
+                  // We want to do this in a separate transaction because doing it in the current transaction would
+                  // make it a read/write transaction, which introduces the possibility for conflicts since we're now
+                  // actually committing the transaction.
+                  return incrementReadsSinceLastAcknowledgedMessage()
+                      .thenApply(_ -> keyValues);
+                }
+
+                return CompletableFuture.completedFuture(keyValues);
+              })
               .thenApply(keyValues -> {
                 if (keyValues.size() < maxMessages && !terminateOnQueueEmpty) {
                   setWatch(transaction);
@@ -383,6 +427,10 @@ class FoundationDbMessagePublisher {
     return (int) Math.min(totalRequested - totalEmitted, Integer.MAX_VALUE);
   }
 
+  private synchronized boolean hasEmittedEntry() {
+    return totalEmitted > 0;
+  }
+
   /// Fetch and publish messages. Messages are fetched in batches to avoid excessive memory consumption. After each
   /// fetch operation, [#beginKeyCursor] is updated to the next key we need to start reading from. If the fetch
   /// operation returns fewer items than the batch size, we infer that we have fetched all available messages and
@@ -411,12 +459,26 @@ class FoundationDbMessagePublisher {
     return this.messagePublisher;
   }
 
+  private CompletableFuture<Void> incrementReadsSinceLastAcknowledgedMessage() {
+    return database.runAsync(transaction -> {
+      transaction.mutate(MutationType.ADD, readsSinceLastAcknowledgedMessageKey, ONE_LITTLE_ENDIAN);
+      return CompletableFuture.completedFuture(null);
+    }, FaultTolerantDatabase.Context.INCREMENT_READS_SINCE_LAST_ACKNOWLEDGED_MESSAGE);
+  }
+
   private synchronized void setWatch(final Transaction transaction) {
     assert messagesAvailableWatchKey != null;
-    if (state == State.TERMINATED || state == State.ERROR) {
+    if (isTerminated()) {
       // If we're already in a terminal state, we don't want to set a watch that would leak
       return;
     }
+
+    if (watchFuture != null && !watchFuture.isDone()) {
+      LOGGER.warn("Setting a watch before previous watch future is done");
+    }
+
+    cancelWatch();
+
     // Set a watch that will be triggered when new messages arrive. When it is triggered, we attempt to fetch messages
     // again (if there is demand). When we run out of messages, this method will be called again, setting another watch,
     // and so on, thus achieving a "watch for new messages -> read -> publish" loop.
@@ -451,7 +513,9 @@ class FoundationDbMessagePublisher {
     final ScheduledFuture<?> scheduledFuture = presenceRenewalExecutorService.schedule(() -> {
       renewPresence().whenComplete((_, throwable) -> {
         if (throwable != null) {
-          LOGGER.warn("Failed to renew presence", throwable);
+          if (!ExceptionUtils.isBreakerOpen(throwable)) {
+            LOGGER.warn("Failed to renew presence", throwable);
+          }
           renewPresenceFuture.completeExceptionally(throwable);
         } else {
           renewPresenceFuture.complete(null);
@@ -481,14 +545,18 @@ class FoundationDbMessagePublisher {
   }
 
   private synchronized CompletableFuture<Void> renewPresence() {
-    if (state == State.TERMINATED || state == State.ERROR) {
+    if (isTerminated()) {
       return CompletableFuture.failedFuture(new IllegalStateException("Publisher already terminated"));
     }
 
     return database.runAsync(transaction -> {
-      transaction.set(presenceKey, FoundationDbMessageStore.getPresenceValue(clock.instant(), streamId));
+      setPresence(transaction);
       return CompletableFuture.completedFuture(null);
     }, FaultTolerantDatabase.Context.SET_PRESENCE);
+  }
+
+  private void setPresence(final Transaction transaction) {
+    transaction.set(presenceKey, FoundationDbMessageStore.getPresenceValue(clock.instant(), streamId));
   }
 
   @VisibleForTesting
@@ -498,31 +566,34 @@ class FoundationDbMessagePublisher {
 
       renewPresenceFuture.whenComplete((_, _) ->
           database.runAsync(transaction -> transaction.get(presenceKey).thenAccept(presenceValue -> {
-                if (!isPresenceContested(presenceValue)) {
+                if (presenceValue == null || !isPresenceContested(presenceValue)) {
+                  // Note: we still try to set the value to null even if it is already null. This way we would still
+                  // cause a FoundationDB transaction conflict with a concurrent presence renewal that was updating
+                  // from null to something else.
                   transaction.clear(presenceKey);
                 }
               }), FaultTolerantDatabase.Context.CLEAR_PRESENCE)
               .whenComplete((_, throwable) -> {
-                if (throwable != null) {
+                if (throwable != null && !ExceptionUtils.isBreakerOpen(throwable)) {
                   LOGGER.warn("Failed to clear presence on disposal", throwable);
                 }
               }));
     }
   }
 
+  /// @return true if a publisher other than us has claimed presence
   private boolean isPresenceContested(final byte[] presenceValue) {
-    if (presenceValue == null) {
-      // Some other process has cleared our presence key, so we must assume a conflict somewhere
-      return true;
-    }
-
     return streamId != FoundationDbMessageStore.getPresenceStreamId(presenceValue) ||
         !Arrays.equals(FoundationDbMessageStore.getPresenceServerId(presenceValue), FoundationDbMessageStore.getServerId());
   }
 
+  private synchronized boolean isTerminated() {
+    return state == State.TERMINATED || state == State.ERROR;
+  }
+
   @VisibleForTesting
   synchronized void terminateWithError(final Throwable throwable) {
-    if (state != State.TERMINATED && state != State.ERROR && !emitter.isCancelled()) {
+    if (!isTerminated() && !emitter.isCancelled()) {
       setState(State.ERROR, Event.INTERNAL_TRIGGER);
       emitter.error(throwable);
     }
@@ -531,7 +602,7 @@ class FoundationDbMessagePublisher {
   private synchronized void onDispose() {
     // Unless the state machine is an already terminal state, directly set state to "terminated", since there's no point
     // in evaluating the state machine when there's no live subscription.
-    if (state != State.TERMINATED && state != State.ERROR) {
+    if (!isTerminated()) {
       setState(State.TERMINATED, Event.INTERNAL_TRIGGER);
     }
     cancelWatch();

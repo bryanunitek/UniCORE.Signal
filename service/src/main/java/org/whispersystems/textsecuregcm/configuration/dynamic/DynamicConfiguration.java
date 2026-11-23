@@ -43,11 +43,11 @@ public class DynamicConfiguration {
 
   @JsonProperty
   @Valid
-  DynamicMessagePersisterConfiguration messagePersister = new DynamicMessagePersisterConfiguration();
+  DynamicMessageDeliveryConfiguration messageDelivery = new DynamicMessageDeliveryConfiguration();
 
   @JsonProperty
   @Valid
-  DynamicMessageDeliveryConfiguration messageDelivery = new DynamicMessageDeliveryConfiguration();
+  DynamicNotificationConfiguration notifications = DynamicNotificationConfiguration.DEFAULT;
 
   @JsonProperty
   @Valid
@@ -76,6 +76,10 @@ public class DynamicConfiguration {
   @JsonProperty
   @Valid
   private DynamicGrpcAllowListConfiguration grpcAllowList = new DynamicGrpcAllowListConfiguration();
+
+  @JsonProperty
+  @Valid
+  private DynamicGrpcCompressionConfiguration grpcCompression = new DynamicGrpcCompressionConfiguration();
 
   @JsonProperty
   @Valid
@@ -115,12 +119,12 @@ public class DynamicConfiguration {
     return captcha;
   }
 
-  public DynamicMessagePersisterConfiguration getMessagePersisterConfiguration() {
-    return messagePersister;
-  }
-
   public DynamicMessageDeliveryConfiguration getMessageDeliveryConfiguration() {
     return messageDelivery;
+  }
+
+  public DynamicNotificationConfiguration getNotificationConfiguration() {
+    return notifications;
   }
 
   public DynamicRegistrationConfiguration getRegistrationConfiguration() {
@@ -149,6 +153,10 @@ public class DynamicConfiguration {
 
   public DynamicGrpcAllowListConfiguration getGrpcAllowList() {
     return grpcAllowList;
+  }
+
+  public DynamicGrpcCompressionConfiguration getGrpcCompression() {
+    return grpcCompression;
   }
 
   public DynamicOmnibusConfiguration getOmnibus() {

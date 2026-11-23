@@ -134,8 +134,6 @@ dynamoDbTables:
     tableName: Example_ProfilesV2
   pushChallenge:
     tableName: Example_PushChallenge
-  pushNotificationExperimentSamples:
-    tableName: Example_PushNotificationExperimentSamples
   redeemedReceipts:
     tableName: Example_RedeemedReceipts
   registrationRecovery:
@@ -145,6 +143,8 @@ dynamoDbTables:
     tableName: Example_RemoteConfig
   reportMessage:
     tableName: Example_ReportMessage
+  sandboxAccounts:
+    tableName: Example_SandboxAccounts
   scheduledJobs:
     tableName: Example_ScheduledJobs
     expiration: P7D
@@ -230,11 +230,6 @@ svrb:
       AAAAAAAAAAAAAAAAAAAA
       -----END CERTIFICATE-----
 
-messageCache: # Redis server configuration for message store cache
-  persistDelayMinutes: 1
-  cluster:
-    configurationUri: redis://redis.example.com:6379/
-
 attachments:
   maxAttachmentUploadSizeInBytes: 1024
   maxMessageBackupUploadSizeInBytes: 1024
@@ -260,7 +255,8 @@ fcm: # FCM configuration
   credentials: secret://fcm.credentials
 
 cdn:
-  bucket: cdn        # S3 Bucket name
+  baseUrl: https://cdn.example.com  # Public base URL for objects in the bucket
+  bucket: cdn  # S3 Bucket name
   credentials:
     accessKeyId: secret://cdn.accessKey
     secretAccessKey: secret://cdn.accessSecret

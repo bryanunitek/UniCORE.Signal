@@ -55,6 +55,7 @@ import org.whispersystems.textsecuregcm.entities.ApnRegistrationId;
 import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.GcmRegistrationId;
 import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClient;
 import org.whispersystems.textsecuregcm.redis.RedisClusterExtension;
 import org.whispersystems.textsecuregcm.securestorage.SecureStorageClient;
@@ -171,6 +172,7 @@ public class AccountCreationDeletionIntegrationTest {
         svr2Client,
         disconnectionRequestManager,
         phoneNumberRecoveryPasswordsManager,
+        mock(SandboxAccounts.class),
         executor,
         executor,
         CLOCK,
@@ -310,7 +312,7 @@ public class AccountCreationDeletionIntegrationTest {
 
     final Account account = accountsManager.create(accountAttributes,
         new IdentityKey(aciKeyPair.getPublicKey()),
-        receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), 1),
+        receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()),
         new DeviceSpec(
             deviceName,
             password,
@@ -538,7 +540,7 @@ public class AccountCreationDeletionIntegrationTest {
           : accountsManager.create(new AccountAttributes(true, 1, null, "name".getBytes(StandardCharsets.UTF_8), null, false, Set.of(),
               originalRecoveryPassword),
               new IdentityKey(aciKeyPair.getPublicKey()),
-              receiptPresentation(receiptSerial, CLOCK.instant().plus(Duration.ofDays(30)), 1),
+              receiptPresentation(receiptSerial, CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()),
               new DeviceSpec(null,
                   "password?",
                   "OWI",
@@ -684,7 +686,7 @@ public class AccountCreationDeletionIntegrationTest {
     } else {
       account = accountsManager.create(accountAttributes,
           new IdentityKey(aciKeyPair.getPublicKey()),
-          receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), 1),
+          receiptPresentation(CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()),
           new DeviceSpec(
               deviceName,
               password,
@@ -734,7 +736,7 @@ public class AccountCreationDeletionIntegrationTest {
           new AccountAttributes(true, 1, null, "name".getBytes(StandardCharsets.UTF_8), null, false, Set.of(), null)
               .setRecoveryPassword(recoveryPassword),
           aciIdentityKey,
-          receiptPresentation(receiptSerial, CLOCK.instant().plus(Duration.ofDays(30)), 1),
+          receiptPresentation(receiptSerial, CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()),
           new DeviceSpec(null,
               password,
               "OWI",
@@ -777,7 +779,7 @@ public class AccountCreationDeletionIntegrationTest {
 
     final Account retriedAccount = accountsManager.create(accountAttributes,
         aciIdentityKey,
-        receiptPresentation(receiptSerial,  CLOCK.instant().plus(Duration.ofDays(30)), 1),
+        receiptPresentation(receiptSerial,  CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()),
         new DeviceSpec(deviceName,
             password,
             signalAgent,
@@ -831,7 +833,7 @@ public class AccountCreationDeletionIntegrationTest {
     final Account existingAccount = accountsManager.create(
         new AccountAttributes(true, 1, null, "name".getBytes(StandardCharsets.UTF_8), null, false, Set.of(), recoveryPassword),
         aciIdentityKey,
-        receiptPresentation(receiptSerial, CLOCK.instant().plus(Duration.ofDays(30)), 1),
+        receiptPresentation(receiptSerial, CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()),
         new DeviceSpec(null,
             password,
             "OWI",
@@ -849,7 +851,7 @@ public class AccountCreationDeletionIntegrationTest {
         // Using a different account recovery password should throw an exception
         new AccountAttributes(true, 1, null, "name".getBytes(StandardCharsets.UTF_8), null, false, Set.of(), TestRandomUtil.nextBytes(16)),
         aciIdentityKey,
-        receiptPresentation(receiptSerial, CLOCK.instant().plus(Duration.ofDays(30)), 1),
+        receiptPresentation(receiptSerial, CLOCK.instant().plus(Duration.ofDays(30)), ReceiptLevel.LOGIN.getValue()),
         new DeviceSpec(null,
             password,
             "OWI",

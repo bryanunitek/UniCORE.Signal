@@ -7,6 +7,7 @@ package org.whispersystems.textsecuregcm.grpc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyByte;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -20,7 +21,9 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import io.grpc.Status;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
@@ -38,7 +41,6 @@ import org.whispersystems.textsecuregcm.auth.DisconnectionRequestManager;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
@@ -51,6 +53,7 @@ import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.MessageStream;
 import org.whispersystems.textsecuregcm.storage.MessageStreamEntry;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
+import org.whispersystems.textsecuregcm.util.TestClock;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import reactor.adapter.JdkFlowAdapter;
 import reactor.core.publisher.Flux;
@@ -59,13 +62,13 @@ import reactor.test.publisher.TestPublisher;
 
 class MessageDispatcherTest {
 
-  private static final GetMessagesResponse QUEUE_EMPTY =
-      GetMessagesResponse.newBuilder().setQueueEmpty(Empty.getDefaultInstance()).build();
-
   private static final UUID ACI = UUID.randomUUID();
   private static final byte DEVICE_ID = 2;
   private static final int SOURCE_DEVICE_ID = 1;
   private static final String TEST_UA = "test-user-agent";
+  private static final Clock CLOCK = TestClock.pinned(Instant.now());
+  private static final GetMessagesResponse QUEUE_EMPTY =
+      GetMessagesResponse.newBuilder().setQueueEmpty(Empty.getDefaultInstance()).setServerTimeEpochMillis(CLOCK.millis()).build();
 
   private Account account;
   private Device device;
@@ -92,6 +95,9 @@ class MessageDispatcherTest {
     when(device.getId()).thenReturn(DEVICE_ID);
     when(device.isPrimary()).thenReturn(true);
 
+    when(messagesManager.hasSuspectedDeliveryLoop(any(), anyByte()))
+        .thenReturn(CompletableFuture.completedFuture(false));
+
     dispatcher = new MessageDispatcher(
         receiptSender,
         messagesManager,
@@ -99,7 +105,8 @@ class MessageDispatcherTest {
         pushNotificationManager,
         pushNotificationScheduler,
         disconnectionRequestManager,
-        mock(ClientReleaseManager.class));
+        mock(ClientReleaseManager.class),
+        CLOCK);
   }
 
   @ParameterizedTest
@@ -119,7 +126,7 @@ class MessageDispatcherTest {
         CompletableFuture.completedFuture(mayHaveMoreMessages));
 
     StepVerifier.create(responses)
-        .expectNext(GetMessagesResponse.newBuilder().setEnvelope(expectedEnvelope).build())
+        .expectNext(GetMessagesResponse.newBuilder().setEnvelope(expectedEnvelope).setServerTimeEpochMillis(CLOCK.millis()).build())
         .then(() -> verify(disconnectionRequestManager).addListener(eq(ACI), eq(DEVICE_ID), any()))
         .thenCancel()
         .verify(Duration.ofSeconds(5));
@@ -137,14 +144,14 @@ class MessageDispatcherTest {
     final AciServiceIdentifier sourceServiceId = new AciServiceIdentifier(UUID.randomUUID());
 
     final List<Envelope> messages = IntStream
-        .range(0, MessageDispatcher.MAX_UNACKED_MESSAGES + 2)
+        .range(0, MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES + 2)
         .mapToObj(i -> createMessage(sourceServiceId, ACI, i, "hello"))
         .toList();
     final List<UUID> guids = messages.stream().map(Envelope::getServerGuid).map(UUIDUtil::fromByteString).toList();
     final List<Long> timestamps = messages.stream().map(Envelope::getServerTimestamp).toList();
     final List<GetMessagesResponse> expectedMessages = messages.stream()
         .map(e -> e.toBuilder().clearEphemeral().build())
-        .map(e -> GetMessagesResponse.newBuilder().setEnvelope(e).build())
+        .map(e -> GetMessagesResponse.newBuilder().setEnvelope(e).setServerTimeEpochMillis(CLOCK.millis()).build())
         .toList();
 
     final MessageStream messageStream = mockMessages(messages);
@@ -155,18 +162,18 @@ class MessageDispatcherTest {
         dispatcher.getMessages(true, TEST_UA, account, device, acks.flux());
 
     StepVerifier.create(responses)
-        .expectNext(expectedMessages.subList(0, MessageDispatcher.MAX_UNACKED_MESSAGES).toArray(GetMessagesResponse[]::new))
+        .expectNext(expectedMessages.subList(0, MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES).toArray(GetMessagesResponse[]::new))
         .expectNoEvent(Duration.ofMillis(1))
 
         // Sending an ack should allow another message to come back
         .then(() -> acks.next(guids.get(0)))
-        .expectNext(expectedMessages.get(MessageDispatcher.MAX_UNACKED_MESSAGES))
+        .expectNext(expectedMessages.get(MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES))
         .then(() -> verify(messageStream, times(1)).acknowledgeMessage(guids.get(0), timestamps.get(0)))
         .expectNoEvent(Duration.ofMillis(1))
 
         // Send another one
         .then(() -> acks.next(guids.get(1)))
-        .expectNext(expectedMessages.get(MessageDispatcher.MAX_UNACKED_MESSAGES + 1))
+        .expectNext(expectedMessages.get(MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES + 1))
         .then(() -> verify(messageStream, times(1)).acknowledgeMessage(guids.get(1), timestamps.get(1)))
         .expectNoEvent(Duration.ofMillis(1))
 
@@ -184,7 +191,7 @@ class MessageDispatcherTest {
   void maxOutstandingAllowsGaps() {
     final AciServiceIdentifier sourceServiceId = new AciServiceIdentifier(UUID.randomUUID());
 
-    final int totalMessages = MessageDispatcher.MAX_UNACKED_MESSAGES  * 2;
+    final int totalMessages = MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES * 2;
 
     final List<Envelope> messages = IntStream
         .range(0, totalMessages)
@@ -195,7 +202,7 @@ class MessageDispatcherTest {
         .toList();
     final List<GetMessagesResponse> expectedMessages = messages.stream()
         .map(e -> e.toBuilder().clearEphemeral().build())
-        .map(e -> GetMessagesResponse.newBuilder().setEnvelope(e).build())
+        .map(e -> GetMessagesResponse.newBuilder().setEnvelope(e).setServerTimeEpochMillis(CLOCK.millis()).build())
         .toList();
 
     mockMessages(messages);
@@ -205,22 +212,22 @@ class MessageDispatcherTest {
         dispatcher.getMessages(true, TEST_UA, account, device, acks.flux());
 
     StepVerifier.create(responses)
-        .expectNext(expectedMessages.subList(0, MessageDispatcher.MAX_UNACKED_MESSAGES).toArray(GetMessagesResponse[]::new))
+        .expectNext(expectedMessages.subList(0, MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES).toArray(GetMessagesResponse[]::new))
         .expectNoEvent(Duration.ofMillis(1))
         .then(() -> {
-          for (int i = 0; i < MessageDispatcher.MAX_UNACKED_MESSAGES; i++) {
+          for (int i = 0; i < MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES; i++) {
             if (i != 2) {
               acks.next(ackRequests.get(i));
             }
           }
         })
-        .expectNext(expectedMessages.subList(MessageDispatcher.MAX_UNACKED_MESSAGES, totalMessages - 1).toArray(GetMessagesResponse[]::new))
+        .expectNext(expectedMessages.subList(MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES, totalMessages - 1).toArray(GetMessagesResponse[]::new))
         .expectNoEvent(Duration.ofMillis(1))
         .then(() -> acks.next(ackRequests.get(2)))
         .expectNext(expectedMessages.get(totalMessages - 1))
         .expectNoEvent(Duration.ofMillis(1))
         .then(() -> {
-          for (int i = MessageDispatcher.MAX_UNACKED_MESSAGES; i < totalMessages; i++) {
+          for (int i = MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES; i < totalMessages; i++) {
             acks.next(ackRequests.get(i));
           }
         })
@@ -233,7 +240,7 @@ class MessageDispatcherTest {
   void duplicateAckIgnored() {
     final AciServiceIdentifier sourceServiceId = new AciServiceIdentifier(UUID.randomUUID());
     final List<Envelope> messages = IntStream
-        .range(0, MessageDispatcher.MAX_UNACKED_MESSAGES + 2)
+        .range(0, MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES + 2)
         .mapToObj(i -> createMessage(sourceServiceId, ACI, i, "hello"))
         .toList();
 
@@ -246,7 +253,7 @@ class MessageDispatcherTest {
 
     StepVerifier
         .create(dispatcher.getMessages(true, TEST_UA, account, device, acks.flux()))
-        .expectNextCount(MessageDispatcher.MAX_UNACKED_MESSAGES)
+        .expectNextCount(MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES)
         .expectNoEvent(Duration.ofMillis(1))
 
         // Ack a message, we should then get a new message
@@ -277,7 +284,7 @@ class MessageDispatcherTest {
         dispatcher.getMessages(true, TEST_UA, account, device, Flux.never());
     ArgumentCaptor<DisconnectionRequestListener> listener = ArgumentCaptor.forClass(DisconnectionRequestListener.class);
     StepVerifier.create(responses)
-        .expectNext(GetMessagesResponse.newBuilder().setEnvelope(expectedEnvelope).build())
+        .expectNext(GetMessagesResponse.newBuilder().setEnvelope(expectedEnvelope).setServerTimeEpochMillis(CLOCK.millis()).build())
         .then(() -> {
           verify(disconnectionRequestManager).addListener(eq(ACI), eq(DEVICE_ID), listener.capture());
           listener.getValue().handleDisconnectionRequest();
@@ -309,7 +316,7 @@ class MessageDispatcherTest {
   void conflictingConsumerWhileWaitingForAcks() {
     final AciServiceIdentifier sourceServiceId = new AciServiceIdentifier(UUID.randomUUID());
     final List<MessageStreamEntry.Envelope> messages = IntStream
-        .range(0, MessageDispatcher.MAX_UNACKED_MESSAGES + 2)
+        .range(0, MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES + 2)
         .mapToObj(i -> createMessage(sourceServiceId, ACI, i, "hello"))
         .map(MessageStreamEntry.Envelope::new)
         .toList();
@@ -320,7 +327,7 @@ class MessageDispatcherTest {
     StepVerifier
         .create(dispatcher.getMessages(true, TEST_UA, account, device, Flux.never()))
         .then(() -> messages.forEach(source::next))
-        .expectNextCount(MessageDispatcher.MAX_UNACKED_MESSAGES)
+        .expectNextCount(MessageDispatcher.DEFAULT_MAX_UNACKED_MESSAGES)
         .expectNoEvent(Duration.ofMillis(1))
         // The error should make it to us immediately even though there are max-unacked messages outstanding
         .then(() -> source.error(new ConflictingMessageConsumerException()))

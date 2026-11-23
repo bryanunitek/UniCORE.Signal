@@ -41,13 +41,13 @@ import org.mockito.Mock;
 import org.signal.chat.errors.FailedUnidentifiedAuthorization;
 import org.signal.chat.messages.ChallengeRequired;
 import org.signal.chat.messages.IndividualRecipientMessageBundle;
-import org.signal.chat.messages.SendMessageType;
 import org.signal.chat.messages.MessagesAnonymousGrpc;
 import org.signal.chat.messages.MismatchedDevices;
 import org.signal.chat.messages.MultiRecipientMessage;
 import org.signal.chat.messages.MultiRecipientMismatchedDevices;
 import org.signal.chat.messages.MultiRecipientSuccess;
 import org.signal.chat.messages.SendMessageResponse;
+import org.signal.chat.messages.SendMessageType;
 import org.signal.chat.messages.SendMultiRecipientMessageRequest;
 import org.signal.chat.messages.SendMultiRecipientMessageResponse;
 import org.signal.chat.messages.SendMultiRecipientStoryRequest;
@@ -60,7 +60,6 @@ import org.whispersystems.textsecuregcm.controllers.MultiRecipientMismatchedDevi
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.CardinalityEstimator;
@@ -251,7 +250,7 @@ class MessagesAnonymousGrpcServiceTest extends
               generateRequest(serviceIdentifier, false, true, messages, UNIDENTIFIED_ACCESS_KEY, null)));
       verifyNoInteractions(messageSender);
     }
-    
+
     @CartesianTest
     void sendUnrestrictedAccessMessage(
         @CartesianTest.Values(booleans = {true, false}) final boolean useUak,
@@ -390,8 +389,9 @@ class MessagesAnonymousGrpcServiceTest extends
       verify(messageSender, never()).sendMessages(any(), any(), any(), any(), any(), any());
     }
 
-    @Test
-    void pniIdentifierWithUak() {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void pniIdentifierWithoutGroupSendToken(final boolean useUak) {
       final byte deviceId = Device.PRIMARY_ID;
       final int registrationId = 7;
       final Device destinationDevice = DevicesHelper.createDevice(deviceId, CLOCK.millis(), registrationId);
@@ -399,6 +399,7 @@ class MessagesAnonymousGrpcServiceTest extends
       final Account destinationAccount = mock(Account.class);
       when(destinationAccount.getDevices()).thenReturn(List.of(destinationDevice));
       when(destinationAccount.getDevice(deviceId)).thenReturn(Optional.of(destinationDevice));
+      when(destinationAccount.isUnrestrictedUnidentifiedAccess()).thenReturn(true);
       when(destinationAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
 
       final PniServiceIdentifier pniIdentifier = new PniServiceIdentifier(UUID.randomUUID());
@@ -411,11 +412,57 @@ class MessagesAnonymousGrpcServiceTest extends
               .build());
 
       final SendSealedSenderMessageRequest request =
-          generateRequest(pniIdentifier, false, true, messages, UNIDENTIFIED_ACCESS_KEY, null);
+          generateRequest(pniIdentifier, false, true, messages, useUak ? UNIDENTIFIED_ACCESS_KEY : null, null);
 
       GrpcTestUtils.assertStatusException(
           Status.INVALID_ARGUMENT,
           () -> unauthenticatedServiceStub().sendSingleRecipientMessage(request));
+      verifyNoInteractions(messageSender);
+    }
+
+    @Test
+    void pniIdentifierWithGroupSendToken()
+        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException {
+      final byte deviceId = Device.PRIMARY_ID;
+      final int registrationId = 7;
+      final Device destinationDevice = DevicesHelper.createDevice(deviceId, CLOCK.millis(), registrationId);
+
+      final Account destinationAccount = mock(Account.class);
+      when(destinationAccount.getDevices()).thenReturn(List.of(destinationDevice));
+      when(destinationAccount.getDevice(deviceId)).thenReturn(Optional.of(destinationDevice));
+
+      final PniServiceIdentifier pniIdentifier = new PniServiceIdentifier(UUID.randomUUID());
+      when(accountsManager.getByServiceIdentifier(pniIdentifier)).thenReturn(Optional.of(destinationAccount));
+
+      final byte[] payload = TestRandomUtil.nextBytes(128);
+      final Map<Byte, IndividualRecipientMessageBundle.Message> messages =
+          Map.of(deviceId, IndividualRecipientMessageBundle.Message.newBuilder()
+              .setRegistrationId(registrationId)
+              .setPayload(ByteString.copyFrom(payload))
+              .setType(SendMessageType.UNIDENTIFIED_SENDER)
+              .build());
+
+      final SendMessageResponse response = unauthenticatedServiceStub().sendSingleRecipientMessage(
+          generateRequest(pniIdentifier, false, true, messages, null, GROUP_SEND_TOKEN));
+
+      assertEquals(SendMessageResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build(), response);
+
+      final MessageProtos.Envelope expectedEnvelope = MessageProtos.Envelope.newBuilder()
+          .setType(MessageProtos.Envelope.Type.UNIDENTIFIED_SENDER)
+          .setDestinationServiceId(pniIdentifier.toCompactByteString())
+          .setClientTimestamp(CLOCK.millis())
+          .setServerTimestamp(CLOCK.millis())
+          .setEphemeral(false)
+          .setUrgent(true)
+          .setContent(ByteString.copyFrom(payload))
+          .build();
+
+      verify(messageSender).sendMessages(destinationAccount,
+          pniIdentifier,
+          Map.of(deviceId, expectedEnvelope),
+          Map.of(deviceId, registrationId),
+          Optional.empty(),
+          null);
     }
 
     @Test
@@ -1462,6 +1509,38 @@ class MessagesAnonymousGrpcServiceTest extends
                   .build())
               .setUrgent(true)
               .build()));
+
+      verify(messageSender, never())
+          .sendMultiRecipientMessage(any(), any(), anyLong(), anyBoolean(), anyBoolean(), anyBoolean(), any());
+    }
+
+    @Test
+    void rateLimited()
+        throws MessageTooLargeException, MessageDeliveryNotAllowedException, MultiRecipientMismatchedDevicesException {
+
+      final AciServiceIdentifier serviceIdentifier = new AciServiceIdentifier(UUID.randomUUID());
+      final Account destinationAccount = mock(Account.class);
+      when(destinationAccount.getAccountIdentifier()).thenReturn(serviceIdentifier.uuid());
+
+      when(accountsManager.getByServiceIdentifierAsync(serviceIdentifier))
+          .thenReturn(CompletableFuture.completedFuture(Optional.of(destinationAccount)));
+
+      final byte[] payload = MultiRecipientMessageHelper.generateMultiRecipientMessage(List.of(
+          new TestRecipient(serviceIdentifier, Device.PRIMARY_ID, 17, new byte[48])));
+
+      final SendMultiRecipientStoryRequest request = SendMultiRecipientStoryRequest.newBuilder()
+          .setMessage(MultiRecipientMessage.newBuilder()
+              .setTimestamp(CLOCK.millis())
+              .setPayload(ByteString.copyFrom(payload))
+              .build())
+          .setUrgent(true)
+          .build();
+
+      final Duration retryDuration = Duration.ofHours(7);
+      when(rateLimiter.validateAsync(any(UUID.class)))
+          .thenReturn(CompletableFuture.failedFuture(new RateLimitExceededException(retryDuration)));
+
+      GrpcTestUtils.assertRateLimitExceeded(retryDuration, () -> unauthenticatedServiceStub().sendMultiRecipientStory(request));
 
       verify(messageSender, never())
           .sendMultiRecipientMessage(any(), any(), anyLong(), anyBoolean(), anyBoolean(), anyBoolean(), any());

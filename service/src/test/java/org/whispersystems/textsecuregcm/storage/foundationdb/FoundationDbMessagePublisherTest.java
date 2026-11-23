@@ -130,6 +130,7 @@ class FoundationDbMessagePublisherTest {
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.end),
         STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         null,
         null,
         null,
@@ -207,6 +208,7 @@ class FoundationDbMessagePublisherTest {
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(new byte[]{(byte) 10}),
         STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         presenceRenewalExecutorService,
         MESSAGES_AVAILABLE_WATCH_KEY,
@@ -231,7 +233,7 @@ class FoundationDbMessagePublisherTest {
         .expectNext(getExpectedMessageStreamEntry(keyValue1))
         .expectNext(getExpectedMessageStreamEntry(keyValue2))
         .expectNext(getExpectedMessageStreamEntry(keyValue3))
-        .verifyTimeout(Duration.ofSeconds(1));
+        .verifyTimeout(Duration.ofMillis(100));
 
     assertEquals(List.of(
             FoundationDbMessagePublisher.State.FETCHING_MESSAGES, // Batch 1
@@ -297,6 +299,7 @@ class FoundationDbMessagePublisherTest {
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(new byte[]{(byte) 10}),
         STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         presenceRenewalExecutorService,
         MESSAGES_AVAILABLE_WATCH_KEY,
@@ -351,6 +354,7 @@ class FoundationDbMessagePublisherTest {
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(new byte[]{(byte) 10}),
         STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         presenceRenewalExecutorService,
         MESSAGES_AVAILABLE_WATCH_KEY,
@@ -372,7 +376,7 @@ class FoundationDbMessagePublisherTest {
     StepVerifier.create(infinitePublisher.getMessages())
         .expectNext(getExpectedMessageStreamEntry(keyValue1))
         .expectNext(getExpectedMessageStreamEntry(keyValue2))
-        .verifyTimeout(Duration.ofSeconds(1));
+        .verifyTimeout(Duration.ofMillis(100));
 
     assertEquals(List.of(
             FoundationDbMessagePublisher.State.FETCHING_MESSAGES, // Batch 1
@@ -399,6 +403,7 @@ class FoundationDbMessagePublisherTest {
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterThan(SUBSPACE_RANGE.end),
         STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         presenceRenewalExecutorService,
         MESSAGES_AVAILABLE_WATCH_KEY);
@@ -461,6 +466,7 @@ class FoundationDbMessagePublisherTest {
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(new byte[]{(byte) 10}),
         STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         presenceRenewalExecutorService,
         MESSAGES_AVAILABLE_WATCH_KEY,
@@ -527,6 +533,7 @@ class FoundationDbMessagePublisherTest {
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.end),
         STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         null,
         null,
         null,
@@ -585,6 +592,7 @@ class FoundationDbMessagePublisherTest {
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.end),
         STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         presenceRenewalExecutorService,
         MESSAGES_AVAILABLE_WATCH_KEY,

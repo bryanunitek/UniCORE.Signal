@@ -71,6 +71,7 @@ import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialPresentation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.DisconnectionRequestManager;
+import org.whispersystems.textsecuregcm.auth.SaltedTokenHash;
 import org.whispersystems.textsecuregcm.auth.webauthn.AuthenticationCeremonyParameters;
 import org.whispersystems.textsecuregcm.auth.webauthn.RegistrationCeremonyParameters;
 import org.whispersystems.textsecuregcm.auth.webauthn.RegistrationCeremonyResult;
@@ -86,6 +87,7 @@ import org.whispersystems.textsecuregcm.entities.TransferArchiveResult;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantPubSubConnection;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClient;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
@@ -127,6 +129,8 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       name(AccountsManager.class, "registrationIdRedisKeyCounter");
   private static final String CREATE_TIMER_NAME = name(AccountsManager.class, "create");
   private static final String HAS_NUMBER_TAG_NAME = "hasNumber";
+  private static final String SANDBOX_POOL_EXHAUSTED_COUNTER_NAME =
+      name(AccountsManager.class, "sandboxAccountPoolExhausted");
 
   private static final String RETRY_NAME = ResilienceUtil.name(AccountsManager.class);
 
@@ -147,6 +151,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private final SecureValueRecoveryClient secureValueRecovery2Client;
   private final DisconnectionRequestManager disconnectionRequestManager;
   private final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager;
+  private final SandboxAccounts sandboxAccounts;
   private final ScheduledExecutorService messagesPollExecutor;
   private final ScheduledExecutorService retryExecutor;
   private final Clock clock;
@@ -196,6 +201,8 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private static final Duration USERNAME_HASH_RESERVATION_TTL_MINUTES = Duration.ofMinutes(5);
 
   private static final int MAX_UPDATE_ATTEMPTS = 10;
+
+  public static final int MAX_DEVICES = 6;
 
   private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
@@ -287,6 +294,10 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private static class UncheckedWebAuthnMismatchException extends NoStackTraceRuntimeException {
   }
 
+  private sealed interface CreationDetails permits NumberDetails, NumberlessDetails {}
+  private record NumberDetails(boolean recentlyDeleted, String e164, UUID pni, IdentityKey pniIdentityKey) implements CreationDetails {}
+  private record NumberlessDetails(ReceiptCredentialPresentation receiptCredentialPresentation, byte[] authCredentialSalt) implements CreationDetails {}
+
   public AccountsManager(final Accounts accounts,
       final PhoneNumberIdentifiers phoneNumberIdentifiers,
       final FaultTolerantRedisClusterClient cacheCluster,
@@ -300,6 +311,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final SecureValueRecoveryClient secureValueRecovery2Client,
       final DisconnectionRequestManager disconnectionRequestManager,
       final PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager,
+      final SandboxAccounts sandboxAccounts,
       final ScheduledExecutorService messagesPollExecutor,
       final ScheduledExecutorService retryExecutor,
       final Clock clock,
@@ -319,6 +331,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     this.secureValueRecovery2Client = secureValueRecovery2Client;
     this.disconnectionRequestManager = disconnectionRequestManager;
     this.phoneNumberRecoveryPasswordsManager = requireNonNull(phoneNumberRecoveryPasswordsManager);
+    this.sandboxAccounts = requireNonNull(sandboxAccounts);
     this.messagesPollExecutor = messagesPollExecutor;
     this.retryExecutor = retryExecutor;
     this.clock = requireNonNull(clock);
@@ -392,16 +405,32 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
             () -> new IllegalArgumentException("recovery password is required for accounts without phone numbers"));
 
     // This salt is required for generating PNI-based auth credentials (e.g. group credentials) for accounts without a number
-    final byte[] authCredentialSalt = new byte[AUTH_CREDENTIAL_SALT_SIZE];
-    SECURE_RANDOM.nextBytes(authCredentialSalt);
+    final byte[] authCredentialSalt = generateAuthCredentialSalt();
 
     // We ignore this property on accounts without a number anyway, but ensure that it is false for consistency
     accountAttributes.setDiscoverableByPhoneNumber(false);
 
-    final Timer.Sample sample = Timer.start();
+    final ReceiptLevel receiptLevel = ReceiptLevel.lookupLevel(receiptCredentialPresentation.getReceiptLevel())
+        .orElseThrow(() -> new IllegalStateException("Invalid receipt level"));
 
+    final NumberlessDetails numberlessDetails = new NumberlessDetails(receiptCredentialPresentation, authCredentialSalt);
+
+    final Timer.Sample sample = Timer.start();
     try {
-      return create(Optional.empty(), Optional.empty(), Optional.of(receiptCredentialPresentation), Optional.of(authCredentialSalt), accountAttributes, aciIdentityKey, Optional.empty(), primaryDeviceSpec, userAgent);
+      return switch (receiptLevel) {
+        case LOGIN -> {
+          final UUID aci = UUID.randomUUID();
+          final List<TransactWriteItem> additionalWriteItems = keysWriteItems(aci, Optional.empty(), primaryDeviceSpec);
+          yield create(aci, numberlessDetails, accountAttributes, aciIdentityKey, primaryDeviceSpec, additionalWriteItems, userAgent);
+        }
+        case LOGIN_SANDBOX ->
+            createSandboxAccount(accountAttributes, aciIdentityKey, primaryDeviceSpec, numberlessDetails, userAgent);
+        default -> throw new IllegalStateException(
+            "Invalid receipt level: " + receiptCredentialPresentation.getReceiptLevel());
+      };
+    } catch (final AccountCreationConditionException e) {
+      logger.error("Unexpected condition exception while creating account", e);
+      throw new IllegalStateException(e);
     } catch (final RuntimeException e) {
       logger.error("Unexpected exception while creating account", e);
       throw e;
@@ -427,49 +456,87 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final DeviceSpec primaryDeviceSpec,
       @Nullable final String userAgent) {
 
-    final UUID pni = phoneNumberIdentifiers.getPhoneNumberIdentifier(number).join();
+    final Timer.Sample sample = Timer.start();
+    try {
+      final UUID pni = phoneNumberIdentifiers.getPhoneNumberIdentifier(number).join();
+      return accountLockManager.withLock(Set.of(pni), () -> {
+        try {
+          // Reuse the ACI from any recently-deleted account with this number to cover cases where somebody is re-registering
+          final Optional<UUID> recentlyDeletedAci = findRecentlyDeletedAccountIdentifier(pni);
+          final UUID aci = recentlyDeletedAci.orElseGet(UUID::randomUUID);
 
-    return Metrics.timer(CREATE_TIMER_NAME, HAS_NUMBER_TAG_NAME, "true").record(() -> {
-      try {
-        return accountLockManager.withLock(Set.of(pni),
-            () -> create(Optional.of(number), Optional.of(pni), Optional.empty(), Optional.empty(), accountAttributes, aciIdentityKey, Optional.of(pniIdentityKey), primaryDeviceSpec, userAgent));
-      } catch (final ReceiptAlreadyRedeemedException e) {
-        throw new AssertionError("ReceiptAlreadyRedeemedException must never be thrown for accounts with numbers");
-      } catch (final RuntimeException e) {
-        logger.error("Unexpected exception while creating account", e);
-        throw e;
-      }
-    });
+          final NumberDetails numberDetails =
+              new NumberDetails(recentlyDeletedAci.isPresent(), number, pni, pniIdentityKey);
+          final List<TransactWriteItem> additionalWriteItems = new ArrayList<>(keysWriteItems(aci, Optional.of(pni), primaryDeviceSpec));
+          accountAttributes.recoveryPassword()
+              .map(phoneNumberRecoveryPassword ->
+                  phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForStorePassword(pni, phoneNumberRecoveryPassword))
+              .ifPresent(additionalWriteItems::add);
+
+          return create(aci, numberDetails, accountAttributes, aciIdentityKey, primaryDeviceSpec, additionalWriteItems, userAgent);
+        } catch (final ReceiptAlreadyRedeemedException | AccountCreationConditionException e) {
+          throw new IllegalStateException("unexpected exception for account with a number", e);
+        }
+      });
+    } catch (final RuntimeException e) {
+      logger.error("Unexpected exception while creating account", e);
+      throw e;
+    } finally {
+      sample.stop(Metrics.timer(CREATE_TIMER_NAME, HAS_NUMBER_TAG_NAME, "true"));
+    }
   }
 
-  @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
-  private Account create(final Optional<String> maybeNumber,
-      final Optional<UUID> maybePni,
-      final Optional<ReceiptCredentialPresentation> maybeReceiptCredentialPresentation,
-      final Optional<byte[]> maybeAuthCredentialSalt,
+  /// Create a sandbox account without a phone number. Sandbox accounts use an account identifier claimed from the
+  /// [SandboxAccounts] pool.
+  ///
+  /// @param accountAttributes             the account-level attributes to set on the account
+  /// @param aciIdentityKey                the ACI identity key to associate with the account
+  /// @param primaryDeviceSpec             the attributes to set on the account's primary device
+  /// @param numberlessDetails             details specific to account-creation without a number
+  /// @param userAgent                     the user agent of the client requesting to create an account
+  /// @return the created account
+  private Account createSandboxAccount(
       final AccountAttributes accountAttributes,
       final IdentityKey aciIdentityKey,
-      final Optional<IdentityKey> maybePniIdentityKey,
       final DeviceSpec primaryDeviceSpec,
+      final NumberlessDetails numberlessDetails,
       @Nullable final String userAgent) throws ReceiptAlreadyRedeemedException {
+    final List<UUID> candidates = new ArrayList<>(sandboxAccounts.getAvailable());
+    Collections.shuffle(candidates);
 
-    assert maybeNumber.isPresent() ^ maybeReceiptCredentialPresentation.isPresent();
+    for (final UUID candidate : candidates) {
+      final List<TransactWriteItem> additionalWriteItems = new ArrayList<>();
+      final int sandboxClaimIndex = additionalWriteItems.size();
+      additionalWriteItems.add(sandboxAccounts.buildClaimWriteItem(candidate, clock.instant()));
+      additionalWriteItems.addAll(keysWriteItems(candidate, Optional.empty(), primaryDeviceSpec));
+      try {
+        return create(candidate, numberlessDetails, accountAttributes, aciIdentityKey, primaryDeviceSpec,
+            additionalWriteItems, userAgent);
+      } catch (final AccountCreationConditionException e) {
+        // If our sandbox claim failed, another registration claimed this identifier after we listed the available
+        // identifiers so we can just try the next one. Otherwise, this is an unexpected condition failure.
+        if (e.getIndex() != sandboxClaimIndex) {
+          throw new IllegalStateException(e);
+        }
+      }
+    }
+
+    Metrics.counter(SANDBOX_POOL_EXHAUSTED_COUNTER_NAME).increment();
+    throw new ReceiptAlreadyRedeemedException();
+  }
+
+  private Account create(
+      final UUID aci,
+      final CreationDetails creationDetails,
+      final AccountAttributes accountAttributes,
+      final IdentityKey aciIdentityKey,
+      final DeviceSpec primaryDeviceSpec,
+      final List<TransactWriteItem> additionalWriteItems,
+      @Nullable final String userAgent) throws ReceiptAlreadyRedeemedException, AccountCreationConditionException {
 
     final Account account = new Account();
-    final Optional<UUID> maybeRecentlyDeletedAccountIdentifier =
-        maybePni.flatMap(accounts::findRecentlyDeletedAccountIdentifier);
 
-    maybeNumber.ifPresent(number -> {
-      account.setNumber(number, maybePni.orElseThrow(() -> new IllegalArgumentException("PNI must be provided if the account has a number")));
-      account.setPhoneNumberIdentityKey(maybePniIdentityKey.orElseThrow(() -> new IllegalArgumentException("PNI identity key must be provided if the account has a number")));
-      account.setRegistrationLockFromAttributes(accountAttributes);
-    });
-
-    maybeAuthCredentialSalt.ifPresent(account::setAuthCredentialSalt);
-
-    // Reuse the ACI from any recently-deleted account with this number to cover cases where somebody is
-    // re-registering.
-    account.setAccountIdentifier(maybeRecentlyDeletedAccountIdentifier.orElseGet(UUID::randomUUID));
+    account.setAccountIdentifier(aci);
     account.setIdentityKey(aciIdentityKey);
     account.addDevice(primaryDeviceSpec.toDevice(Device.PRIMARY_ID, clock, aciIdentityKey));
     account.setUnidentifiedAccessKey(accountAttributes.getUnidentifiedAccessKey());
@@ -478,48 +545,43 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
     accountAttributes.recoveryPassword().ifPresent(account::setAccountRecoveryPassword);
 
-    AccountCreationType accountCreationType = maybeRecentlyDeletedAccountIdentifier.isPresent()
-        ? AccountCreationType.RECENTLY_DELETED
-        : AccountCreationType.NEW;
-
     final PushTokenType pushTokenType = PushTokenType.fromDeviceSpec(primaryDeviceSpec);
 
     @Nullable PushTokenType previousPushTokenType = null;
 
+    AccountCreationType accountCreationType;
+
     try {
-      final List<TransactWriteItem> additionalWriteItems = new ArrayList<>(keysManager.buildWriteItemsForNewDevice(account.getAccountIdentifier(),
-          account.getPhoneNumberIdentifier(),
-          Device.PRIMARY_ID,
-          primaryDeviceSpec.aciInfo().signedPreKey(),
-          primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::signedPreKey),
-          primaryDeviceSpec.aciInfo().pqLastResortPreKey(),
-          primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::pqLastResortPreKey)));
-
-      maybePni.ifPresent(phoneNumberIdentifier ->
-          accountAttributes.recoveryPassword().ifPresent(phoneNumberRecoveryPassword ->
-              additionalWriteItems.add(phoneNumberRecoveryPasswordsManager.buildTransactWriteItemForStorePassword(phoneNumberIdentifier, phoneNumberRecoveryPassword))));
-
-      if (maybeNumber.isPresent()) {
-        if (maybeRecentlyDeletedAccountIdentifier.isPresent()) {
-          // If we are re-using a recently deleted ACI, also obtain a lock for it so that clearing queues for the ACI synchronize against it
-          accountLockManager.withLock(Set.of(maybeRecentlyDeletedAccountIdentifier.get()), () -> {
+      switch (creationDetails) {
+        case NumberDetails numbered -> {
+          account.setNumber(numbered.e164(), numbered.pni());
+          account.setPhoneNumberIdentityKey(numbered.pniIdentityKey());
+          account.setRegistrationLockFromAttributes(accountAttributes);
+          if (numbered.recentlyDeleted()) {
+            accountCreationType = AccountCreationType.RECENTLY_DELETED;
+            // If we are re-using a recently deleted ACI, also obtain a lock for it so that clearing queues for the ACI synchronize against it
+            accountLockManager.withLock(Set.of(aci), () -> {
+              accounts.create(account, additionalWriteItems);
+              return null;
+            });
+          } else {
+            accountCreationType = AccountCreationType.NEW;
             accounts.create(account, additionalWriteItems);
-            return null;
-          });
-        } else {
-          accounts.create(account, additionalWriteItems);
+          }
         }
-      } else {
-        assert accountAttributes.recoveryPassword().isPresent();
-        accounts.create(account,
-            maybeReceiptCredentialPresentation.get(),
-            accountAttributes.recoveryPassword().get(),
-            additionalWriteItems);
+        case NumberlessDetails numberless -> {
+          accountCreationType = AccountCreationType.NEW;
+          account.setAuthCredentialSalt(numberless.authCredentialSalt());
+          assert accountAttributes.recoveryPassword().isPresent();
+          accounts.create(account,
+              numberless.receiptCredentialPresentation(),
+              accountAttributes.recoveryPassword().get(),
+              additionalWriteItems);
+        }
       }
     } catch (final AccountAlreadyExistsException e) {
       accountCreationType = AccountCreationType.RE_REGISTRATION;
       previousPushTokenType = PushTokenType.fromDevice(e.getExistingAccount().getPrimaryDevice());
-
       reclaimAccount(account, e.getExistingAccount(), primaryDeviceSpec, accountAttributes);
     }
 
@@ -531,6 +593,16 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
         userAgent);
 
     return account;
+  }
+
+  private List<TransactWriteItem> keysWriteItems(final UUID aci, final Optional<UUID> pni, final DeviceSpec primaryDeviceSpec) {
+    return keysManager.buildWriteItemsForNewDevice(aci,
+        pni,
+        Device.PRIMARY_ID,
+        primaryDeviceSpec.aciInfo().signedPreKey(),
+        primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::signedPreKey),
+        primaryDeviceSpec.aciInfo().pqLastResortPreKey(),
+        primaryDeviceSpec.pniInfo().map(DeviceIdentityInfo::pqLastResortPreKey));
   }
 
   /// Recovers (re-registers) an account with a specific identifier. Callers are responsible for checking that the end
@@ -574,11 +646,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
         if (maybePniIdentityKey.isPresent()) {
           throw new IllegalArgumentException("PNI identity key must not be provided if existing account does not have a phone number");
         }
-
-        final byte[] authCredentialSalt = new byte[AUTH_CREDENTIAL_SALT_SIZE];
-        SECURE_RANDOM.nextBytes(authCredentialSalt);
-
-        account.setAuthCredentialSalt(authCredentialSalt);
+        account.setAuthCredentialSalt(generateAuthCredentialSalt());
       }
 
       account.setIdentityKey(aciIdentityKey);
@@ -673,7 +741,8 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     Tags tags = Tags.of(UserAgentTagUtil.getPlatformTag(userAgent),
         Tag.of("type", accountCreationType.getTagValue()),
         Tag.of("pushTokenType", pushTokenType.getTagValue()),
-        Tag.of("hasRecoveryPassword", String.valueOf(hasRecoveryPassword)));
+        Tag.of("hasRecoveryPassword", String.valueOf(hasRecoveryPassword)),
+        Tag.of("fictitiousNumber", String.valueOf(account.getNumber().map(Util::isFictitiousNumber).orElse(false))));
 
     if (previousPushTokenType != null) {
       tags = tags.and(Tag.of("previousPushTokenType", previousPushTokenType.getTagValue()));
@@ -683,19 +752,30 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   }
 
   public Pair<Account, Device> addDevice(final UUID accountIdentifier, final DeviceSpec deviceSpec, final String linkDeviceToken)
-      throws LinkDeviceTokenAlreadyUsedException {
+      throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
 
     final Account account = accounts.getByAccountIdentifier(accountIdentifier)
         .orElseThrow(() -> new IllegalArgumentException("Account not found: " + accountIdentifier));
 
-    return accountLockManager.withSingleAccountLock(account,
-        () -> addDevice(accountIdentifier, deviceSpec, linkDeviceToken, MAX_UPDATE_ATTEMPTS));
+    try {
+      return accountLockManager.withSingleAccountLock(account,
+          () -> addDevice(accountIdentifier, deviceSpec, linkDeviceToken, MAX_UPDATE_ATTEMPTS));
+    } catch (final LinkDeviceTokenAlreadyUsedException | DeviceLimitExceededException | RuntimeException e) {
+      throw e;
+    } catch (final Exception e) {
+      throw new AssertionError("Unexpected exception adding device", e);
+    }
   }
 
   private Pair<Account, Device> addDevice(final UUID accountIdentifier, final DeviceSpec deviceSpec, final String linkDeviceToken, final int retries)
-      throws LinkDeviceTokenAlreadyUsedException {
+      throws LinkDeviceTokenAlreadyUsedException, DeviceLimitExceededException {
+
     final Account account = accounts.getByAccountIdentifier(accountIdentifier)
         .orElseThrow(ContestedOptimisticLockException::new);
+
+    if (account.getDevices().size() >= MAX_DEVICES) {
+      throw new DeviceLimitExceededException(account.getDevices().size(), MAX_DEVICES);
+    }
 
     final byte nextDeviceId = account.getNextDeviceId();
 
@@ -739,7 +819,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
               connection.async().set(key, deviceInfoJson, SetArgs.Builder.ex(RECENTLY_ADDED_DEVICE_TTL))))
           .whenComplete((_, pubSubThrowable) -> {
             if (pubSubThrowable != null) {
-              logger.warn("Failed to record recently-created device", pubSubThrowable);
+              if (!ExceptionUtils.isBreakerOpen(pubSubThrowable)) {
+                logger.warn("Failed to record recently-created device", pubSubThrowable);
+              }
             }
           });
 
@@ -789,8 +871,13 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     }
   }
 
-  public String generateLinkDeviceToken(final UUID aci) {
-    final String claims = aci + "." + clock.instant().toEpochMilli();
+  public String generateLinkDeviceToken(final Account account) throws DeviceLimitExceededException {
+
+    if (account.getDevices().size() >= MAX_DEVICES) {
+      throw new DeviceLimitExceededException(account.getDevices().size(), MAX_DEVICES);
+    }
+
+    final String claims = account.getAccountIdentifier() + "." + clock.instant().toEpochMilli();
     final byte[] signature = getInitializedMac().doFinal(claims.getBytes(StandardCharsets.UTF_8));
 
     return claims + ":" + Base64.getUrlEncoder().encodeToString(signature);
@@ -826,14 +913,19 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       return Optional.empty();
     }
 
-    final byte[] expectedSignature = getInitializedMac().doFinal(claimsAndSignature[0].getBytes(StandardCharsets.UTF_8));
     final byte[] providedSignature;
 
     try {
       providedSignature = Base64.getUrlDecoder().decode(claimsAndSignature[1]);
+
+      if (!isCanonicallyBase64UrlEncoded(claimsAndSignature[1], providedSignature)) {
+        return Optional.empty();
+      }
     } catch (final IllegalArgumentException e) {
       return Optional.empty();
     }
+
+    final byte[] expectedSignature = getInitializedMac().doFinal(claimsAndSignature[0].getBytes(StandardCharsets.UTF_8));
 
     if (!MessageDigest.isEqual(expectedSignature, providedSignature)) {
       return Optional.empty();
@@ -868,6 +960,11 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     }
 
     return Optional.of(aci);
+  }
+
+  @VisibleForTesting
+  static boolean isCanonicallyBase64UrlEncoded(final String encoded, final byte[] bytes) {
+    return Base64.getUrlEncoder().encodeToString(bytes).equals(encoded);
   }
 
   /**
@@ -1252,7 +1349,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       });
 
       if (!maybeUpdatedAccount.getCurrentProfileVersion().map(v -> Arrays.equals(v, newVersion)).orElse(false)) {
-        throw new WriteConflictException();
+        throw new WriteConflictException(maybeUpdatedAccount.getCurrentProfileVersion().orElse(null));
       }
 
       return maybeUpdatedAccount;
@@ -1279,6 +1376,43 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
       }).orElse(false);
     });
+  }
+
+  /// Sets a new password for the given device and requests disconnection for all authenticated device connections.
+  ///
+  ///
+  /// @return `true` if the password was changed or `false` if the device no longer exists or its credentials
+  /// have been locked
+  public boolean updateDevicePassword(final UUID accountIdentifier, final byte deviceId, final String newPassword) {
+
+    final SaltedTokenHash newCredentials = SaltedTokenHash.generateFor(newPassword);
+
+    final Account updatedAccount = update(accountIdentifier, a -> {
+
+      final Optional<Device> maybeDevice = a.getDevice(deviceId);
+
+      return maybeDevice.map(d -> {
+
+        if (d.hasLockedCredentials()) {
+          return false;
+        }
+
+        d.setAuthTokenHash(newCredentials);
+
+        return true;
+
+      }).orElse(false);
+    });
+
+    final boolean passwordChanged = updatedAccount.getDevice(deviceId)
+        .map(d -> d.getAuthTokenHash().equals(newCredentials))
+        .orElse(false);
+
+    if (passwordChanged) {
+      disconnectionRequestManager.requestDisconnection(accountIdentifier, List.of(deviceId));
+    }
+
+    return passwordChanged;
   }
 
   /**
@@ -1471,7 +1605,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
               DELETION_REASON_TAG_NAME, deletionReason.tagValue)
           .increment();
     } catch (final RuntimeException e) {
-      logger.warn("Failed to delete account", e);
+      if (!ExceptionUtils.isBreakerOpen(e)) {
+        logger.warn("Failed to delete account", e);
+      }
       throw e;
     } finally {
       sample.stop(deleteTimer);
@@ -1564,7 +1700,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
         try {
           account.ifPresent(this::redisSet);
         } catch (RedisException e) {
-          logger.warn("Failed to cache retrieved account", e);
+          if (!ExceptionUtils.isBreakerOpen(e)) {
+            logger.warn("Failed to cache retrieved account", e);
+          }
         }
       }
       return account;
@@ -1585,7 +1723,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
                 .thenCompose(maybeAccountFromAccounts -> maybeAccountFromAccounts
                     .map(account -> redisSetAsync(account)
                         .exceptionally(ExceptionUtils.exceptionallyHandler(RedisException.class, e -> {
-                          logger.warn("Failed to cache retrieved account", e);
+                          if (!ExceptionUtils.isBreakerOpen(e)) {
+                            logger.warn("Failed to cache retrieved account", e);
+                          }
                           return null;
                         }))
                         .thenApply(ignored -> maybeAccountFromAccounts))
@@ -1603,7 +1743,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       logger.warn("Deserialization error", e);
       return Optional.empty();
     } catch (RedisException e) {
-      logger.warn("Failed fetching account from cache by secondary key", e);
+      if (!ExceptionUtils.isBreakerOpen(e)) {
+        logger.warn("Failed fetching account from cache by secondary key", e);
+      }
       return Optional.empty();
     }
     });
@@ -1621,7 +1763,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
           }
         })
         .exceptionally(throwable -> {
-          logger.warn("Failed to retrieve account from Redis", throwable);
+          if (!ExceptionUtils.isBreakerOpen(throwable)) {
+            logger.warn("Failed to retrieve account from Redis", throwable);
+          }
           return Optional.empty();
         })
         .whenComplete((_, _) -> sample.stop(timer))
@@ -1635,7 +1779,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
         return parseAccountJson(json, uuid);
       } catch (final RedisException e) {
-        logger.warn("Failed to retrieve account from cache", e);
+        if (!ExceptionUtils.isBreakerOpen(e)) {
+          logger.warn("Failed to retrieve account from cache", e);
+        }
         return Optional.empty();
       }
     });
@@ -1645,7 +1791,9 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     return cacheCluster.withCluster(connection -> connection.async().get(getAccountEntityKey(uuid)))
         .thenApply(accountJson -> parseAccountJson(accountJson, uuid))
         .exceptionally(throwable -> {
-          logger.warn("Failed to retrieve account from Redis", throwable);
+          if (!ExceptionUtils.isBreakerOpen(throwable)) {
+            logger.warn("Failed to retrieve account from Redis", throwable);
+          }
           return Optional.empty();
         })
         .toCompletableFuture();
@@ -2275,4 +2423,11 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
         .map(AnnotatedWebAuthnCredential.class::cast)
         .toList();
   }
+
+  private static byte[] generateAuthCredentialSalt() {
+    final byte[] authCredentialSalt = new byte[AUTH_CREDENTIAL_SALT_SIZE];
+    SECURE_RANDOM.nextBytes(authCredentialSalt);
+    return authCredentialSalt;
+  }
+
 }

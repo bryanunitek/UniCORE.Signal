@@ -110,6 +110,7 @@ message GetPreKeysRequest {
 
 message GetPreKeysAnonymousRequest {
   // The request to retrieve pre-keys for a specific account/device(s).
+  // If `request.target_identifier` is a PNI, `authorization` must be a group send token.
   GetPreKeysRequest request = 1;
 
   // A means to authorize the request.
@@ -136,7 +137,7 @@ message DevicePreKeyBundle {
 
   // A one-time KEM pre-key (or a last-resort KEM pre-key) for the targeted
   // account/device/identity.
-  common.KemSignedPreKey kem_one_time_pre_key = 3;
+  common.KemSignedPreKey kem_pre_key = 3;
 
   // The registration ID for the targeted account/device/identity.
   uint32 registration_id = 4;
@@ -229,8 +230,16 @@ message CheckIdentityKeyRequest {
 }
 
 message CheckIdentityKeyResponse {
-  // The service identifier of the account for which there is a mismatch between the client and server identity key fingerprints.
-  common.ServiceIdentifier target_identifier = 1;
-  // The identity key that is stored by the server for the target account/identity type.
-  bytes identity_key = 2;
+
+  oneof response {
+    // The key for the target account/identity type matched.
+    google.protobuf.Empty matched = 1;
+
+    // The identity key that is stored by the server for the target account/identity type.
+    bytes identity_key = 2;
+
+    // Either the target account was not found, or it has no identity key for
+    // the requested identity type.
+    errors.NotFound target_not_found = 3 [(tag.reason) = "not_found"];
+  }
 }

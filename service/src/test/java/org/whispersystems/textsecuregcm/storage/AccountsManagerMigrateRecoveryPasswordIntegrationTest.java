@@ -137,6 +137,7 @@ public class AccountsManagerMigrateRecoveryPasswordIntegrationTest {
           svr2Client,
           disconnectionRequestManager,
           phoneNumberRecoveryPasswordsManager,
+          mock(SandboxAccounts.class),
           executor,
           executor,
           mock(Clock.class),

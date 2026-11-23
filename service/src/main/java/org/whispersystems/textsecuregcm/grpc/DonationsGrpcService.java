@@ -4,8 +4,8 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import java.time.Clock;
 import java.time.Instant;
-import org.signal.chat.donations.CreateDonationPermitRequest;
-import org.signal.chat.donations.CreateDonationPermitResponse;
+import org.signal.chat.donations.CreateDonationPermitsRequest;
+import org.signal.chat.donations.CreateDonationPermitsResponse;
 import org.signal.chat.donations.RedeemReceiptRequest;
 import org.signal.chat.donations.RedeemReceiptResponse;
 import org.signal.chat.donations.SimpleDonationsGrpc;
@@ -28,8 +28,8 @@ import org.whispersystems.textsecuregcm.storage.AccountBadge;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.DonationPermitsManager;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptCredentialPresentationFactory;
-import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
+import org.whispersystems.textsecuregcm.purchases.ReceiptCredentialPresentationFactory;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 
 public class DonationsGrpcService extends SimpleDonationsGrpc.DonationsImplBase {
 
@@ -120,10 +120,10 @@ public class DonationsGrpcService extends SimpleDonationsGrpc.DonationsImplBase 
   }
 
   @Override
-  public CreateDonationPermitResponse createDonationPermit(final CreateDonationPermitRequest request) throws Exception {
+  public CreateDonationPermitsResponse createDonationPermits(final CreateDonationPermitsRequest request) throws Exception {
     final DonationPermitRequest permitRequest;
     try {
-      permitRequest = new DonationPermitRequest(request.getDonationPermitRequest().toByteArray());
+      permitRequest = new DonationPermitRequest(request.getDonationPermitsRequest().toByteArray());
     } catch (InvalidInputException e) {
       throw GrpcExceptions.invalidArguments("invalid permit request");
     }
@@ -133,8 +133,8 @@ public class DonationsGrpcService extends SimpleDonationsGrpc.DonationsImplBase 
 
     final DonationPermitResponse permitResponse = donationPermitsManager.issue(permitRequest);
 
-    return CreateDonationPermitResponse.newBuilder()
-        .setDonationPermitResponse(ByteString.copyFrom(permitResponse.serialize()))
+    return CreateDonationPermitsResponse.newBuilder()
+        .setDonationPermitsResponse(ByteString.copyFrom(permitResponse.serialize()))
         .build();
   }
 }

@@ -8,7 +8,6 @@ package org.whispersystems.textsecuregcm.websocket;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.google.common.annotations.VisibleForTesting;
-import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
@@ -20,21 +19,21 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import javax.annotation.Nullable;
-import org.apache.commons.lang3.StringUtils;
 import org.eclipse.jetty.util.ConstantThrowable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
-import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
+import org.whispersystems.textsecuregcm.push.NotPushRegisteredException;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
 import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
 import org.whispersystems.textsecuregcm.push.ReceiptSender;
@@ -42,9 +41,11 @@ import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
 import org.whispersystems.textsecuregcm.storage.ConflictingMessageConsumerException;
 import org.whispersystems.textsecuregcm.storage.Device;
+import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.MessageStream;
 import org.whispersystems.textsecuregcm.storage.MessageStreamEntry;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
+import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.textsecuregcm.util.ua.UserAgent;
@@ -55,12 +56,13 @@ import org.whispersystems.websocket.messages.WebSocketResponseMessage;
 import reactor.adapter.JdkFlowAdapter;
 import reactor.core.Disposable;
 import reactor.core.observability.micrometer.Micrometer;
+import reactor.core.publisher.Hooks;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 
 public class WebSocketConnection {
 
-  private static final Counter sendFailuresCounter = Metrics.counter(name(WebSocketConnection.class, "sendFailures"));
+  private static final String SEND_FAILURES_COUNTER_NAME = name(WebSocketConnection.class, "sendFailures");
 
   private static final String NON_SUCCESS_RESPONSE_COUNTER_NAME = name(WebSocketConnection.class,
       "clientNonSuccessResponse");
@@ -70,7 +72,6 @@ public class WebSocketConnection {
       "sendMessageError");
 
   private static final String STATUS_CODE_TAG = "status";
-  private static final String STATUS_MESSAGE_TAG = "message";
   private static final String ERROR_TYPE_TAG = "errorType";
   private static final String EXCEPTION_TYPE_TAG = "exceptionType";
 
@@ -83,13 +84,14 @@ public class WebSocketConnection {
   private static final Duration CLOSE_WITH_PENDING_MESSAGES_NOTIFICATION_DELAY = Duration.ofMinutes(1);
 
   private static final Logger logger = LoggerFactory.getLogger(WebSocketConnection.class);
+  private static final Logger droppedErrorLogger = LoggerFactory.getLogger("droppedError");
 
   private final ReceiptSender receiptSender;
   private final MessagesManager messagesManager;
   private final MessageMetrics messageMetrics;
   private final PushNotificationManager pushNotificationManager;
   private final PushNotificationScheduler pushNotificationScheduler;
-  private final ExperimentEnrollmentManager experimentEnrollmentManager;
+  private final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager;
 
   private final Account authenticatedAccount;
   private final Device authenticatedDevice;
@@ -115,7 +117,7 @@ public class WebSocketConnection {
       final WebSocketClient client,
       final Scheduler messageDeliveryScheduler,
       final ClientReleaseManager clientReleaseManager,
-      final ExperimentEnrollmentManager experimentEnrollmentManager) {
+      final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager) {
 
     this.receiptSender = receiptSender;
     this.messagesManager = messagesManager;
@@ -127,7 +129,7 @@ public class WebSocketConnection {
     this.client = client;
     this.messageDeliveryScheduler = messageDeliveryScheduler;
     this.clientReleaseManager = clientReleaseManager;
-    this.experimentEnrollmentManager = experimentEnrollmentManager;
+    this.dynamicConfigurationManager = dynamicConfigurationManager;
 
     this.messageStream =
         messagesManager.getMessages(authenticatedAccount.getAccountIdentifier(), authenticatedDevice);
@@ -140,10 +142,21 @@ public class WebSocketConnection {
 
     final Timer.Sample queueDrainStart = Timer.start();
 
-    messageSubscription.set(JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages())
-        .name(SEND_MESSAGES_FLUX_NAME)
-        .tap(Micrometer.metrics(Metrics.globalRegistry))
-        .limitRate(MESSAGE_PUBLISHER_LIMIT_RATE)
+    final AtomicInteger maxConcurrency = new AtomicInteger(MESSAGE_SENDER_MAX_CONCURRENCY);
+
+    messageSubscription.set(Mono.fromFuture(() -> messagesManager.hasSuspectedDeliveryLoop(authenticatedAccount.getAccountIdentifier(), authenticatedDevice.getId()))
+        .flatMapMany(hasSuspectedDeliveryLoop -> {
+          if (hasSuspectedDeliveryLoop) {
+            maxConcurrency.set(1);
+            MessageMetrics.recordSuspectedDeliveryLoop(MessageMetrics.WEBSOCKET_CHANNEL, userAgent, clientReleaseManager);
+          }
+
+          return JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages())
+              .name(SEND_MESSAGES_FLUX_NAME)
+              .tag("hasSuspectedDeliveryLoop", String.valueOf(hasSuspectedDeliveryLoop))
+              .tap(Micrometer.metrics(Metrics.globalRegistry))
+              .limitRate(maxConcurrency.get());
+        })
         // We want to handle conflicting connections as soon as possible, and so do this before we start processing
         // messages in the `flatMapSequential` stage below. If we didn't do this first, then we'd wait for clients to
         // process messages before sending the "connected elsewhere" signal, and while that's ultimately not harmful,
@@ -155,7 +168,7 @@ public class WebSocketConnection {
         .flatMapSequential(entry -> switch (entry) {
           case MessageStreamEntry.Envelope envelope -> Mono.fromFuture(() -> sendMessage(envelope.message())).thenReturn(entry);
           case MessageStreamEntry.QueueEmpty _ -> Mono.just(entry);
-        }, MESSAGE_SENDER_MAX_CONCURRENCY)
+        }, maxConcurrency.get())
         .subscribeOn(messageDeliveryScheduler)
         .subscribe(
             entry -> {
@@ -194,9 +207,18 @@ public class WebSocketConnection {
     messagesManager.mayHaveMessages(authenticatedAccount.getAccountIdentifier(), authenticatedDevice)
         .thenAccept(mayHaveMessages -> {
           if (mayHaveMessages) {
-            pushNotificationScheduler.scheduleDelayedNotification(authenticatedAccount,
-                authenticatedDevice,
-                CLOSE_WITH_PENDING_MESSAGES_NOTIFICATION_DELAY);
+            if (dynamicConfigurationManager.getConfiguration().getNotificationConfiguration().sendRemainingMessagesNotificationImmediately()) {
+              try {
+                pushNotificationManager.sendNewMessageNotification(authenticatedAccount,
+                    authenticatedDevice.getId(),
+                    true);
+              } catch (NotPushRegisteredException _) {
+              }
+            } else {
+              pushNotificationScheduler.scheduleDelayedNotification(authenticatedAccount,
+                  authenticatedDevice,
+                  CLOSE_WITH_PENDING_MESSAGES_NOTIFICATION_DELAY);
+            }
           }
         });
   }
@@ -235,7 +257,8 @@ public class WebSocketConnection {
             List.of(HeaderUtils.getTimestampHeader()), body)
         .whenComplete((ignored, throwable) -> {
           if (throwable != null) {
-            sendFailuresCounter.increment();
+            Metrics.counter(SEND_FAILURES_COUNTER_NAME, EXCEPTION_TYPE_TAG, throwable.getClass().getSimpleName())
+                    .increment();
           } else {
             messageMetrics.measureOutgoingMessageLatency(serverTimestamp,
                 MessageMetrics.WEBSOCKET_CHANNEL,
@@ -264,11 +287,6 @@ public class WebSocketConnection {
           } else {
             Tags tags = Tags.of(UserAgentTagUtil.getPlatformTag(userAgent), Tag.of(STATUS_CODE_TAG, String.valueOf(response.getStatus())));
 
-            // TODO Remove this once we've identified the cause of message rejections from desktop clients
-            if (StringUtils.isNotBlank(response.getMessage())) {
-              tags = tags.and(Tag.of(STATUS_MESSAGE_TAG, response.getMessage()));
-            }
-
             Metrics.counter(NON_SUCCESS_RESPONSE_COUNTER_NAME, tags).increment();
 
             result = CompletableFuture.completedFuture(null);
@@ -277,6 +295,16 @@ public class WebSocketConnection {
           return result;
         })
         .thenRun(() -> messageMetrics.measureSendMessageDuration(MessageMetrics.WEBSOCKET_CHANNEL, userAgent, sample));
+  }
+
+  /// Registers a global hook that discards exceptions caused by closed connections and logs everything else.
+  /// Hooks are additive and should therefore be called exactly once at startup.
+  public static void registerDroppedErrorHook() {
+    Hooks.onErrorDropped(throwable -> {
+      if (!WebSocketConnection.isConnectionClosedException(ExceptionUtils.unwrap(throwable))) {
+        droppedErrorLogger.error("Dropped error", throwable);
+      }
+    });
   }
 
   @VisibleForTesting
@@ -295,6 +323,8 @@ public class WebSocketConnection {
       errorType = "timeout";
     } else if (isConnectionClosedException(e)) {
       errorType = "connectionClosed";
+    } else if (ExceptionUtils.isBreakerOpen(e)) {
+      errorType = "breakerOpen";
     } else {
       logger.warn("Send message failed", e);
       errorType = "other";

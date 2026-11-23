@@ -171,6 +171,10 @@ public class FaultTolerantDatabase {
     READ_STATUS("readStatus"),
     READ_VERSIONSTAMP("readVersionstamp"),
     RECORD_VERSIONSTAMP_AND_TIME("recordVersionstampAndTime"),
+    GET_HAS_MESSAGES("hasMessages"),
+    GET_HAS_URGENT_MESSAGES("hasUrgentMessages"),
+    GET_EARLIEST_TIMESTAMP("getEarliestTimestamp"),
+    INCREMENT_READS_SINCE_LAST_ACKNOWLEDGED_MESSAGE("increamentReadsSinceLastAcknowledgedMessage"),
     TEST("test");
 
     private final String name;

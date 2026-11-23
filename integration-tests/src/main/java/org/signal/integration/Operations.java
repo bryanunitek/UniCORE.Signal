@@ -8,6 +8,7 @@ package org.signal.integration;
 import static java.util.Objects.requireNonNull;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.io.Resources;
 import com.google.common.net.HttpHeaders;
 import com.webauthn4j.data.AuthenticatorAssertionResponse;
@@ -20,6 +21,7 @@ import com.webauthn4j.data.client.challenge.DefaultChallenge;
 import com.webauthn4j.test.client.ClientPlatform;
 import io.dropwizard.configuration.ConfigurationValidationException;
 import io.dropwizard.jersey.validation.Validators;
+import io.github.resilience4j.retry.Retry;
 import io.grpc.ChannelCredentials;
 import io.grpc.ClientInterceptor;
 import io.grpc.Grpc;
@@ -51,17 +53,23 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nullable;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Validate;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.eclipse.jetty.client.HttpClient;
+import org.eclipse.jetty.client.Request;
 import org.eclipse.jetty.http2.client.HTTP2Client;
 import org.eclipse.jetty.http2.client.transport.HttpClientTransportOverHTTP2;
 import org.eclipse.jetty.io.ClientConnector;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.eclipse.jetty.websocket.api.exceptions.UpgradeException;
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
 import org.signal.integration.config.Config;
@@ -82,6 +90,7 @@ import org.signal.libsignal.zkgroup.receipts.ReceiptSerial;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.grpc.RequireAuthenticationInterceptor;
+import org.whispersystems.textsecuregcm.configuration.RetryConfiguration;
 import org.whispersystems.textsecuregcm.entities.AccountAttributes;
 import org.whispersystems.textsecuregcm.entities.AccountIdentityResponse;
 import org.whispersystems.textsecuregcm.entities.DeviceActivationRequest;
@@ -95,6 +104,7 @@ import org.whispersystems.textsecuregcm.storage.TotpManager;
 import org.whispersystems.textsecuregcm.util.CertificateUtil;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
 import org.whispersystems.textsecuregcm.util.HttpUtils;
+import org.whispersystems.textsecuregcm.util.ResilienceUtil;
 import org.whispersystems.textsecuregcm.util.SystemMapper;
 import org.whispersystems.textsecuregcm.util.ThrowingSupplier;
 import org.whispersystems.textsecuregcm.util.Util;
@@ -113,12 +123,27 @@ public final class Operations {
 
   private static final FaultTolerantHttpClient CLIENT = buildClient();
 
+  private static final FaultTolerantHttpClient NO_RETRY_CLIENT = buildNoRetryClient();
+
   private static final WebSocketClient WEB_SOCKET_CLIENT = buildWebSocketClient();
 
   private static final ManagedChannel GRPC_CHANNEL = buildGrpcChannel();
 
+  private static final Retry WEBSOCKET_CONNECT_RETRY = Retry.of("integration-test-websocket-connect",
+      new RetryConfiguration().toRetryConfigBuilder()
+          .retryOnException(Operations::isRetryableConnectFailure)
+          .build());
   private Operations() {
     // utility class
+  }
+
+  static boolean isRetryableConnectFailure(final Throwable e) {
+    final Throwable cause = e instanceof ExecutionException ? e.getCause() : e;
+    if (cause instanceof UpgradeException upgradeException) {
+      return upgradeException.getResponseStatusCode() >= 500
+          || ExceptionUtils.getRootCause(upgradeException) instanceof TimeoutException;
+    }
+    return cause instanceof IOException;
   }
 
   public record Receipt(ReceiptSerial serial, ReceiptCredential credential) {}
@@ -235,52 +260,66 @@ public final class Operations {
             Optional.empty(),
             Optional.empty()));
 
-    final Pair<Integer, MfaFailureExceptionMapper.MfaFailureResponse> initialResponse = apiPost("/v1/registration", initialRequest)
-        // For a numberless account recovery, the username is the ACI
-        .authorized(testUser.aciUuid().toString(), testUser.accountPassword())
-        .execute(MfaFailureExceptionMapper.MfaFailureResponse.class);
-
     // we expect (and need) failure with status 441, which will contain the WebAuthn challenge
-    assert initialResponse.getLeft() == 441;
-
-    final MfaFailureExceptionMapper.MfaFailureResponse mfaFailureResponse = initialResponse.getRight();
-    assert mfaFailureResponse.webAuthnParameters().allowedCredentialIds()
-        .stream()
-        .anyMatch(allowedId -> Arrays.equals(allowedId, credentialId));
-
-    final PublicKeyCredential<AuthenticatorAssertionResponse, ?> credential =
-        clientPlatform.get(new PublicKeyCredentialRequestOptions(
-            new DefaultChallenge(mfaFailureResponse.webAuthnParameters().challenge()),
-            null,
-            relyingPartyId,
-            List.of(new PublicKeyCredentialDescriptor(PublicKeyCredentialType.PUBLIC_KEY, credentialId, null)),
-            UserVerificationRequirement.DISCOURAGED,
-            null));
-
-    final RegistrationRequest registrationRequest = new RegistrationRequest(null,
-        testUser.registrationPassword(),
-        null,
-        null,
-        webAuthnVerificationResponseJson(credential),
-        recoveredUser.accountAttributes(),
-        true,
-        new IdentityKey(aciIdentityKeyPair.getPublicKey()),
-        new IdentityKey(pniIdentityKeyPair.getPublicKey()),
-        new DeviceActivationRequest(generateSignedECPreKey(1, aciIdentityKeyPair),
-            Optional.of(generateSignedECPreKey(2, pniIdentityKeyPair)),
-            generateSignedKEMPreKey(3, aciIdentityKeyPair),
-            Optional.of(generateSignedKEMPreKey(4, pniIdentityKeyPair)),
-            Optional.empty(),
-            Optional.empty()));
-
-    final AccountIdentityResponse registrationResponse = apiPost("/v1/registration", registrationRequest)
+    MfaFailureExceptionMapper.MfaFailureResponse mfaFailureResponse = apiPost("/v1/registration", initialRequest)
         // For a numberless account recovery, the username is the ACI
         .authorized(testUser.aciUuid().toString(), testUser.accountPassword())
-        .executeExpectSuccess(AccountIdentityResponse.class);
+        .executeExpectStatusCode(441, MfaFailureExceptionMapper.MfaFailureResponse.class);
 
-    recoveredUser.setAciUuid(registrationResponse.uuid());
-    return recoveredUser;
+    // Retry a 441 to 3 times. It's possible we burned a challenge on a 500 that actually succeeded, but we didn't see
+    // the response, so we can retry on the new challenge.
+    int attempt = 0;
+    while (true) {
+      attempt++;
+      Validate.isTrue(mfaFailureResponse.webAuthnParameters().allowedCredentialIds()
+          .stream()
+          .anyMatch(allowedId -> Arrays.equals(allowedId, credentialId)),
+          "Expected MFA failure to contain credentialId");
+
+      final PublicKeyCredential<AuthenticatorAssertionResponse, ?> credential =
+          clientPlatform.get(new PublicKeyCredentialRequestOptions(
+              new DefaultChallenge(mfaFailureResponse.webAuthnParameters().challenge()),
+              null,
+              relyingPartyId,
+              List.of(new PublicKeyCredentialDescriptor(PublicKeyCredentialType.PUBLIC_KEY, credentialId, null)),
+              UserVerificationRequirement.DISCOURAGED,
+              null));
+
+      final RegistrationRequest registrationRequest = new RegistrationRequest(null,
+          testUser.registrationPassword(),
+          null,
+          null,
+          webAuthnVerificationResponseJson(credential),
+          recoveredUser.accountAttributes(),
+          true,
+          new IdentityKey(aciIdentityKeyPair.getPublicKey()),
+          new IdentityKey(pniIdentityKeyPair.getPublicKey()),
+          new DeviceActivationRequest(generateSignedECPreKey(1, aciIdentityKeyPair),
+              Optional.of(generateSignedECPreKey(2, pniIdentityKeyPair)),
+              generateSignedKEMPreKey(3, aciIdentityKeyPair),
+              Optional.of(generateSignedKEMPreKey(4, pniIdentityKeyPair)),
+              Optional.empty(),
+              Optional.empty()));
+
+      final Pair<Integer, JsonNode> registrationResponse = apiPost("/v1/registration", registrationRequest)
+          // For a numberless account recovery, the username is the ACI
+          .authorized(testUser.aciUuid().toString(), testUser.accountPassword())
+          .execute(JsonNode.class);
+
+      if (registrationResponse.getLeft() == 441 && attempt < 3) {
+        mfaFailureResponse = SystemMapper.jsonMapper()
+            .convertValue(registrationResponse.getRight(), MfaFailureExceptionMapper.MfaFailureResponse.class);
+        continue;
+      }
+
+      Validate.isTrue(HttpUtils.isSuccessfulResponse(registrationResponse.getLeft()),
+          "Unexpected response code: %d, body: %s", registrationResponse.getLeft(), registrationResponse.getRight());
+      recoveredUser.setAciUuid(SystemMapper.jsonMapper()
+          .convertValue(registrationResponse.getRight(), AccountIdentityResponse.class).uuid());
+      return recoveredUser;
+    }
   }
+
 
   public static TestUser newRegisteredUser(final String number) {
     final byte[] registrationPassword = populateRandomRecoveryPassword(number);
@@ -328,7 +367,24 @@ public final class Operations {
   }
 
   public static void deleteUser(final TestUser user) {
-    apiDelete("/v1/accounts/me").authorized(user).executeExpectSuccess();
+    final AtomicInteger attempts = new AtomicInteger();
+    final Retry retry = Retry.of("integration-test-delete-user",
+        new RetryConfiguration().<Integer>toRetryConfigBuilder()
+            .retryOnResult(statusCode -> statusCode >= 500)
+            .build());
+    final int statusCode = retry.executeSupplier(() -> {
+      attempts.incrementAndGet();
+      return apiDelete("/v1/accounts/me")
+          .authorized(user)
+          // disable retries, since this endpoint is not idempotent
+          .withoutRetries()
+          .execute()
+          .getLeft();
+    });
+
+    // If we had to retry a 500 where the account was already deleted, we would fail authorization
+    Validate.isTrue(HttpUtils.isSuccessfulResponse(statusCode) || (attempts.get() > 1 && statusCode == 401),
+        "Unexpected response code: %d", statusCode);
   }
 
   public static String peekVerificationSessionPushChallenge(final String sessionId) {
@@ -438,11 +494,21 @@ public final class Operations {
 
   private static ManagedChannel buildGrpcChannel() {
     try {
-      final ByteArrayInputStream rootCert =
-          new ByteArrayInputStream(CONFIG.rootCert().getBytes(StandardCharsets.UTF_8));
-      final ChannelCredentials credentials = TlsChannelCredentials.newBuilder().trustManager(rootCert).build();
+      final String rootCerts = String.join("\n", CONFIG.rootCerts());
+      final ByteArrayInputStream rootCertInputStream =
+          new ByteArrayInputStream(rootCerts.getBytes(StandardCharsets.UTF_8));
+      final ChannelCredentials credentials = TlsChannelCredentials.newBuilder().trustManager(rootCertInputStream).build();
       return Grpc.newChannelBuilderForAddress(GRPC_DOMAIN, 443, credentials)
           .userAgent(USER_AGENT)
+          .defaultServiceConfig(Map.of("methodConfig", List.of(Map.of(
+              "name", List.of(Map.of()),
+              "retryPolicy", Map.of(
+                  "maxAttempts", 3.0,
+                  "initialBackoff", "0.5s",
+                  "maxBackoff", "2s",
+                  "backoffMultiplier", 2.0,
+                  "retryableStatusCodes", List.of("UNAVAILABLE"))))))
+          .enableRetry()
           .build();
     } catch (final IOException e) {
       throw new UncheckedIOException(e);
@@ -457,6 +523,7 @@ public final class Operations {
 
     private final List<String> queryParams = new ArrayList<>();
 
+    private boolean retryServerErrors = true;
 
     private RequestBuilder(final HttpRequest.Builder builder, final String endpoint) {
       this.builder = builder;
@@ -494,6 +561,12 @@ public final class Operations {
       return this;
     }
 
+    /// Don't automatically retry 5xx responses, for requests that aren't safe to blindly retry
+    public RequestBuilder withoutRetries() {
+      retryServerErrors = false;
+      return this;
+    }
+
     public Pair<Integer, Void> execute() {
       return execute(Void.class);
     }
@@ -524,6 +597,15 @@ public final class Operations {
           response.statusCode(), expectedStatusCode, response.body());
     }
 
+    public <T> T executeExpectStatusCode(final int expectedStatusCode, final Class<T> expectedType) {
+      final RawResponse response = executeRaw();
+      Validate.isTrue(
+          response.statusCode() == expectedStatusCode,
+          "Unexpected response code: %d (expected %d), body: %s",
+          response.statusCode(), expectedStatusCode, response.body());
+      return requireNonNull(parseBody(response.body(), expectedType));
+    }
+
     public <T> Pair<Integer, T> execute(final Class<T> expectedType) {
       final RawResponse response = executeRaw();
       return Pair.of(response.statusCode(), parseBody(response.body(), expectedType));
@@ -534,7 +616,8 @@ public final class Operations {
     private RawResponse executeRaw() {
       builder.uri(serverUri(endpoint, queryParams))
           .header(HttpHeaders.USER_AGENT, USER_AGENT);
-      return CLIENT.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+      return (retryServerErrors ? CLIENT : NO_RETRY_CLIENT)
+          .sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
           .whenComplete((response, error) -> {
             if (error != null) {
               logger.error("request error", error);
@@ -563,8 +646,24 @@ public final class Operations {
 
   private static FaultTolerantHttpClient buildClient() {
     try {
-      return FaultTolerantHttpClient.newBuilder("integration-test", Executors.newFixedThreadPool(16))
-          .withTrustedServerCertificates(CONFIG.rootCert())
+      final FaultTolerantHttpClient client = FaultTolerantHttpClient.newBuilder("integration-test", Executors.newFixedThreadPool(16))
+          .withTrustedServerCertificates(CONFIG.rootCerts().toArray(String[]::new))
+          .withRetry(null, Executors.newSingleThreadScheduledExecutor())
+          .build();
+      // FaultTolerantHttpClient doesn't expose its Retry; it's the only one registered in this JVM
+      ResilienceUtil.getRetryRegistry().getAllRetries().forEach(retry -> retry.getEventPublisher()
+          .onRetry(event -> logger.warn("Retrying {} after {} failed attempt(s)",
+              event.getName(), event.getNumberOfRetryAttempts(), event.getLastThrowable())));
+      return client;
+    } catch (final CertificateException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static FaultTolerantHttpClient buildNoRetryClient() {
+    try {
+      return FaultTolerantHttpClient.newBuilder("integration-test-no-retry", Executors.newFixedThreadPool(16))
+          .withTrustedServerCertificates(CONFIG.rootCerts().toArray(String[]::new))
           .build();
     } catch (final CertificateException e) {
       throw new RuntimeException(e);
@@ -573,7 +672,7 @@ public final class Operations {
 
   private static WebSocketClient buildWebSocketClient() {
     try {
-      final KeyStore trustStore = CertificateUtil.buildKeyStoreForPem(CONFIG.rootCert());
+      final KeyStore trustStore = CertificateUtil.buildKeyStoreForPem(CONFIG.rootCerts().toArray(String[]::new));
       final SslContextFactory.Client sslContextFactory = new SslContextFactory.Client();
       sslContextFactory.setTrustStore(trustStore);
 
@@ -581,7 +680,17 @@ public final class Operations {
       connector.setSslContextFactory(sslContextFactory);
 
       final HTTP2Client http2Client = new HTTP2Client(connector);
-      final HttpClient httpClient = new HttpClient(new HttpClientTransportOverHTTP2(http2Client));
+      final HttpClient httpClient = new HttpClient(new HttpClientTransportOverHTTP2(http2Client)) {
+        // There is an upstream Jetty bug where an HTTP/2 reader can race against and beat a websocket connection in
+        // reading the first websocket frame. See https://github.com/jetty/jetty.project/issues/15981 for more details.
+        //
+        // As a workaround, register a response content listener that never reads. This stops the HTTP client's default
+        // response content consumer from reading websocket frames off the upgraded HTTP/2 stream.
+        @Override
+        public Request newRequest(final URI uri) {
+          return super.newRequest(uri).onResponseContentSource((_, _) -> {});
+        }
+      };
 
       final WebSocketClient wsClient = new WebSocketClient(httpClient);
       wsClient.start();
@@ -606,16 +715,19 @@ public final class Operations {
 
     final URI uri = URI.create("wss://" + GRPC_DOMAIN + path);
     final ClientUpgradeRequest request = new ClientUpgradeRequest(uri);
+    request.setTimeout(5, TimeUnit.SECONDS);
     headers.forEach(request::setHeader);
 
-    final WebsocketClientSession listener = new WebsocketClientSession();
     try {
-      WEB_SOCKET_CLIENT.connect(listener, request).get(5, TimeUnit.SECONDS);
+      return WEBSOCKET_CONNECT_RETRY.executeCallable(() -> {
+        final WebsocketClientSession session = new WebsocketClientSession();
+        WEB_SOCKET_CLIENT.connect(session, request).get();
+        logger.info("Successfully connected to websocket on {}", uri);
+        return session;
+      });
     } catch (Exception e) {
       throw new IOException(e);
     }
-    logger.info("Successfully connected to websocket on {}", uri);
-    return listener;
   }
 
   private static Config loadConfigFromClasspath(final String filename) {

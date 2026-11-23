@@ -21,6 +21,7 @@ import io.micrometer.core.instrument.Tags;
 import io.micrometer.core.instrument.Timer;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -31,7 +32,6 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -39,7 +39,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import javax.annotation.Nullable;
@@ -50,6 +49,7 @@ import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.DevicePlatformUtil;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.storage.Device;
+import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.Pair;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.textsecuregcm.util.Util;
@@ -79,7 +79,7 @@ public class FoundationDbMessageStore {
   private final ScheduledExecutorService presenceRenewalExecutorService;
   private final Clock clock;
 
-  // Per-attempt timeout and retry limit for batch priority transacitons, e.g. expired-message trim.
+  // Per-attempt timeout and retry limit for batch priority transactions, e.g. expired-message trim.
   private final Duration batchPriorityTransactionTimeout;
   private final long batchPriorityTransactionRetryLimit;
 
@@ -90,6 +90,9 @@ public class FoundationDbMessageStore {
 
   @VisibleForTesting
   static final Duration PRESENCE_STALE_THRESHOLD = Duration.ofMinutes(5);
+
+  @VisibleForTesting
+  static final int MAY_HAVE_URGENT_MESSAGES_QUERY_LIMIT = 20;
 
   /// The (approximate) transaction size beyond which we do not add more messages in a transaction. The estimated size
   /// includes only message payloads (and not key reads/writes) which we assume will dominate the total
@@ -394,41 +397,14 @@ public class FoundationDbMessageStore {
 
     return databasesByEpoch[getConfigurationEpoch(versionstamp)][getShardId(versionstamp)].runAsync(transaction -> {
           transaction.clear(messageKey);
+          transaction.clear(getReadsSinceLastAcknowledgedMessageKey(aci, deviceId));
+
           return CompletableFuture.completedFuture(null);
         }, FaultTolerantDatabase.Context.DELETE_MESSAGE)
         .thenRun(() -> {
           sample.stop(DELETE_MESSAGE_TIMER);
           DELETE_MESSAGE_COUNTER.increment();
         });
-  }
-
-  CompletableFuture<Optional<FoundationDbMessageStreamEntry.Message>> deleteAndGet(final AciServiceIdentifier aci, final byte deviceId, final UUID messageGuid) {
-    return deleteAndGet(aci, deviceId, versionstampUUIDCipher.decryptVersionstamp(messageGuid, aci.uuid(), deviceId));
-  }
-
-  CompletableFuture<Optional<FoundationDbMessageStreamEntry.Message>> deleteAndGet(final AciServiceIdentifier aci, final byte deviceId, final Versionstamp versionstamp) {
-    final Timer.Sample sample = Timer.start();
-
-    final byte[] messageKey = getDeviceQueueSubspace(aci, deviceId).pack(Tuple.from(versionstamp));
-
-    return databasesByEpoch[getConfigurationEpoch(versionstamp)][getShardId(versionstamp)].runAsync(
-            transaction -> transaction.get(messageKey)
-                .thenApply(value -> {
-                  if (value == null) {
-                    return Optional.<byte[]>empty();
-                  }
-                  transaction.clear(messageKey);
-                  return Optional.of(value);
-                }), FaultTolerantDatabase.Context.DELETE_MESSAGE)
-        .whenComplete((_, _) -> sample.stop(DELETE_MESSAGE_TIMER))
-        .thenApply(maybeValue -> maybeValue.map(value -> {
-          DELETE_MESSAGE_COUNTER.increment();
-          try {
-            return new FoundationDbMessageStreamEntry.Message(versionstamp, MessageProtos.Envelope.parseFrom(value));
-          } catch (final InvalidProtocolBufferException e) {
-            throw new UncheckedIOException(e);
-          }
-        }));
   }
 
   public void clearAll(final AciServiceIdentifier aci) {
@@ -457,32 +433,93 @@ public class FoundationDbMessageStore {
     return getMessages(aci, deviceId, Util.NOOP);
   }
 
-  FaultTolerantDatabase[] getDatabasesByEpochForAci(final AciServiceIdentifier aci) {
-    // For each configured database epoch, which database held (or holds) the messages for this ACI/device pair?
-    final FaultTolerantDatabase[] databasesForQueueByEpoch = new FaultTolerantDatabase[databasesByEpoch.length];
-
-    for (final int epoch : liveEpochs) {
-      databasesForQueueByEpoch[epoch] = getShardForAci(aci, epoch);
-    }
-
-    return databasesForQueueByEpoch;
-  }
-
   @VisibleForTesting
   FoundationDbMessageStream getMessages(final AciServiceIdentifier aci,
       final byte deviceId,
       final Runnable doAfterCleanup) {
 
-   final FaultTolerantDatabase[] databasesForQueueByEpoch = getDatabasesByEpochForAci(aci);
-
     return new FoundationDbMessageStream(this,
         aci,
         deviceId,
-        databasesForQueueByEpoch,
+        getDistinctDatabasesForAci(aci),
         new MessageGuidCodec(aci.uuid(), deviceId, versionstampUUIDCipher),
         doAfterCleanup,
         presenceRenewalExecutorService,
         clock);
+  }
+
+  /// Checks whether the message queue belonging to a specific device contains any messages.
+  ///
+  /// @param aci      the account identifier for the queue to check
+  /// @param deviceId the account-specific device identifier for the queue to check
+  ///
+  /// @return a future that yields `true` if the identified queue contains any messages or `false` if the queue is empty
+  public CompletableFuture<Boolean> hasMessages(final AciServiceIdentifier aci, final byte deviceId) {
+    return Flux.fromArray(getDistinctDatabasesForAci(aci))
+        .flatMap(database -> Mono.fromFuture(() -> database.readAsync(transaction ->
+                transaction.getRange(getDeviceQueueSubspace(aci, deviceId).range(), 1).asList(),
+            FaultTolerantDatabase.Context.GET_HAS_MESSAGES)))
+            .map(keyValues -> !keyValues.isEmpty())
+        .any(hasMessages -> hasMessages)
+        .toFuture();
+  }
+
+  /// Checks whether the message queue belonging to a specific device contains an urgent message within the first
+  /// {@value MAY_HAVE_URGENT_MESSAGES_QUERY_LIMIT} messages.
+  ///
+  /// @param aci      the account identifier for the queue to check
+  /// @param deviceId the account-specific device identifier for the queue to check
+  ///
+  /// @return a future that yields `true` if the identified queue contains an urgent message within a sample or `false`
+  /// otherwise
+  public CompletableFuture<Boolean> mayHaveUrgentMessages(final AciServiceIdentifier aci, final byte deviceId) {
+    return Flux.fromArray(getDistinctDatabasesForAci(aci))
+        .flatMap(database -> Mono.fromFuture(() -> database.readAsync(transaction ->
+                transaction.getRange(getDeviceQueueSubspace(aci, deviceId).range(), MAY_HAVE_URGENT_MESSAGES_QUERY_LIMIT).asList(),
+            FaultTolerantDatabase.Context.GET_HAS_URGENT_MESSAGES))
+            .flatMapMany(keyValues -> Flux.fromIterable(keyValues)
+                .<MessageProtos.Envelope>handle((keyValue, sink) -> {
+                  try {
+                    sink.next(MessageProtos.Envelope.parseFrom(keyValue.getValue()));
+                  } catch (final InvalidProtocolBufferException e) {
+                    sink.error(e);
+                  }
+                })))
+        .any(MessageProtos.Envelope::getUrgent)
+        .toFuture();
+  }
+
+  /// Gets the server timestamp of the earliest message in the queue for a specific device
+  ///
+  /// @param aci      the account identifier for the queue to check
+  /// @param deviceId the account-specific device identifier for the queue to check
+  ///
+  /// @return a future that yields the server timestamp of the earliest message in the queue, or empty if the queue
+  /// contains no messages
+  public CompletableFuture<Optional<Instant>> getEarliestUndeliveredMessageTimestamp(final AciServiceIdentifier aci,
+      final byte deviceId) {
+
+    return Flux.fromArray(getDistinctDatabasesForAci(aci))
+        .flatMap(database -> Mono.fromFuture(() -> database.readAsync(transaction ->
+                    transaction.getRange(getDeviceQueueSubspace(aci, deviceId).range(), 1).asList(),
+                FaultTolerantDatabase.Context.GET_EARLIEST_TIMESTAMP))
+            .mapNotNull(keyValues -> {
+              if (keyValues.isEmpty()) {
+                return null;
+              }
+
+              try {
+                return Instant.ofEpochMilli(MessageProtos.Envelope.parseFrom(keyValues.getFirst().getValue())
+                    .getServerTimestamp());
+              } catch (final InvalidProtocolBufferException e) {
+                throw new UncheckedIOException(e);
+              }
+            }))
+        .sort()
+        .next()
+        .map(Optional::of)
+        .switchIfEmpty(Mono.just(Optional.empty()))
+        .toFuture();
   }
 
   /// Record the versionstamp for the current time in each database's versionstamp clock.
@@ -606,8 +643,17 @@ public class FoundationDbMessageStore {
   @VisibleForTesting
   record QueueSizeAndRangeSplitPoints(long estimatedQueueSize, Map<FaultTolerantDatabase, List<byte[]>> splitPointsByDatabase) {}
 
-  private Flux<FaultTolerantDatabase> getDistinctDatabasesForAci(final AciServiceIdentifier aci) {
-    return Flux.fromStream(Arrays.stream(getDatabasesByEpochForAci(aci)).filter(Objects::nonNull).distinct());
+  private FaultTolerantDatabase[] getDistinctDatabasesForAci(final AciServiceIdentifier aci) {
+    // Optimization: if we only have one live epoch (true most of the time!), we can skip the overhead of working with
+    // a stream
+    if (liveEpochs.length == 1) {
+      return new FaultTolerantDatabase[] { getShardForAci(aci, liveEpochs[0]) };
+    }
+
+    return Arrays.stream(liveEpochs)
+        .mapToObj(epoch -> getShardForAci(aci, epoch))
+        .distinct()
+        .toArray(FaultTolerantDatabase[]::new);
   }
 
   /// Estimates the size of the provided queue in bytes.
@@ -618,7 +664,7 @@ public class FoundationDbMessageStore {
   Mono<Long> estimateQueueSize(final AciServiceIdentifier aci, final byte deviceId) {
     final Range deviceQueueRange = getDeviceQueueSubspace(aci, deviceId).range();
 
-    return getDistinctDatabasesForAci(aci)
+    return Flux.fromArray(getDistinctDatabasesForAci(aci))
         .flatMap(database -> Mono.fromFuture(() -> database.runAsync(transaction -> transaction.getEstimatedRangeSizeBytes(deviceQueueRange), FaultTolerantDatabase.Context.ESTIMATE_QUEUE_SIZE)))
         .reduce(0L, Long::sum);
   }
@@ -634,7 +680,8 @@ public class FoundationDbMessageStore {
       final AciServiceIdentifier aci,
       final byte deviceId,
       final long rangeSplitChunkSize) {
-    return getDistinctDatabasesForAci(aci)
+
+    return Flux.fromArray(getDistinctDatabasesForAci(aci))
         .flatMap(database -> Mono.fromFuture(() -> estimateQueueSizeAndRangeSplitsForDatabase(database, aci, deviceId, rangeSplitChunkSize))
             .map(pair -> Tuples.of(pair.first(), database, pair.second().getKeys())))
         .collect(Collectors.teeing(
@@ -662,7 +709,7 @@ public class FoundationDbMessageStore {
       final long maxQueueSizeBytes,
       final long targetQueueSizeBytes,
       final long rangeSplitChunkSizeBytes,
-      final UnaryOperator<Mono<Boolean>> deleteModifier) {
+      final Function<Mono<Boolean>, Mono<Boolean>> deleteModifier) {
     final Tag platformTag = Tag.of("platform", DevicePlatformUtil.getDevicePlatform(device)
         .map(platform -> platform.name().toLowerCase(Locale.ROOT))
         .orElse("unknown"));
@@ -716,11 +763,13 @@ public class FoundationDbMessageStore {
                       remainingBytesToDelete.addAndGet(-estimatedDeletedBytes);
                       ESTIMATED_TRIMMED_BYTES_COUNTER.increment(estimatedDeletedBytes);
                     })
-                    .flatMap(_ -> Mono.just(true));
+                    .then(Mono.just(true));
 
-                return deleteModifier.apply(deleteMono)
+                return deleteMono.transform(deleteModifier)
                     .onErrorResume(throwable -> {
-                      LOGGER.warn("Failed to trim message queue for {}:{}", aci, device.getId(), throwable);
+                      if (!ExceptionUtils.isBreakerOpen(throwable)) {
+                        LOGGER.warn("Failed to trim message queue for {}:{}", aci, device.getId(), throwable);
+                      }
                       return Mono.just(false);
                     });
               })
@@ -731,7 +780,9 @@ public class FoundationDbMessageStore {
         .onErrorResume(throwable -> {
           // If we error out on estimating queue size, we don't know if this queue needed trimming
           Metrics.counter(TRIM_QUEUE_COUNTER_NAME, "success", "false").increment();
-          LOGGER.warn("Failed to estimate queue size for {}:{}", aci, device.getId(), throwable);
+          if (!ExceptionUtils.isBreakerOpen(throwable)) {
+            LOGGER.warn("Failed to estimate queue size for {}:{}", aci, device.getId(), throwable);
+          }
           return Mono.empty();
         });
   }
@@ -746,6 +797,24 @@ public class FoundationDbMessageStore {
     }, FaultTolerantDatabase.Context.TRIM_QUEUE);
   }
 
+  /// Returns the number of times a subscriber has started reading a message queue since the last time any message in
+  /// the queue was acknowledged. In cases where a caller's messages span multiple database shards (i.e. during a
+  /// migration), this method returns the maximum count across all shards.
+  ///
+  /// @param aci the account identifier for which to retrieve a read-without-acknowledging-head count
+  /// @param deviceId the device ID for which to retrieve a read-without-acknowledging-head count
+  ///
+  /// @return the number of times a subscriber has started reading messages from the identified message queue since the
+  /// last time any message in the queue was acknowledged
+  public CompletableFuture<Long> getReadsSinceLastAcknowledgedMessage(final AciServiceIdentifier aci, final byte deviceId) {
+    return Flux.fromArray(getDistinctDatabasesForAci(aci))
+        .flatMap(database -> Mono.fromFuture(() -> database.readAsync(transaction ->
+            transaction.get(getReadsSinceLastAcknowledgedMessageKey(aci, deviceId)), FaultTolerantDatabase.Context.TEST)))
+        .map(countBytes -> ByteBuffer.wrap(countBytes).order(ByteOrder.LITTLE_ENDIAN).getLong())
+        .reduce(0L, Math::max)
+        .toFuture();
+  }
+
   @VisibleForTesting
   public static Subspace getAccountSubspace(final AciServiceIdentifier aci) {
     return getAccountSubspace(MESSAGES_SUBSPACE, aci);
@@ -758,6 +827,10 @@ public class FoundationDbMessageStore {
   @VisibleForTesting
   static byte[] getMessagesAvailableWatchKey(final AciServiceIdentifier aci) {
     return getAccountSubspace(aci).pack("l");
+  }
+
+  static byte[] getReadsSinceLastAcknowledgedMessageKey(final AciServiceIdentifier aci, final byte deviceId) {
+    return getDeviceSubspace(aci, deviceId).pack("r");
   }
 
   @VisibleForTesting

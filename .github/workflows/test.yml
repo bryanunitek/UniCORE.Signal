@@ -50,7 +50,7 @@ jobs:
           # ca-certificates: required for AWS CRT client
           apt update && apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin ca-certificates
       - name: Set up JDK
-        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: 'temurin'
           java-version-file: .java-version
@@ -65,8 +65,8 @@ jobs:
         run: docker exec foundationdb1 /usr/bin/fdbcli --exec 'configure new single memory'
       - name: Download and install FoundationDB client
         run: |
-          ./mvnw -e -B -Pexclude-spam-filter clean prepare-package -DskipTests=true
+          ./mvnw -e -B -Pexclude-spam-filter -pl service download:wget@install-foundationdb-client-library
           cp service/target/jib-extra/usr/lib/libfdb_c.so /usr/lib/libfdb_c.x86_64.so
           ldconfig
       - name: Build with Maven
-        run: ./mvnw -e -B clean verify -DfoundationDb.serviceContainerNamePrefix=foundationdb
+        run: ./mvnw -e -B -Pprepull-testcontainers-images clean verify -DfoundationDb.serviceContainerNamePrefix=foundationdb

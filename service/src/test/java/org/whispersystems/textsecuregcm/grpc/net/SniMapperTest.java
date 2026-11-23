@@ -5,7 +5,9 @@
 package org.whispersystems.textsecuregcm.grpc.net;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.netty.bootstrap.Bootstrap;
@@ -13,31 +15,41 @@ import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
-import io.netty.channel.DefaultEventLoopGroup;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.SimpleUserEventChannelHandler;
 import io.netty.channel.local.LocalAddress;
 import io.netty.channel.local.LocalChannel;
+import io.netty.channel.local.LocalIoHandler;
 import io.netty.channel.local.LocalServerChannel;
 import io.netty.handler.ssl.SniHandler;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.handler.ssl.SslHandshakeCompletionEvent;
+import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.pkitesting.CertificateBuilder;
 import io.netty.pkitesting.X509Bundle;
 import io.netty.util.Mapping;
+import io.netty.util.ReferenceCountUtil;
+import io.netty.util.test.LeakPresenceExtension;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.security.KeyStore;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLSession;
@@ -45,12 +57,13 @@ import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
+@ExtendWith(LeakPresenceExtension.class)
 class SniMapperTest {
 
   // Configuration for precomputed keystore blob defined in sni-mapper-test-keystore.p12
@@ -62,8 +75,9 @@ class SniMapperTest {
       CertificateBuilder.Algorithm.rsa2048
   };
 
-  private static DefaultEventLoopGroup eventLoopGroup;
-  private static Mapping<String, SslContext> sniMapping;
+  private static EventLoopGroup eventLoopGroup;
+  private static final Map<SslProvider, Mapping<String, SslContext>> sniMappingsByProvider =
+      new EnumMap<>(SslProvider.class);
 
   private Channel serverChannel;
 
@@ -96,14 +110,16 @@ class SniMapperTest {
     final ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
     keyStore.store(byteArrayOutputStream, keyStorePassword);
 
-    sniMapping = SniMapper.buildSniMapping(new ByteArrayInputStream(byteArrayOutputStream.toByteArray()),
-        new String(keyStorePassword));
+    for (final SslProvider sslProvider : new SslProvider[] { SslProvider.JDK, SslProvider.OPENSSL }) {
+      sniMappingsByProvider.put(sslProvider, SniMapper.buildSniMapping(
+          new ByteArrayInputStream(byteArrayOutputStream.toByteArray()), new String(keyStorePassword), sslProvider));
+    }
 
-    eventLoopGroup = new DefaultEventLoopGroup();
+    eventLoopGroup = new MultiThreadIoEventLoopGroup(LocalIoHandler.newFactory());
   }
 
-  @BeforeEach
-  void setUp() throws Exception {
+  private void startServer(final SslProvider sslProvider) throws InterruptedException {
+    final Mapping<String, SslContext> sniMapping = sniMappingsByProvider.get(sslProvider);
     final LocalAddress localAddress = new LocalAddress(SniMapper.class.getSimpleName());
     serverChannel = new ServerBootstrap()
         .group(eventLoopGroup)
@@ -129,11 +145,17 @@ class SniMapperTest {
   @AfterAll
   static void tearDownAfterAll() throws InterruptedException {
     eventLoopGroup.shutdownGracefully(1, 1000, TimeUnit.MILLISECONDS).sync();
+    sniMappingsByProvider.values().forEach(sniMapping -> {
+      ReferenceCountUtil.release(sniMapping.map(FOO_DOMAIN));
+      ReferenceCountUtil.release(sniMapping.map(BAR_DOMAIN));
+    });
   }
 
-  @Test
-  void unknownDomain() throws Exception {
-    assertNotNull(sniMapping.map("unknown.example.com"));
+  @ParameterizedTest
+  @EnumSource(value = SslProvider.class, names = {"JDK", "OPENSSL"})
+  void unknownDomain(final SslProvider sslProvider) throws Exception {
+    assertNotNull(sniMappingsByProvider.get(sslProvider).map("unknown.example.com"));
+    startServer(sslProvider);
     final X509Certificate defaultCertificate = connectAndGetServerCertificate("unknown.example.com", null);
 
     // bar.example.com is the lexicographically first domain, so we should default to it.
@@ -141,7 +163,7 @@ class SniMapperTest {
   }
 
   static List<Arguments> selectCertificate() {
-    return List.of(
+    final List<Arguments> cases = List.of(
         Arguments.of(FOO_DOMAIN, List.of(), "Ed25519"),
         Arguments.of(BAR_DOMAIN, List.of(), "Ed25519"),
         Arguments.of(BAR_DOMAIN, List.of("ed25519"), "Ed25519"),
@@ -149,21 +171,44 @@ class SniMapperTest {
         Arguments.of(FOO_DOMAIN, List.of("rsa_pss_rsae_sha256", "rsa_pss_rsae_sha384", "rsa_pss_rsae_sha512", "rsa_pkcs1_sha256", "ed25519"), "SHA256withRSA"),
         Arguments.of(FOO_DOMAIN, List.of("ed25519", "rsa_pss_rsae_sha256", "rsa_pss_rsae_sha384", "rsa_pss_rsae_sha512"), "Ed25519")
     );
+
+    // Each provider should select the same certificate
+    return Stream.of(SslProvider.JDK, SslProvider.OPENSSL)
+        .flatMap(sslProvider -> cases.stream().map(arguments -> {
+          final Object[] args = arguments.get();
+          return Arguments.of(sslProvider, args[0], args[1], args[2]);
+        }))
+        .toList();
   }
 
   @ParameterizedTest
   @MethodSource
-  void selectCertificate(final String sni, final List<String> signatureSchemes, final String expectedSigAlgorithm)
-      throws Exception {
+  void selectCertificate(final SslProvider sslProvider, final String sni, final List<String> signatureSchemes,
+      final String expectedSigAlgorithm) throws Exception {
+    startServer(sslProvider);
     final X509Certificate serverCert = connectAndGetServerCertificate(sni, signatureSchemes.toArray(String[]::new));
     assertNotNull(serverCert);
     assertCertificateIsForDomain(serverCert, sni);
     assertEquals(expectedSigAlgorithm, serverCert.getSigAlgName());
   }
 
+  @ParameterizedTest
+  @EnumSource(value = SslProvider.class, names = {"JDK", "OPENSSL"})
+  void noCommonSignatureAlgorithm(final SslProvider sslProvider) throws Exception {
+    startServer(sslProvider);
+
+    final ExecutionException executionException = assertThrows(ExecutionException.class,
+        () -> connectAndGetServerCertificate(FOO_DOMAIN, new String[] { "ecdsa_secp256r1_sha256" }),
+        "server doesn’t have an ECDSA key");
+
+    assertInstanceOf(SSLException.class, executionException.getCause());
+  }
+
   private X509Certificate connectAndGetServerCertificate(final String sniHostname,
       final String[] signatureSchemes) throws Exception {
     final SslContext clientSsl = SslContextBuilder.forClient()
+        // the client can always use the JDK provider
+        .sslProvider(SslProvider.JDK)
         .trustManager(InsecureTrustManagerFactory.INSTANCE)
         .protocols("TLSv1.3")
         .build();
