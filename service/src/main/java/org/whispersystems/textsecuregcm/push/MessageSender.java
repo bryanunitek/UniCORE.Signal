@@ -4,8 +4,8 @@
  */
 package org.whispersystems.textsecuregcm.push;
 
-import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 import static org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.google.common.annotations.VisibleForTesting;
 import io.dropwizard.util.DataSize;
@@ -24,14 +24,12 @@ import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import kotlin.Pair;
-import org.apache.commons.lang3.StringUtils;
 import org.signal.libsignal.protocol.SealedSenderMultiRecipientMessage;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.controllers.MessageDeliveryNotAllowedException;
 import org.whispersystems.textsecuregcm.controllers.MismatchedDevices;
 import org.whispersystems.textsecuregcm.controllers.MismatchedDevicesException;
 import org.whispersystems.textsecuregcm.controllers.MultiRecipientMismatchedDevicesException;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
@@ -119,6 +117,12 @@ public class MessageSender {
       @Nullable final String userAgent)
       throws MismatchedDevicesException, MessageTooLargeException, MessageDeliveryNotAllowedException {
 
+    // Every message in the map is expected to have the same ephemerality.
+    if (dynamicConfigurationManager.getConfiguration().getMessageDeliveryConfiguration().dropEphemeralMessages()
+        && messagesByDeviceId.values().stream().anyMatch(Envelope::getEphemeral)) {
+      return;
+    }
+
     if (dynamicConfigurationManager.getConfiguration().getMessageDeliveryConfiguration().isReadOnly()) {
       throw new MessageDeliveryNotAllowedException();
     }
@@ -132,7 +136,7 @@ public class MessageSender {
         syncMessageSenderDeviceId,
         platformTag);
 
-    messagesManager.insert(destination.getIdentifier(IdentityType.ACI), messagesByDeviceId)
+    messagesManager.insert(destination.getAccountIdentifier(), messagesByDeviceId)
         .forEach((deviceId, destinationPresent) -> {
           final Envelope message = messagesByDeviceId.get(deviceId);
 
@@ -200,6 +204,11 @@ public class MessageSender {
       final boolean isUrgent,
       @Nullable final String userAgent)
       throws MultiRecipientMismatchedDevicesException, MessageTooLargeException, MessageDeliveryNotAllowedException {
+
+    if (dynamicConfigurationManager.getConfiguration().getMessageDeliveryConfiguration().dropEphemeralMessages()
+        && isEphemeral) {
+      return CompletableFuture.completedFuture(null);
+    }
 
     if (dynamicConfigurationManager.getConfiguration().getMessageDeliveryConfiguration().isReadOnly()) {
       throw new MessageDeliveryNotAllowedException();
@@ -327,15 +336,15 @@ public class MessageSender {
 
     final byte excludedDeviceId;
     if (syncMessageSenderDeviceId.isPresent()) {
-      if (messagesByDeviceId.values().stream().anyMatch(message -> StringUtils.isBlank(message.getSourceServiceId()) ||
-          !destination.isIdentifiedBy(ServiceIdentifier.valueOf(message.getSourceServiceId())))) {
+      if (messagesByDeviceId.values().stream().anyMatch(message -> !message.hasSourceServiceId() ||
+          !destination.isIdentifiedBy(ServiceIdentifier.fromByteString(message.getSourceServiceId())))) {
 
         throw new IllegalArgumentException("Sync message sender device ID specified, but one or more messages are not addressed to sender");
       }
       excludedDeviceId = syncMessageSenderDeviceId.get();
     } else {
-      if (messagesByDeviceId.values().stream().anyMatch(message -> StringUtils.isNotBlank(message.getSourceServiceId()) &&
-          destination.isIdentifiedBy(ServiceIdentifier.valueOf(message.getSourceServiceId())))) {
+      if (messagesByDeviceId.values().stream().anyMatch(message -> message.hasSourceServiceId() &&
+          destination.isIdentifiedBy(ServiceIdentifier.fromByteString(message.getSourceServiceId())))) {
 
         throw new IllegalArgumentException("Sync message sender device ID not specified, but one or more messages are addressed to sender");
       }
@@ -410,9 +419,14 @@ public class MessageSender {
           // We know the device must be present because we've already filtered out device IDs that aren't associated
           // with the given account
           final Device device = account.getDevice(deviceId).orElseThrow();
-          final int expectedRegistrationId = device.getRegistrationId(serviceIdentifier.identityType());
+          final Optional<Integer> maybeExpectedRegistrationId = switch (serviceIdentifier.identityType()) {
+            case ACI -> Optional.of(device.getAccountRegistrationId());
+            case PNI -> device.getPhoneNumberIdentityRegistrationId();
+          };
 
-          return registrationId != expectedRegistrationId;
+          return maybeExpectedRegistrationId
+              .map(expectedRegistrationId -> registrationId != expectedRegistrationId)
+              .orElse(true);
         })
         .map(Map.Entry::getKey)
         .collect(Collectors.toSet());

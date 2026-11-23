@@ -8,7 +8,6 @@ package org.whispersystems.textsecuregcm.workers;
 import io.dropwizard.core.Application;
 import io.dropwizard.core.setup.Environment;
 import java.time.Clock;
-import java.util.Base64;
 import java.util.Optional;
 import net.sourceforge.argparse4j.inf.Namespace;
 import net.sourceforge.argparse4j.inf.Subparser;
@@ -19,8 +18,8 @@ import org.whispersystems.textsecuregcm.storage.IssuedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.SubscriberCredentials;
 import org.whispersystems.textsecuregcm.storage.SubscriptionManager;
 import org.whispersystems.textsecuregcm.storage.Subscriptions;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionPaymentProcessor;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionPaymentProcessor;
 
 public class ClearIssuedReceiptRedemptionsCommand extends AbstractCommandWithDependencies {
 
@@ -68,25 +67,12 @@ public class ClearIssuedReceiptRedemptionsCommand extends AbstractCommandWithDep
             throw new IllegalStateException("Cannot clear issued receipts for a non-IAP processor: " + processorType);
       };
       final SubscriptionPaymentProcessor.ReceiptItem receiptItem = processor.getReceiptItem(subscriber.subscriptionId);
-      final boolean deleted = issuedReceiptsManager.clearIssuance(receiptItem.itemId(), processorType).join();
-      logger.info("Deleted issuances for receiptItem: {}, subscriberId: {}, hadExistingIssuances: {}",
-          receiptItem.itemId(), subscriberId, deleted);
+      final boolean deleted = issuedReceiptsManager.clearIssuance(receiptItem.itemId(), processorType);
+      logger.info("Deleted issuances for receiptItem: {}, subscriberId: {}***, hadExistingIssuances: {}",
+          receiptItem.itemId(), subscriberId.substring(0, subscriberId.length() / 2), deleted);
     } catch (Exception ex) {
       logger.warn("Removal Exception", ex);
       throw new RuntimeException(ex);
     }
-  }
-
-  public static void main(String[] args) throws Exception {
-    final String subscriberId = "7ywqmymkSMBkBi9v06Iy4AN8DiN_lg8gHXM8TSpO0Z0";
-
-    final SubscriberCredentials creds = SubscriberCredentials
-        .process(Optional.empty(), subscriberId, Clock.systemUTC());
-    System.out.println(Base64.getEncoder().encodeToString(creds.subscriberUser()));
-
-    final String pc = "AWN1c19TV3hDUEhlWDBldzB0UA==";
-    final byte[] bc = Base64.getDecoder().decode(pc);
-    System.out.println(bc[0]);
-    System.out.println(new String(bc, 1, bc.length - 1));
   }
 }

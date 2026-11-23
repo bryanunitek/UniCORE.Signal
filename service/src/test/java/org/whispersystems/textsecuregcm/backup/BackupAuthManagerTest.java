@@ -111,8 +111,8 @@ public class BackupAuthManagerTest {
     final BackupAuthManager authManager = create();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(aci);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
 
     AccountsHelper.setupMockGet(accountsManager, account);
     AccountsHelper.setupMockUpdate(accountsManager);
@@ -340,7 +340,7 @@ public class BackupAuthManagerTest {
         .build();
     clock.pin(Instant.EPOCH.plus(Duration.ofDays(1)));
     when(accountsManager.update(any(Account.class), any())).thenReturn(account);
-    when(redeemedReceiptsManager.put(any(), eq(expirationTime.getEpochSecond()), eq(201L), eq(aci)))
+    when(redeemedReceiptsManager.put(any(), eq(expirationTime), eq(201L), eq(aci)))
         .thenReturn(true);
     authManager.redeemReceipt(account, receiptPresentation(201, expirationTime));
     verify(accountsManager, times(1)).update(any(Account.class), any());
@@ -353,7 +353,7 @@ public class BackupAuthManagerTest {
     final Account account = new MockAccountBuilder().mediaCredential(Optional.empty()).build();
 
     clock.pin(Instant.EPOCH.plus(Duration.ofDays(1)));
-    when(redeemedReceiptsManager.put(any(), eq(expirationTime.getEpochSecond()), eq(201L), eq(aci)))
+    when(redeemedReceiptsManager.put(any(), eq(expirationTime), eq(201L), eq(aci)))
         .thenReturn(true);
     assertThatExceptionOfType(BackupMissingIdCommitmentException.class)
         .isThrownBy(() -> authManager.redeemReceipt(account, receiptPresentation(201, expirationTime)));
@@ -374,7 +374,7 @@ public class BackupAuthManagerTest {
 
     clock.pin(Instant.EPOCH.plus(Duration.ofDays(1)));
     when(accountsManager.update(any(Account.class), any())).thenReturn(account);
-    when(redeemedReceiptsManager.put(any(), eq(newExpirationTime.getEpochSecond()), eq(201L), eq(aci)))
+    when(redeemedReceiptsManager.put(any(), eq(newExpirationTime), eq(201L), eq(aci)))
         .thenReturn(true);
     authManager.redeemReceipt(account, receiptPresentation(201, newExpirationTime));
 
@@ -429,7 +429,7 @@ public class BackupAuthManagerTest {
 
     clock.pin(Instant.EPOCH.plus(Duration.ofDays(1)));
     when(accountsManager.update(any(Account.class), any())).thenReturn(account);
-    when(redeemedReceiptsManager.put(any(), eq(expirationTime.getEpochSecond()), eq(201L), eq(aci)))
+    when(redeemedReceiptsManager.put(any(), eq(expirationTime), eq(201L), eq(aci)))
         .thenReturn(false);
 
     assertThatExceptionOfType(BackupBadReceiptException.class)
@@ -556,7 +556,7 @@ public class BackupAuthManagerTest {
     private final Account account = mock(Account.class);
 
     MockAccountBuilder() {
-      when(account.getUuid()).thenReturn(aci);
+      when(account.getAccountIdentifier()).thenReturn(aci);
     }
 
     MockAccountBuilder backupLevel(BackupLevel backupLevel) {

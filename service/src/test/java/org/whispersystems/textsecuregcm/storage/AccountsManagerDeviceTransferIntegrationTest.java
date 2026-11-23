@@ -18,7 +18,6 @@ import java.util.Base64;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.jupiter.api.AfterEach;
@@ -31,7 +30,6 @@ import org.whispersystems.textsecuregcm.entities.RemoteAttachment;
 import org.whispersystems.textsecuregcm.entities.RemoteAttachmentError;
 import org.whispersystems.textsecuregcm.entities.RestoreAccountRequest;
 import org.whispersystems.textsecuregcm.entities.TransferArchiveResult;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.redis.RedisServerExtension;
 import org.whispersystems.textsecuregcm.securestorage.SecureStorageClient;
@@ -68,12 +66,14 @@ public class AccountsManagerDeviceTransferIntegrationTest {
         mock(SecureStorageClient.class),
         mock(SecureValueRecoveryClient.class),
         mock(DisconnectionRequestManager.class),
-        mock(RegistrationRecoveryPasswordsManager.class),
-        mock(ExecutorService.class),
+        mock(PhoneNumberRecoveryPasswordsManager.class),
+        mock(SandboxAccounts.class),
         mock(ScheduledExecutorService.class),
         mock(ScheduledExecutorService.class),
         Clock.systemUTC(),
-        "link-device-secret".getBytes(StandardCharsets.UTF_8));
+        "link-device-secret".getBytes(StandardCharsets.UTF_8),
+        null,
+        null);
 
     accountsManager.start();
   }
@@ -94,10 +94,10 @@ public class AccountsManagerDeviceTransferIntegrationTest {
 
     final Device device = mock(Device.class);
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
 
     final Account account = mock(Account.class);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
 
     final CompletableFuture<Optional<TransferArchiveResult>> displacedFuture =
         accountsManager.waitForTransferArchive(account, device, Duration.ofSeconds(5));
@@ -123,10 +123,10 @@ public class AccountsManagerDeviceTransferIntegrationTest {
 
     final Device device = mock(Device.class);
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
 
     final Account account = mock(Account.class);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
 
     accountsManager.recordTransferArchiveUpload(account, deviceId, registrationId, transferArchive).join();
 
@@ -145,10 +145,10 @@ public class AccountsManagerDeviceTransferIntegrationTest {
 
     final Device device = mock(Device.class);
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
 
     final Account account = mock(Account.class);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
 
     accountsManager.recordTransferArchiveUpload(account, deviceId,
         registrationId, transferArchiveError).join();
@@ -162,10 +162,10 @@ public class AccountsManagerDeviceTransferIntegrationTest {
     final UUID accountIdentifier = UUID.randomUUID();
 
     final Device device = mock(Device.class);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(123);
+    when(device.getAccountRegistrationId()).thenReturn(123);
 
     final Account account = mock(Account.class);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
 
     assertEquals(Optional.empty(),
         accountsManager.waitForTransferArchive(account, device, Duration.ofMillis(1)).join());

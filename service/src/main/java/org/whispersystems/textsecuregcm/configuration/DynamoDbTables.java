@@ -55,6 +55,7 @@ public class DynamoDbTables {
   private final Table clientReleases;
   private final Table deletedAccounts;
   private final Table deletedAccountsLock;
+  private final TableWithExpiration donationPermits;
   private final IssuedReceiptsTableConfiguration issuedReceipts;
   private final Table ecKeys;
   private final Table ecSignedPreKeys;
@@ -63,14 +64,15 @@ public class DynamoDbTables {
   private final TableWithExpiration messages;
   private final TableWithExpiration onetimeDonations;
   private final Table phoneNumberIdentifiers;
+  private final Table profileAvatars;
   private final Table profiles;
   private final Table profilesV2;
   private final Table pushChallenge;
-  private final Table pushNotificationExperimentSamples;
-  private final TableWithExpiration redeemedReceipts;
+  private final Table redeemedReceipts;
   private final TableWithExpiration registrationRecovery;
   private final Table remoteConfig;
   private final Table reportMessage;
+  private final Table sandboxAccounts;
   private final TableWithExpiration scheduledJobs;
   private final Table subscriptions;
   private final Table verificationSessions;
@@ -84,6 +86,7 @@ public class DynamoDbTables {
       @JsonProperty("clientReleases") final Table clientReleases,
       @JsonProperty("deletedAccounts") final Table deletedAccounts,
       @JsonProperty("deletedAccountsLock") final Table deletedAccountsLock,
+      @JsonProperty("donationPermits") final TableWithExpiration donationPermits,
       @JsonProperty("issuedReceipts") final IssuedReceiptsTableConfiguration issuedReceipts,
       @JsonProperty("ecKeys") final Table ecKeys,
       @JsonProperty("ecSignedPreKeys") final Table ecSignedPreKeys,
@@ -92,14 +95,15 @@ public class DynamoDbTables {
       @JsonProperty("messages") final TableWithExpiration messages,
       @JsonProperty("onetimeDonations") final TableWithExpiration onetimeDonations,
       @JsonProperty("phoneNumberIdentifiers") final Table phoneNumberIdentifiers,
+      @JsonProperty("profileAvatars") final Table profileAvatars,
       @JsonProperty("profiles") final Table profiles,
       @JsonProperty("profilesV2") final Table profilesV2,
       @JsonProperty("pushChallenge") final Table pushChallenge,
-      @JsonProperty("pushNotificationExperimentSamples") final Table pushNotificationExperimentSamples,
-      @JsonProperty("redeemedReceipts") final TableWithExpiration redeemedReceipts,
+      @JsonProperty("redeemedReceipts") final Table redeemedReceipts,
       @JsonProperty("registrationRecovery") final TableWithExpiration registrationRecovery,
       @JsonProperty("remoteConfig") final Table remoteConfig,
       @JsonProperty("reportMessage") final Table reportMessage,
+      @JsonProperty("sandboxAccounts") final Table sandboxAccounts,
       @JsonProperty("scheduledJobs") final TableWithExpiration scheduledJobs,
       @JsonProperty("subscriptions") final Table subscriptions,
       @JsonProperty("verificationSessions") final Table verificationSessions) {
@@ -112,6 +116,7 @@ public class DynamoDbTables {
     this.clientReleases = clientReleases;
     this.deletedAccounts = deletedAccounts;
     this.deletedAccountsLock = deletedAccountsLock;
+    this.donationPermits = donationPermits;
     this.issuedReceipts = issuedReceipts;
     this.ecKeys = ecKeys;
     this.ecSignedPreKeys = ecSignedPreKeys;
@@ -120,14 +125,15 @@ public class DynamoDbTables {
     this.messages = messages;
     this.onetimeDonations = onetimeDonations;
     this.phoneNumberIdentifiers = phoneNumberIdentifiers;
+    this.profileAvatars = profileAvatars;
     this.profiles = profiles;
     this.profilesV2 = profilesV2;
     this.pushChallenge = pushChallenge;
-    this.pushNotificationExperimentSamples = pushNotificationExperimentSamples;
     this.redeemedReceipts = redeemedReceipts;
     this.registrationRecovery = registrationRecovery;
     this.remoteConfig = remoteConfig;
     this.reportMessage = reportMessage;
+    this.sandboxAccounts = sandboxAccounts;
     this.scheduledJobs = scheduledJobs;
     this.subscriptions = subscriptions;
     this.verificationSessions = verificationSessions;
@@ -183,6 +189,12 @@ public class DynamoDbTables {
 
   @NotNull
   @Valid
+  public TableWithExpiration getDonationPermits() {
+    return donationPermits;
+  }
+
+  @NotNull
+  @Valid
   public IssuedReceiptsTableConfiguration getIssuedReceipts() {
     return issuedReceipts;
   }
@@ -231,6 +243,12 @@ public class DynamoDbTables {
 
   @NotNull
   @Valid
+  public Table getProfileAvatars() {
+    return profileAvatars;
+  }
+
+  @NotNull
+  @Valid
   public Table getProfilesV1() {
     return profiles;
   }
@@ -249,13 +267,7 @@ public class DynamoDbTables {
 
   @NotNull
   @Valid
-  public Table getPushNotificationExperimentSamples() {
-    return pushNotificationExperimentSamples;
-  }
-
-  @NotNull
-  @Valid
-  public TableWithExpiration getRedeemedReceipts() {
+  public Table getRedeemedReceipts() {
     return redeemedReceipts;
   }
 
@@ -275,6 +287,12 @@ public class DynamoDbTables {
   @Valid
   public Table getReportMessage() {
     return reportMessage;
+  }
+
+  @NotNull
+  @Valid
+  public Table getSandboxAccounts() {
+    return sandboxAccounts;
   }
 
   @NotNull

@@ -14,28 +14,51 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Locale.LanguageRange;
+import java.util.Map;
 import java.util.Optional;
-import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
-import java.util.random.RandomGenerator;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
+import org.whispersystems.textsecuregcm.storage.Account;
 
 public class Util {
-
-  private static final RandomGenerator RANDOM_GENERATOR = new Random();
 
   private static final PhoneNumberUtil PHONE_NUMBER_UTIL = PhoneNumberUtil.getInstance();
 
   public static final Runnable NOOP = () -> {};
+
+  public static final String COUNTRY_CODE_NOT_APPLICABLE = "n/a";
+  public static final String REGION_NOT_APPLICABLE = "n/a";
+
+  // Keep in sync with registration-service's FictitiousNumberVerificationCodeSender, which sends verification codes
+  // for these numbers to a datastore instead of an SMS/voice provider; see
+  // https://github.com/signalapp/registration-service/blob/cbace936454c1f5e62590d75eaa42ecd2b54f6ee/src/main/java/org/signal/registration/sender/fictitious/FictitiousNumberVerificationCodeSender.java#L43-L52
+  private static final List<Pattern> FICTITIOUS_NUMBER_PATTERNS = List.of(
+      // NANPA fictitious numbers
+      Pattern.compile("\\+1[0-9]{3}55501[0-9]{2}"),
+
+      // UK "numbers for drama"
+      Pattern.compile("\\+447700900[0-9]{3}"),
+
+      // French numbers "for use in audiovisual productions"
+      Pattern.compile("\\+3363998[0-9]{4}")
+  );
+
+  // We use a `HashMap` because `HashMap` allows for null keys at query time, and `PhoneNumberUtil` may return a null
+  // region code for some phone numbers
+  private static final Map<String, AlternatePhoneNumberFormGenerator> ALTERNATE_FORM_GENERATORS_BY_REGION =
+      new HashMap<>(Map.of(
+          "BJ", new BeninAlternateFormGenerator(),
+          "GM", new GambiaAlternateFormGenerator()
+      ));
 
   // Use `CompletableFuture#thenApply(ASYNC_EMPTY_RESPONSE) to convert futures to
   // CompletableFuture<Response> instead of using NOOP to convert them to CompletableFuture<Void>
@@ -87,12 +110,20 @@ public class Util {
     }
   }
 
-  public static String getCountryCode(String number) {
+  public static String getCountryCode(final Account account) {
+    return account.getNumber().map(Util::getCountryCode).orElse(COUNTRY_CODE_NOT_APPLICABLE);
+  }
+
+  public static String getCountryCode(final String number) {
     try {
       return String.valueOf(PHONE_NUMBER_UTIL.parse(number, null).getCountryCode());
     } catch (final NumberParseException e) {
       return "0";
     }
+  }
+
+  public static String getRegion(final Account account) {
+    return account.getNumber().map(Util::getRegion).orElse(REGION_NOT_APPLICABLE);
   }
 
   public static String getRegion(final String number) {
@@ -124,25 +155,9 @@ public class Util {
     try {
       final PhoneNumber phoneNumber = PHONE_NUMBER_UTIL.parse(number, null);
 
-      // Benin changed phone number formats from +229 XXXXXXXX to +229 01XXXXXXXX on November 30, 2024
-      if ("BJ".equals(PHONE_NUMBER_UTIL.getRegionCodeForNumber(phoneNumber))) {
-        final String nationalSignificantNumber = PHONE_NUMBER_UTIL.getNationalSignificantNumber(phoneNumber);
-        final String alternateE164;
-
-        if (nationalSignificantNumber.length() == 10) {
-          // This is a new-format number; we can get the old-format version by stripping the leading "01" from the
-          // national number
-          alternateE164 = "+229" + StringUtils.removeStart(nationalSignificantNumber, "01");
-        } else {
-          // This is an old-format number; we can get the new-format version by adding a "01" prefix to the national
-          // number
-          alternateE164 = "+22901" + nationalSignificantNumber;
-        }
-
-        return List.of(number, alternateE164);
-      }
-
-      return List.of(number);
+      return ALTERNATE_FORM_GENERATORS_BY_REGION.getOrDefault(PHONE_NUMBER_UTIL.getRegionCodeForNumber(phoneNumber),
+              AlternatePhoneNumberFormGenerator.IDENTITY)
+          .getAlternateForms(number);
     } catch (final NumberParseException e) {
       return List.of(number);
     }
@@ -177,7 +192,7 @@ public class Util {
       if (regions.contains("BJ")) {
         // Benin changed phone number formats from +229 XXXXXXXX to +229 01XXXXXXXX on November 30, 2024
         // We prefer the longest form for long-term stability
-        return e164s.stream().sorted(Comparator.comparingInt(String::length).reversed()).findFirst();
+        return e164s.stream().max(Comparator.comparingInt(String::length));
       }
       // No matching country; fall back to something that's at least stable
       return e164s.stream().sorted().findFirst();
@@ -216,14 +231,10 @@ public class Util {
   }
 
   /**
-   * Benin changed phone number formats from +229 XXXXXXXX to +229 01XXXXXXXX on November 30, 2024
-   *
-   * @param phoneNumber the phone number to check.
-   * @return whether the provided phone number is an old-format Benin phone number
+   * @return whether the E164-formatted {@code number} is in a range that registration-service treats as fictitious
    */
-  public static boolean isOldFormatBeninPhoneNumber(final Phonenumber.PhoneNumber phoneNumber) {
-    return "BJ".equals(PHONE_NUMBER_UTIL.getRegionCodeForNumber(phoneNumber)) &&
-        PHONE_NUMBER_UTIL.getNationalSignificantNumber(phoneNumber).length() == 8;
+  public static boolean isFictitiousNumber(final String number) {
+    return FICTITIOUS_NUMBER_PATTERNS.stream().anyMatch(pattern -> pattern.matcher(number).matches());
   }
 
   /**
@@ -235,9 +246,6 @@ public class Util {
    */
   public static Phonenumber.PhoneNumber canonicalizePhoneNumber(final Phonenumber.PhoneNumber phoneNumber)
       throws NumberParseException, ObsoletePhoneNumberFormatException {
-    if (isOldFormatBeninPhoneNumber(phoneNumber)) {
-      throw new ObsoletePhoneNumberFormatException("bj");
-    }
     return phoneNumber;
   }
 
@@ -273,18 +281,6 @@ public class Util {
   }
 
   /**
-   * Map ints to non-negative ints.
-   * <br>
-   * Unlike Math.abs this method handles Integer.MIN_VALUE correctly.
-   *
-   * @param n any int value
-   * @return an int value guaranteed to be non-negative
-   */
-  public static int ensureNonNegativeInt(int n) {
-    return n == Integer.MIN_VALUE ? 0 : Math.abs(n);
-  }
-
-  /**
    * Map longs to non-negative longs.
    * <br>
    * Unlike Math.abs this method handles Long.MIN_VALUE correctly.
@@ -294,46 +290,5 @@ public class Util {
    */
   public static long ensureNonNegativeLong(long n) {
     return n == Long.MIN_VALUE ? 0 : Math.abs(n);
-  }
-
-  /**
-   * Chooses min(values.size(), n) random values in shuffled order.
-   * <br>
-   * Copies the input Array - use for small lists only or for when n/values.size() is near 1.
-   */
-  public static <E> List<E> randomNOfShuffled(List<E> values, int n) {
-    if(values == null || values.isEmpty()) {
-      return Collections.emptyList();
-    }
-
-    List<E> result = new ArrayList<>(values);
-    Collections.shuffle(result);
-
-    return result.stream().limit(n).toList();
-  }
-
-  /**
-   * Chooses min(values.size(), n) random values. Return value is in stable order from input values.
-   * Not uniform random, but good enough.
-   * <br>
-   * Does NOT copy the input Array.
-   */
-  public static <E> List<E> randomNOfStable(List<E> values, int n) {
-    if(values == null || values.isEmpty()) {
-      return Collections.emptyList();
-    }
-    if(n >= values.size()) {
-      return values;
-    }
-
-    Set<Integer> indices = new HashSet<>(RANDOM_GENERATOR.ints(0, values.size()).distinct().limit(n).boxed().toList());
-    List<E> result = new ArrayList<>(n);
-    for(int i = 0; i < values.size() && result.size() < n; i++) {
-      if(indices.contains(i)) {
-        result.add(values.get(i));
-      }
-    }
-
-    return result;
   }
 }

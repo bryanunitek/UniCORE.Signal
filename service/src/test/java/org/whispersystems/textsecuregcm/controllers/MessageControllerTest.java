@@ -79,7 +79,6 @@ import org.whispersystems.textsecuregcm.entities.SendMultiRecipientMessageRespon
 import org.whispersystems.textsecuregcm.entities.SpamReport;
 import org.whispersystems.textsecuregcm.entities.StaleDevicesResponse;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.CardinalityEstimator;
@@ -714,70 +713,6 @@ class MessageControllerTest {
   }
 
   @Test
-  void testReportMessageByE164() {
-    final String senderNumber = "+12125550001";
-    final UUID senderAci = UUID.randomUUID();
-    final UUID senderPni = UUID.randomUUID();
-    final String userAgent = "user-agent";
-    UUID messageGuid = UUID.randomUUID();
-
-    final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
-
-    when(accountsManager.getByE164(senderNumber)).thenReturn(Optional.of(account));
-
-    try (final Response response =
-        resources.getJerseyTest()
-            .target(String.format("/v1/messages/report/%s/%s", senderNumber, messageGuid))
-            .request()
-            .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
-            .header(HttpHeaders.USER_AGENT, userAgent)
-            .post(null)) {
-
-      assertThat(response.getStatus(), is(equalTo(202)));
-
-      verify(reportMessageManager).report(Optional.of(senderNumber), Optional.of(senderAci), Optional.of(senderPni),
-          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent);
-      verify(accountsManager, never()).findRecentlyDeletedPhoneNumberIdentifier(any(UUID.class));
-      verify(phoneNumberIdentifiers, never()).getPhoneNumber(any());
-    }
-  }
-
-  @Test
-  void testReportMesageByE164DeletedAccount() {
-    final String senderNumber = "+12125550001";
-    final UUID senderAci = UUID.randomUUID();
-    final UUID senderPni = UUID.randomUUID();
-    final String userAgent = "user-agent";
-    UUID messageGuid = UUID.randomUUID();
-
-    final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
-
-    when(accountsManager.getByE164(senderNumber)).thenReturn(Optional.empty());
-    when(phoneNumberIdentifiers.getPhoneNumberIdentifier(senderNumber)).thenReturn(CompletableFuture.completedFuture(senderPni));
-    when(accountsManager.findRecentlyDeletedAccountIdentifier(senderPni)).thenReturn(Optional.of(senderAci));
-
-    try (final Response response =
-        resources.getJerseyTest()
-            .target(String.format("/v1/messages/report/%s/%s", senderNumber, messageGuid))
-            .request()
-            .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
-            .header(HttpHeaders.USER_AGENT, userAgent)
-            .post(null)) {
-
-      assertThat(response.getStatus(), is(equalTo(202)));
-
-      verify(reportMessageManager).report(Optional.of(senderNumber), Optional.of(senderAci), Optional.of(senderPni),
-          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent);
-    }
-  }
-
-  @Test
   void testReportMessageByAci() {
     final String senderNumber = "+12125550001";
     final UUID senderAci = UUID.randomUUID();
@@ -786,11 +721,11 @@ class MessageControllerTest {
     UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumber()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(senderPni));
 
-    when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.of(account));
+    when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(senderAci))).thenReturn(Optional.of(account));
     when(phoneNumberIdentifiers.getPhoneNumber(senderPni)).thenReturn(CompletableFuture.completedFuture(List.of(senderNumber)));
 
     try (final Response response =
@@ -803,8 +738,8 @@ class MessageControllerTest {
 
       assertThat(response.getStatus(), is(equalTo(202)));
 
-      verify(reportMessageManager).report(Optional.of(senderNumber), Optional.of(senderAci), Optional.of(senderPni),
-          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent);
+      verify(reportMessageManager).report(Optional.of(senderNumber), senderAci, Optional.of(senderPni),
+          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent, false);
       verify(accountsManager, never()).findRecentlyDeletedPhoneNumberIdentifier(any(UUID.class));
       verify(phoneNumberIdentifiers, never()).getPhoneNumber(any());
     }
@@ -819,9 +754,9 @@ class MessageControllerTest {
     final UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumber()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(senderPni));
 
     when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.empty());
     when(accountsManager.findRecentlyDeletedPhoneNumberIdentifier(senderAci)).thenReturn(Optional.of(senderPni));
@@ -837,8 +772,8 @@ class MessageControllerTest {
 
       assertThat(response.getStatus(), is(equalTo(202)));
 
-      verify(reportMessageManager).report(Optional.of(senderNumber), Optional.of(senderAci), Optional.of(senderPni),
-          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent);
+      verify(reportMessageManager).report(Optional.of(senderNumber), senderAci, Optional.of(senderPni),
+          messageGuid, AuthHelper.VALID_UUID, Optional.empty(), userAgent, true);
     }
   }
 
@@ -851,11 +786,11 @@ class MessageControllerTest {
     UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumber()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(senderPni));
 
-    when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.of(account));
+    when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(senderAci))).thenReturn(Optional.of(account));
     when(accountsManager.findRecentlyDeletedPhoneNumberIdentifier(senderAci)).thenReturn(Optional.of(senderPni));
     when(phoneNumberIdentifiers.getPhoneNumber(senderPni)).thenReturn(CompletableFuture.completedFuture(List.of(senderNumber)));
 
@@ -870,21 +805,24 @@ class MessageControllerTest {
 
       assertThat(response.getStatus(), is(equalTo(202)));
       verify(reportMessageManager).report(eq(Optional.of(senderNumber)),
-          eq(Optional.of(senderAci)),
+          eq(senderAci),
           eq(Optional.of(senderPni)),
           eq(messageGuid),
           eq(AuthHelper.VALID_UUID),
           argThat(maybeBytes -> maybeBytes.map(bytes -> Arrays.equals(bytes, new byte[3])).orElse(false)),
-          any());
+          any(),
+          eq(false));
       verify(accountsManager, never()).findRecentlyDeletedPhoneNumberIdentifier(any(UUID.class));
       verify(phoneNumberIdentifiers, never()).getPhoneNumber(any());
     }
 
-    when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.empty());
+    when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(senderAci))).thenReturn(Optional.empty());
 
     messageGuid = UUID.randomUUID();
 
-    entity = Entity.entity(new SpamReport(new byte[5]), "application/json");
+    final byte[] reportSpamToken = new byte[5];
+
+    entity = Entity.entity(new SpamReport(reportSpamToken), "application/json");
 
     try (final Response response =
         resources.getJerseyTest()
@@ -895,12 +833,13 @@ class MessageControllerTest {
 
       assertThat(response.getStatus(), is(equalTo(202)));
       verify(reportMessageManager).report(eq(Optional.of(senderNumber)),
-          eq(Optional.of(senderAci)),
+          eq(senderAci),
           eq(Optional.of(senderPni)),
           eq(messageGuid),
           eq(AuthHelper.VALID_UUID),
-          argThat(maybeBytes -> maybeBytes.map(bytes -> Arrays.equals(bytes, new byte[5])).orElse(false)),
-          any());
+          argThat(maybeBytes -> maybeBytes.map(bytes -> Arrays.equals(bytes, reportSpamToken)).orElse(false)),
+          any(),
+          eq(true));
     }
   }
 
@@ -914,9 +853,9 @@ class MessageControllerTest {
     UUID messageGuid = UUID.randomUUID();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(senderAci);
-    when(account.getNumber()).thenReturn(senderNumber);
-    when(account.getPhoneNumberIdentifier()).thenReturn(senderPni);
+    when(account.getAccountIdentifier()).thenReturn(senderAci);
+    when(account.getNumber()).thenReturn(Optional.of(senderNumber));
+    when(account.getPhoneNumberIdentifier()).thenReturn(Optional.of(senderPni));
 
     when(accountsManager.getByAccountIdentifier(senderAci)).thenReturn(Optional.of(account));
     when(accountsManager.findRecentlyDeletedPhoneNumberIdentifier(senderAci)).thenReturn(Optional.of(senderPni));
@@ -1094,25 +1033,25 @@ class MessageControllerTest {
 
     final Device singleDeviceAccountPrimary = mock(Device.class);
     when(singleDeviceAccountPrimary.getId()).thenReturn(Device.PRIMARY_ID);
-    when(singleDeviceAccountPrimary.getRegistrationId(IdentityType.ACI)).thenReturn(singleDevicePrimaryRegistrationId);
+    when(singleDeviceAccountPrimary.getAccountRegistrationId()).thenReturn(singleDevicePrimaryRegistrationId);
 
     final Device multiDeviceAccountPrimary = mock(Device.class);
     when(multiDeviceAccountPrimary.getId()).thenReturn(Device.PRIMARY_ID);
-    when(multiDeviceAccountPrimary.getRegistrationId(IdentityType.ACI)).thenReturn(multiDevicePrimaryRegistrationId);
+    when(multiDeviceAccountPrimary.getAccountRegistrationId()).thenReturn(multiDevicePrimaryRegistrationId);
 
     final Device multiDeviceAccountLinked = mock(Device.class);
     when(multiDeviceAccountLinked.getId()).thenReturn((byte) (Device.PRIMARY_ID + 1));
-    when(multiDeviceAccountLinked.getRegistrationId(IdentityType.ACI)).thenReturn(multiDeviceLinkedRegistrationId);
+    when(multiDeviceAccountLinked.getAccountRegistrationId()).thenReturn(multiDeviceLinkedRegistrationId);
 
     final Account singleDeviceAccount = mock(Account.class);
-    when(singleDeviceAccount.getIdentifier(IdentityType.ACI)).thenReturn(singleDeviceAccountAci);
+    when(singleDeviceAccount.getAccountIdentifier()).thenReturn(singleDeviceAccountAci);
     when(singleDeviceAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(singleDeviceAccountUak));
     when(singleDeviceAccount.getDevices()).thenReturn(List.of(singleDeviceAccountPrimary));
     when(singleDeviceAccount.getDevice(anyByte())).thenReturn(Optional.empty());
     when(singleDeviceAccount.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(singleDeviceAccountPrimary));
 
     final Account multiDeviceAccount = mock(Account.class);
-    when(multiDeviceAccount.getIdentifier(IdentityType.ACI)).thenReturn(multiDeviceAccountAci);
+    when(multiDeviceAccount.getAccountIdentifier()).thenReturn(multiDeviceAccountAci);
     when(multiDeviceAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(multiDeviceAccountUak));
     when(multiDeviceAccount.getDevices()).thenReturn(List.of(multiDeviceAccountPrimary, multiDeviceAccountLinked));
     when(multiDeviceAccount.getDevice(anyByte())).thenReturn(Optional.empty());
@@ -1512,25 +1451,25 @@ class MessageControllerTest {
 
     final Device singleDeviceAccountPrimary = mock(Device.class);
     when(singleDeviceAccountPrimary.getId()).thenReturn(Device.PRIMARY_ID);
-    when(singleDeviceAccountPrimary.getRegistrationId(IdentityType.ACI)).thenReturn(singleDevicePrimaryRegistrationId);
+    when(singleDeviceAccountPrimary.getAccountRegistrationId()).thenReturn(singleDevicePrimaryRegistrationId);
 
     final Device multiDeviceAccountPrimary = mock(Device.class);
     when(multiDeviceAccountPrimary.getId()).thenReturn(Device.PRIMARY_ID);
-    when(multiDeviceAccountPrimary.getRegistrationId(IdentityType.ACI)).thenReturn(multiDevicePrimaryRegistrationId);
+    when(multiDeviceAccountPrimary.getAccountRegistrationId()).thenReturn(multiDevicePrimaryRegistrationId);
 
     final Device multiDeviceAccountLinked = mock(Device.class);
     when(multiDeviceAccountLinked.getId()).thenReturn((byte) (Device.PRIMARY_ID + 1));
-    when(multiDeviceAccountLinked.getRegistrationId(IdentityType.ACI)).thenReturn(multiDeviceLinkedRegistrationId);
+    when(multiDeviceAccountLinked.getAccountRegistrationId()).thenReturn(multiDeviceLinkedRegistrationId);
 
     final Account singleDeviceAccount = mock(Account.class);
-    when(singleDeviceAccount.getIdentifier(IdentityType.ACI)).thenReturn(singleDeviceAccountAci);
+    when(singleDeviceAccount.getAccountIdentifier()).thenReturn(singleDeviceAccountAci);
     when(singleDeviceAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(singleDeviceAccountUak));
     when(singleDeviceAccount.getDevices()).thenReturn(List.of(singleDeviceAccountPrimary));
     when(singleDeviceAccount.getDevice(anyByte())).thenReturn(Optional.empty());
     when(singleDeviceAccount.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(singleDeviceAccountPrimary));
 
     final Account multiDeviceAccount = mock(Account.class);
-    when(multiDeviceAccount.getIdentifier(IdentityType.ACI)).thenReturn(multiDeviceAccountAci);
+    when(multiDeviceAccount.getAccountIdentifier()).thenReturn(multiDeviceAccountAci);
     when(multiDeviceAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(multiDeviceAccountUak));
     when(multiDeviceAccount.getDevices()).thenReturn(List.of(multiDeviceAccountPrimary, multiDeviceAccountLinked));
     when(multiDeviceAccount.getDevice(anyByte())).thenReturn(Optional.empty());
@@ -1598,10 +1537,10 @@ class MessageControllerTest {
 
     final Device singleDeviceAccountPrimary = mock(Device.class);
     when(singleDeviceAccountPrimary.getId()).thenReturn(Device.PRIMARY_ID);
-    when(singleDeviceAccountPrimary.getRegistrationId(IdentityType.ACI)).thenReturn(singleDevicePrimaryRegistrationId);
+    when(singleDeviceAccountPrimary.getAccountRegistrationId()).thenReturn(singleDevicePrimaryRegistrationId);
 
     final Account singleDeviceAccount = mock(Account.class);
-    when(singleDeviceAccount.getIdentifier(IdentityType.ACI)).thenReturn(singleDeviceAccountAci);
+    when(singleDeviceAccount.getAccountIdentifier()).thenReturn(singleDeviceAccountAci);
     when(singleDeviceAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(singleDeviceAccountUak));
     when(singleDeviceAccount.getDevices()).thenReturn(List.of(singleDeviceAccountPrimary));
     when(singleDeviceAccount.getDevice(anyByte())).thenReturn(Optional.empty());

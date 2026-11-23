@@ -5,6 +5,7 @@
 
 package org.whispersystems.textsecuregcm.grpc;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -14,7 +15,9 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.whispersystems.textsecuregcm.grpc.GrpcTestUtils.assertRateLimitExceeded;
 import static org.whispersystems.textsecuregcm.grpc.GrpcTestUtils.assertStatusException;
@@ -31,6 +34,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -56,6 +60,8 @@ import org.signal.chat.keys.SetOneTimeEcPreKeysRequest;
 import org.signal.chat.keys.SetOneTimeKemSignedPreKeysRequest;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.protocol.ecc.ECKeyPair;
+import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessChecksum;
+import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.entities.ECPreKey;
 import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
@@ -71,6 +77,7 @@ import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.KeyIdUtil;
 import org.whispersystems.textsecuregcm.storage.KeysManager;
 import org.whispersystems.textsecuregcm.tests.util.KeysHelper;
+import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import reactor.core.publisher.Mono;
 
@@ -94,6 +101,7 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
   @Mock
   private Device authenticatedDevice;
 
+  private Account authenticatedAccount;
 
   @Override
   protected KeysGrpcService createServiceBeforeEachTest() {
@@ -104,13 +112,12 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
 
     when(authenticatedDevice.getId()).thenReturn(AUTHENTICATED_DEVICE_ID);
 
-    final Account authenticatedAccount = mock(Account.class);
-    when(authenticatedAccount.getUuid()).thenReturn(AUTHENTICATED_ACI);
-    when(authenticatedAccount.getPhoneNumberIdentifier()).thenReturn(AUTHENTICATED_PNI);
-    when(authenticatedAccount.getIdentifier(IdentityType.ACI)).thenReturn(AUTHENTICATED_ACI);
-    when(authenticatedAccount.getIdentifier(IdentityType.PNI)).thenReturn(AUTHENTICATED_PNI);
-    when(authenticatedAccount.getIdentityKey(IdentityType.ACI)).thenReturn(new IdentityKey(ACI_IDENTITY_KEY_PAIR.getPublicKey()));
-    when(authenticatedAccount.getIdentityKey(IdentityType.PNI)).thenReturn(new IdentityKey(PNI_IDENTITY_KEY_PAIR.getPublicKey()));
+    authenticatedAccount = mock(Account.class);
+    when(authenticatedAccount.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
+    when(authenticatedAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(AUTHENTICATED_PNI));
+
+    when(authenticatedAccount.getAccountIdentityKey()).thenReturn(new IdentityKey(ACI_IDENTITY_KEY_PAIR.getPublicKey()));
+    when(authenticatedAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(new IdentityKey(PNI_IDENTITY_KEY_PAIR.getPublicKey())));
     when(authenticatedAccount.getDevice(AUTHENTICATED_DEVICE_ID)).thenReturn(Optional.of(authenticatedDevice));
 
     when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI)).thenReturn(Optional.of(authenticatedAccount));
@@ -143,6 +150,88 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
             .setPniKemPreKeyCount(4)
             .build(),
         authenticatedServiceStub().getPreKeyCount(GetPreKeyCountRequest.newBuilder().build()));
+  }
+
+  @Test
+  void getPreKeyCountWithoutPhoneNumber() {
+    when(authenticatedAccount.getPhoneNumberIdentifier()).thenReturn(Optional.empty());
+
+    when(keysManager.getEcCount(AUTHENTICATED_ACI, AUTHENTICATED_DEVICE_ID))
+        .thenReturn(CompletableFuture.completedFuture(1));
+
+    when(keysManager.getPqCount(AUTHENTICATED_ACI, AUTHENTICATED_DEVICE_ID))
+        .thenReturn(CompletableFuture.completedFuture(2));
+
+    assertEquals(GetPreKeyCountResponse.newBuilder()
+            .setAciEcPreKeyCount(1)
+            .setAciKemPreKeyCount(2)
+            .setPniEcPreKeyCount(0)
+            .setPniKemPreKeyCount(0)
+            .build(),
+        authenticatedServiceStub().getPreKeyCount(GetPreKeyCountRequest.newBuilder().build()));
+
+    verify(keysManager, times(1)).getEcCount(any(), anyByte());
+    verify(keysManager, times(1)).getPqCount(any(), anyByte());
+  }
+
+  @ParameterizedTest
+  @MethodSource
+  void setPreKeysWithoutPhoneNumber(final Function<KeysGrpc.KeysBlockingStub, Object> setPreKeysFunction) {
+    when(authenticatedAccount.getPhoneNumberIdentifier()).thenReturn(Optional.empty());
+
+    assertStatusException(Status.INVALID_ARGUMENT, () -> setPreKeysFunction.apply(authenticatedServiceStub()));
+
+    verifyNoInteractions(keysManager);
+  }
+
+  private static Stream<Arguments> setPreKeysWithoutPhoneNumber() {
+    final org.signal.chat.common.IdentityType identityType = org.signal.chat.common.IdentityType.IDENTITY_TYPE_PNI;
+
+    final ECPreKey ecPreKey = new ECPreKey(1, ECKeyPair.generate().getPublicKey());
+    final KEMSignedPreKey kemPreKey = KeysHelper.signedKEMPreKey(1, PNI_IDENTITY_KEY_PAIR);
+    final ECSignedPreKey ecSignedPreKey = KeysHelper.signedECPreKey(17, PNI_IDENTITY_KEY_PAIR);
+    final KEMSignedPreKey lastResortPreKey = KeysHelper.signedKEMPreKey(19, PNI_IDENTITY_KEY_PAIR);
+
+    return Stream.of(
+        Arguments.argumentSet("setOneTimeEcPreKeys", (Function<KeysGrpc.KeysBlockingStub, Object>) stub ->
+            stub.setOneTimeEcPreKeys(SetOneTimeEcPreKeysRequest.newBuilder()
+                .setIdentityType(identityType)
+                .addPreKeys(EcPreKey.newBuilder()
+                    .setKeyId(KeyIdUtil.toUnsignedInt(ecPreKey.keyId()))
+                    .setPublicKey(ByteString.copyFrom(ecPreKey.serializedPublicKey()))
+                    .build())
+                .build())),
+
+        Arguments.argumentSet("setOneTimeKemSignedPreKeys", (Function<KeysGrpc.KeysBlockingStub, Object>) stub ->
+            stub.setOneTimeKemSignedPreKeys(SetOneTimeKemSignedPreKeysRequest.newBuilder()
+                .setIdentityType(identityType)
+                .addPreKeys(KemSignedPreKey.newBuilder()
+                    .setKeyId(KeyIdUtil.toUnsignedInt(kemPreKey.keyId()))
+                    .setPublicKey(ByteString.copyFrom(kemPreKey.serializedPublicKey()))
+                    .setSignature(ByteString.copyFrom(kemPreKey.signature()))
+                    .build())
+                .build())),
+
+        Arguments.argumentSet("setEcSignedPreKey", (Function<KeysGrpc.KeysBlockingStub, Object>) stub ->
+            stub.setEcSignedPreKey(SetEcSignedPreKeyRequest.newBuilder()
+                .setIdentityType(identityType)
+                .setSignedPreKey(EcSignedPreKey.newBuilder()
+                    .setKeyId(KeyIdUtil.toUnsignedInt(ecSignedPreKey.keyId()))
+                    .setPublicKey(ByteString.copyFrom(ecSignedPreKey.serializedPublicKey()))
+                    .setSignature(ByteString.copyFrom(ecSignedPreKey.signature()))
+                    .build())
+                .build())),
+
+        Arguments.argumentSet("setKemLastResortPreKey", (Function<KeysGrpc.KeysBlockingStub, Object>) stub ->
+            stub.setKemLastResortPreKey(SetKemLastResortPreKeyRequest.newBuilder()
+                .setIdentityType(identityType)
+                .setSignedPreKey(KemSignedPreKey.newBuilder()
+                    .setKeyId(KeyIdUtil.toUnsignedInt(lastResortPreKey.keyId()))
+                    .setPublicKey(ByteString.copyFrom(lastResortPreKey.serializedPublicKey()))
+                    .setSignature(ByteString.copyFrom(lastResortPreKey.signature()))
+                    .build())
+                .build()))
+    );
   }
 
   @ParameterizedTest
@@ -464,9 +553,19 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
       case ACI -> new AciServiceIdentifier(identifier);
     };
 
-    when(targetAccount.getUuid()).thenReturn(UUID.randomUUID());
-    when(targetAccount.getIdentifier(identityType)).thenReturn(identifier);
-    when(targetAccount.getIdentityKey(identityType)).thenReturn(identityKey);
+    when(targetAccount.getAccountIdentifier()).thenReturn(UUID.randomUUID());
+
+    switch (identityType) {
+      case ACI -> {
+        when(targetAccount.getAccountIdentifier()).thenReturn(identifier);
+        when(targetAccount.getAccountIdentityKey()).thenReturn(identityKey);
+      }
+      case PNI -> {
+        when(targetAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(identifier));
+        when(targetAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(identityKey));
+      }
+    }
+
     when(accountsManager.getByServiceIdentifier(serviceIdentifier))
         .thenReturn(Optional.of(targetAccount));
 
@@ -498,7 +597,7 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
               .setPublicKey(ByteString.copyFrom(ecSignedPreKey.serializedPublicKey()))
               .setSignature(ByteString.copyFrom(ecSignedPreKey.signature()))
               .build())
-          .setKemOneTimePreKey(KemSignedPreKey.newBuilder()
+          .setKemPreKey(KemSignedPreKey.newBuilder()
               .setKeyId(KeyIdUtil.toUnsignedInt(kemSignedPreKey.keyId()))
               .setPublicKey(ByteString.copyFrom(kemSignedPreKey.serializedPublicKey()))
               .setSignature(ByteString.copyFrom(kemSignedPreKey.signature()))
@@ -513,7 +612,11 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
 
       final Device device = mock(Device.class);
       when(device.getId()).thenReturn(entry.getKey());
-      when(device.getRegistrationId(any())).thenReturn(entry.getValue());
+
+      switch (identityType) {
+        case ACI -> when(device.getAccountRegistrationId()).thenReturn(entry.getValue());
+        case PNI -> when(device.getPhoneNumberIdentityRegistrationId()).thenReturn(Optional.of(entry.getValue()));
+      }
 
       devices.put(entry.getKey(), device);
       when(targetAccount.getDevice(entry.getKey())).thenReturn(Optional.of(device));
@@ -581,8 +684,8 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
     final UUID accountIdentifier = UUID.randomUUID();
 
     final Account targetAccount = mock(Account.class);
-    when(targetAccount.getUuid()).thenReturn(accountIdentifier);
-    when(targetAccount.getIdentityKey(IdentityType.ACI)).thenReturn(new IdentityKey(ECKeyPair.generate().getPublicKey()));
+    when(targetAccount.getAccountIdentifier()).thenReturn(accountIdentifier);
+    when(targetAccount.getAccountIdentityKey()).thenReturn(new IdentityKey(ECKeyPair.generate().getPublicKey()));
     when(targetAccount.getDevices()).thenReturn(Collections.emptyList());
     when(targetAccount.getDevice(anyByte())).thenReturn(Optional.empty());
 
@@ -609,11 +712,11 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
 
     if (!targetMissing) {
       final Device mockDevice = mock(Device.class);
-      when(mockDevice.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+      when(mockDevice.getAccountRegistrationId()).thenReturn(registrationId);
 
       final Account targetAccount = mock(Account.class);
-      when(targetAccount.getUuid()).thenReturn(targetAccountId);
-      when(targetAccount.getIdentityKey(IdentityType.ACI)).thenReturn(new IdentityKey(ECKeyPair.generate().getPublicKey()));
+      when(targetAccount.getAccountIdentifier()).thenReturn(targetAccountId);
+      when(targetAccount.getAccountIdentityKey()).thenReturn(new IdentityKey(ECKeyPair.generate().getPublicKey()));
       when(targetAccount.getDevice(targetDeviceId)).thenReturn(Optional.of(mockDevice));
       when(targetAccount.getDevices()).thenReturn(List.of(mockDevice));
       when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(targetAccountId)))
@@ -642,5 +745,83 @@ class KeysGrpcServiceTest extends SimpleBaseGrpcTest<KeysGrpcService, KeysGrpc.K
     }
     assertRateLimitExceeded(retryAfterDuration, () -> authenticatedServiceStub().getPreKeys(builder.build()));
     verify(preKeysRateLimiter).validate(expectedRateLimitKey);
+  }
+
+  @CartesianTest
+  void getPreKeysUnidentifiedInfo(
+      @CartesianTest.Enum(names = {"IDENTITY_TYPE_ACI", "IDENTITY_TYPE_PNI"}) final org.signal.chat.common.IdentityType grpcIdentityType,
+      @CartesianTest.Values(booleans = {false , true}) final boolean hasUak,
+      @CartesianTest.Values(booleans = {false , true}) final boolean hasUua) {
+    final Account targetAccount = mock(Account.class);
+
+    final ECKeyPair identityKeyPair = ECKeyPair.generate();
+    final IdentityKey identityKey = new IdentityKey(identityKeyPair.getPublicKey());
+    final UUID identifier = UUID.randomUUID();
+
+    final IdentityType identityType = IdentityTypeUtil.fromGrpcIdentityType(grpcIdentityType);
+    final org.whispersystems.textsecuregcm.identity.ServiceIdentifier serviceIdentifier = switch (identityType) {
+      case PNI -> new PniServiceIdentifier(identifier);
+      case ACI -> new AciServiceIdentifier(identifier);
+    };
+
+    when(targetAccount.getAccountIdentifier()).thenReturn(UUID.randomUUID());
+
+    switch (identityType) {
+      case ACI -> {
+        when(targetAccount.getAccountIdentifier()).thenReturn(identifier);
+        when(targetAccount.getAccountIdentityKey()).thenReturn(identityKey);
+      }
+      case PNI -> {
+        when(targetAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(identifier));
+        when(targetAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(identityKey));
+      }
+    }
+
+    when(accountsManager.getByServiceIdentifier(serviceIdentifier))
+        .thenReturn(Optional.of(targetAccount));
+
+    final byte deviceId1 = 1;
+    final int registrationId = 123;
+
+    final ECSignedPreKey ecSignedPreKey = KeysHelper.signedECPreKey(3, identityKeyPair);
+    final Optional<ECPreKey> maybeEcPreKey = Optional.of(new ECPreKey(1, ECKeyPair.generate().getPublicKey()));
+    final KEMSignedPreKey kemSignedPreKey = KeysHelper.signedKEMPreKey(2, identityKeyPair);
+    when(keysManager.takeDevicePreKeys(eq(deviceId1), eq(serviceIdentifier), any()))
+        .thenReturn(CompletableFuture.completedFuture(Optional.of(new KeysManager.DevicePreKeys(ecSignedPreKey, maybeEcPreKey, kemSignedPreKey))));
+
+    final Device device = mock(Device.class);
+    when(device.getId()).thenReturn(deviceId1);
+
+    switch (identityType) {
+      case ACI -> when(device.getAccountRegistrationId()).thenReturn(registrationId);
+      case PNI -> when(device.getPhoneNumberIdentityRegistrationId()).thenReturn(Optional.of(registrationId));
+    }
+
+    final Map<Byte, Device> devices = Map.of(deviceId1, device);
+    when(targetAccount.getDevice(deviceId1)).thenReturn(Optional.of(device));
+    when(targetAccount.getDevices()).thenReturn(new ArrayList<>(devices.values()));
+
+    final byte[] uak = TestRandomUtil.nextBytes(UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH);
+    when(targetAccount.getUnidentifiedAccessKey()).thenReturn(hasUak ? Optional.of(uak) : Optional.empty());
+    when(targetAccount.isUnrestrictedUnidentifiedAccess()).thenReturn(hasUua);
+
+    final GetPreKeysResponse response = authenticatedServiceStub().getPreKeys(GetPreKeysRequest.newBuilder()
+        .setTargetIdentifier(ServiceIdentifier.newBuilder()
+            .setIdentityType(grpcIdentityType)
+            .setUuid(UUIDUtil.toByteString(identifier))
+            .build())
+        .setDeviceId(1)
+        .build());
+
+    assertTrue(response.hasPreKeys());
+    assertEquals(identityType == IdentityType.ACI && hasUua,
+        response.getPreKeys().getUnrestrictedUnidentifiedAccess());
+    if (identityType == IdentityType.ACI && hasUak) {
+      assertArrayEquals(UnidentifiedAccessChecksum.generateFor(uak),
+          response.getPreKeys().getUnidentifiedAccessKeyFingerprint().toByteArray());
+    } else {
+      assertTrue(response.getPreKeys().getUnidentifiedAccessKeyFingerprint().isEmpty());
+    }
+
   }
 }

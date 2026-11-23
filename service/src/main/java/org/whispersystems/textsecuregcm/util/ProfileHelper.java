@@ -21,8 +21,10 @@ import org.signal.libsignal.zkgroup.profiles.ExpiringProfileKeyCredentialRespons
 import org.signal.libsignal.zkgroup.profiles.ProfileKeyCommitment;
 import org.signal.libsignal.zkgroup.profiles.ProfileKeyCredentialRequest;
 import org.signal.libsignal.zkgroup.profiles.ServerZkProfileOperations;
+import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
 import org.whispersystems.textsecuregcm.configuration.BadgeConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
+import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicPaymentsConfiguration;
 import org.whispersystems.textsecuregcm.entities.CreateProfileRequest;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.storage.Account;
@@ -34,19 +36,19 @@ import org.whispersystems.textsecuregcm.storage.VersionedProfileV1;
 public class ProfileHelper {
   public static int MAX_PROFILE_AVATAR_SIZE_BYTES = 10 * 1024 * 1024;
   @VisibleForTesting
-  public static final Duration EXPIRING_PROFILE_KEY_CREDENTIAL_EXPIRATION = Duration.ofDays(7);
+  public static final Duration PROFILE_KEY_CREDENTIAL_EXPIRATION = Duration.ofDays(7);
 
   public static List<AccountBadge> mergeBadgeIdsWithExistingAccountBadges(
       final Clock clock,
       final Map<String, BadgeConfiguration> badgeConfigurationMap,
       final List<String> badgeIds,
       final List<AccountBadge> accountBadges) {
-    LinkedHashMap<String, AccountBadge> existingBadges = new LinkedHashMap<>(accountBadges.size());
+    final LinkedHashMap<String, AccountBadge> existingBadges = new LinkedHashMap<>(accountBadges.size());
     for (final AccountBadge accountBadge : accountBadges) {
       existingBadges.putIfAbsent(accountBadge.id(), accountBadge);
     }
 
-    LinkedHashMap<String, AccountBadge> result = new LinkedHashMap<>(accountBadges.size());
+    final LinkedHashMap<String, AccountBadge> result = new LinkedHashMap<>(accountBadges.size());
     for (final String badgeId : badgeIds) {
 
       // duplicate in the list, ignore it
@@ -97,24 +99,34 @@ public class ProfileHelper {
       final ServiceId.Aci accountIdentifier,
       final ServerZkProfileOperations zkProfileOperations) throws InvalidInputException, VerificationFailedException {
 
-    final Instant expiration = Instant.now().plus(EXPIRING_PROFILE_KEY_CREDENTIAL_EXPIRATION).truncatedTo(ChronoUnit.DAYS);
+    final Instant expiration = Instant.now().plus(PROFILE_KEY_CREDENTIAL_EXPIRATION).truncatedTo(ChronoUnit.DAYS);
 
     return zkProfileOperations.issueExpiringProfileKeyCredential(request, accountIdentifier, commitment, expiration);
   }
 
   @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
   public static boolean isPaymentAddressUpdateForbidden(
-      final Account account, final Optional<VersionedProfile> maybeProfile,
+      final Account account,
+      final Optional<VersionedProfile> maybeProfile,
       final Optional<VersionedProfileV1> maybeV1Profile,
+      final String ipAddress,
+      final AsnInfoProvider asnInfoProvider,
       final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager) {
 
     final Optional<byte[]> currentPaymentAddress = maybeProfile.map(VersionedProfile::paymentAddress)
         .or(() -> maybeV1Profile.map(VersionedProfileV1::paymentAddress));
-    final boolean hasDisallowedPrefix = dynamicConfigurationManager.getConfiguration().getPaymentsConfiguration()
-        .getDisallowedPrefixes().stream()
-        .anyMatch(prefix -> account.getNumber().startsWith(prefix));
 
-    return hasDisallowedPrefix && currentPaymentAddress.isEmpty();
+    final DynamicPaymentsConfiguration paymentsConfiguration =
+        dynamicConfigurationManager.getConfiguration().getPaymentsConfiguration();
+
+    final boolean hasDisallowedRegion = account.getNumber()
+        .map(phoneNumber -> paymentsConfiguration.disallowedPrefixes().stream().anyMatch(phoneNumber::startsWith))
+        .orElseGet(() -> asnInfoProvider.lookup(ipAddress)
+            .map(asnInfo -> paymentsConfiguration.disallowedAsnRegions().stream()
+                .anyMatch(region -> region.equalsIgnoreCase(asnInfo.regionCode())))
+            .orElse(false));
+
+    return hasDisallowedRegion && currentPaymentAddress.filter(a -> a.length != 0).isEmpty();
   }
 
   @Nullable

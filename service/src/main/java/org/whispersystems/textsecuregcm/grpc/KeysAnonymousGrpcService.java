@@ -6,14 +6,15 @@
 package org.whispersystems.textsecuregcm.grpc;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.concurrent.Flow;
 import org.signal.chat.errors.FailedUnidentifiedAuthorization;
 import org.signal.chat.errors.NotFound;
-import org.signal.chat.keys.AccountPreKeyBundles;
 import org.signal.chat.keys.CheckIdentityKeyRequest;
 import org.signal.chat.keys.CheckIdentityKeyResponse;
 import org.signal.chat.keys.GetPreKeysAnonymousRequest;
@@ -22,6 +23,7 @@ import org.signal.chat.keys.SimpleKeysAnonymousGrpc;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.signal.libsignal.zkgroup.ServerSecretParams;
 import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
+import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -31,6 +33,8 @@ import reactor.core.publisher.Mono;
 import reactor.util.function.Tuples;
 
 public class KeysAnonymousGrpcService extends SimpleKeysAnonymousGrpc.KeysAnonymousImplBase {
+
+  private static final int CHECK_KEYS_MAX_CONCURRENCY = 16;
 
   private final AccountsManager accountsManager;
   private final KeysManager keysManager;
@@ -46,7 +50,12 @@ public class KeysAnonymousGrpcService extends SimpleKeysAnonymousGrpc.KeysAnonym
   @Override
   public GetPreKeysAnonymousResponse getPreKeys(final GetPreKeysAnonymousRequest request) {
     final ServiceIdentifier serviceIdentifier =
-        ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getRequest().getTargetIdentifier());
+        GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getRequest().getTargetIdentifier());
+
+    if (serviceIdentifier.identityType() == IdentityType.PNI
+        && request.getAuthorizationCase() != GetPreKeysAnonymousRequest.AuthorizationCase.GROUP_SEND_TOKEN) {
+      throw GrpcExceptions.fieldViolation("authorization", "group send token is required for PNI targets");
+    }
 
     final byte deviceId = request.getRequest().hasDeviceId()
         ? DeviceIdUtil.validate(request.getRequest().getDeviceId())
@@ -91,19 +100,24 @@ public class KeysAnonymousGrpcService extends SimpleKeysAnonymousGrpc.KeysAnonym
   @Override
   public Flow.Publisher<CheckIdentityKeyResponse> checkIdentityKeys(final Flow.Publisher<CheckIdentityKeyRequest> requests) {
     return JdkFlowAdapter.publisherToFlowPublisher(JdkFlowAdapter.flowPublisherToFlux(requests)
-        .map(request -> Tuples.of(ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getTargetIdentifier()),
+        .map(request -> Tuples.of(GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getTargetIdentifier()),
             request.getFingerprint().toByteArray()))
-        .flatMap(serviceIdentifierAndFingerprint -> Mono.fromFuture(
+        .flatMapSequential(serviceIdentifierAndFingerprint -> Mono.fromFuture(
                 () -> accountsManager.getByServiceIdentifierAsync(serviceIdentifierAndFingerprint.getT1()))
-            .flatMap(Mono::justOrEmpty)
-            .filter(account -> !fingerprintMatches(account.getIdentityKey(serviceIdentifierAndFingerprint.getT1()
-                .identityType()), serviceIdentifierAndFingerprint.getT2()))
-            .map(account -> CheckIdentityKeyResponse.newBuilder()
-                .setTargetIdentifier(
-                    ServiceIdentifierUtil.toGrpcServiceIdentifier(serviceIdentifierAndFingerprint.getT1()))
-                .setIdentityKey(ByteString.copyFrom(account.getIdentityKey(serviceIdentifierAndFingerprint.getT1()
-                    .identityType()).serialize()))
-                .build())));
+            .map(maybeAccount -> maybeAccount.flatMap(
+                account -> switch (serviceIdentifierAndFingerprint.getT1().identityType()) {
+                  case ACI -> Optional.of(account.getAccountIdentityKey());
+                  case PNI -> account.getPhoneNumberIdentityKey();
+                }))
+            .map(maybeIdentityKey -> {
+              final CheckIdentityKeyResponse.Builder builder = CheckIdentityKeyResponse.newBuilder();
+
+              return maybeIdentityKey.map(identityKey ->
+                      fingerprintMatches(identityKey, serviceIdentifierAndFingerprint.getT2())
+                          ? builder.setMatched(Empty.getDefaultInstance()).build()
+                          : builder.setIdentityKey(ByteString.copyFrom(identityKey.serialize())).build())
+                  .orElseGet(() -> builder.setTargetNotFound(NotFound.getDefaultInstance()).build());
+            }), CHECK_KEYS_MAX_CONCURRENCY));
   }
 
   private static boolean fingerprintMatches(final IdentityKey identityKey, final byte[] fingerprint) {

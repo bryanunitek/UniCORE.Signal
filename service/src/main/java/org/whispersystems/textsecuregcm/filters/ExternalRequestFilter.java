@@ -7,6 +7,7 @@ package org.whispersystems.textsecuregcm.filters;
 
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
+import com.google.common.net.InetAddresses;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
 import io.grpc.ServerCall;
@@ -27,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.grpc.RequestAttributesUtil;
 import org.whispersystems.textsecuregcm.util.InetAddressRange;
+import org.whispersystems.textsecuregcm.util.logging.ImpossibleEvents;
 
 public class ExternalRequestFilter implements Filter, ServerInterceptor {
 
@@ -72,8 +74,12 @@ public class ExternalRequestFilter implements Filter, ServerInterceptor {
   public void doFilter(final ServletRequest request, final ServletResponse response, final FilterChain chain)
       throws IOException, ServletException {
 
-    final InetAddress remoteInetAddress = InetAddress.getByName(
-        (String) request.getAttribute(RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME));
+    final String remoteAddressString = (String) request.getAttribute(RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
+
+    final InetAddress remoteInetAddress = remoteAddressString != null
+        ? InetAddresses.forString(remoteAddressString)
+        : InetAddress.getLoopbackAddress();
+
     final boolean restricted = shouldBlock(remoteInetAddress);
 
     Metrics.counter(REQUESTS_COUNTER_NAME,
@@ -85,7 +91,7 @@ public class ExternalRequestFilter implements Filter, ServerInterceptor {
       if (response instanceof HttpServletResponse hsr) {
         hsr.setStatus(404);
       } else {
-        logger.warn("response was an unexpected type: {}", response.getClass());
+        ImpossibleEvents.logImpossible(logger, "response was an unexpected type: {}", response.getClass());
       }
       return;
     }

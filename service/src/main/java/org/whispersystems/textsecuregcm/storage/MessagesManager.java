@@ -4,74 +4,55 @@
  */
 package org.whispersystems.textsecuregcm.storage;
 
-import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
-
+import com.apple.foundationdb.FDBException;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
-import io.micrometer.core.instrument.Counter;
-import io.micrometer.core.instrument.Metrics;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import javax.annotation.Nullable;
-import org.reactivestreams.Publisher;
 import org.signal.libsignal.protocol.SealedSenderMultiRecipientMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
+import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
-import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
-import org.whispersystems.textsecuregcm.push.RedisMessageAvailabilityManager;
-import org.whispersystems.textsecuregcm.util.Pair;
-import reactor.core.observability.micrometer.Micrometer;
-import reactor.core.publisher.Flux;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
+import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import reactor.core.publisher.Mono;
 
 public class MessagesManager {
 
-  private static final int RESULT_SET_CHUNK_SIZE = 100;
-  final String GET_MESSAGES_FOR_DEVICE_FLUX_NAME = name(MessagesManager.class, "getMessagesForDevice");
-
   private static final Logger logger = LoggerFactory.getLogger(MessagesManager.class);
 
-  private static final Counter PERSIST_MESSAGE_COUNTER = Metrics.counter(
-      name(MessagesManager.class, "persistMessage"));
-
-  private static final Counter PERSIST_MESSAGE_BYTES_COUNTER = Metrics.counter(
-      name(MessagesManager.class, "persistMessageBytes"));
-
-  private static final String MAY_HAVE_MESSAGES_COUNTER_NAME =
-      MetricsUtil.name(MessagesManager.class, "mayHaveMessages");
-
   private final MessagesDynamoDb messagesDynamoDb;
-  private final MessagesCache messagesCache;
-  private final RedisMessageAvailabilityManager redisMessageAvailabilityManager;
+  private final FoundationDbMessageStore foundationDbMessageStore;
   private final ReportMessageManager reportMessageManager;
   private final ExecutorService messageDeletionExecutor;
   private final Clock clock;
 
+  @VisibleForTesting
+  static final long DELIVERY_LOOP_READ_THRESHOLD = 10;
+
   public MessagesManager(
       final MessagesDynamoDb messagesDynamoDb,
-      final MessagesCache messagesCache,
-      final RedisMessageAvailabilityManager redisMessageAvailabilityManager,
+      final FoundationDbMessageStore foundationDbMessageStore,
       final ReportMessageManager reportMessageManager,
       final ExecutorService messageDeletionExecutor,
       final Clock clock) {
 
     this.messagesDynamoDb = messagesDynamoDb;
-    this.messagesCache = messagesCache;
-    this.redisMessageAvailabilityManager = redisMessageAvailabilityManager;
+    this.foundationDbMessageStore = foundationDbMessageStore;
     this.reportMessageManager = reportMessageManager;
     this.messageDeletionExecutor = messageDeletionExecutor;
     this.clock = clock;
@@ -83,36 +64,44 @@ public class MessagesManager {
    * @param accountIdentifier the account identifier for the destination queue
    * @param messagesByDeviceId a map of device IDs to messages
    *
-   * @return a map of device IDs to a device's presence state (i.e. if the device has an active event listener)
-   *
-   * @see RedisMessageAvailabilityManager
+   * @return a map of device IDs to a device's presence state
    */
   public Map<Byte, Boolean> insert(final UUID accountIdentifier, final Map<Byte, Envelope> messagesByDeviceId) {
     return insertAsync(accountIdentifier, messagesByDeviceId).join();
   }
 
   private CompletableFuture<Map<Byte, Boolean>> insertAsync(final UUID accountIdentifier, final Map<Byte, Envelope> messagesByDeviceId) {
-    final Map<Byte, Boolean> devicePresenceById = new ConcurrentHashMap<>();
+    return foundationDbMessageStore.insert(new AciServiceIdentifier(accountIdentifier), messagesByDeviceId)
+        .thenApply(insertResultsByDeviceId -> {
+          messagesByDeviceId.forEach((deviceId, message) -> {
+            if (message.hasSourceServiceId()) {
+              final ServiceIdentifier sourceServiceIdentifier =
+                  ServiceIdentifier.fromByteString(message.getSourceServiceId());
 
-    return CompletableFuture.allOf(messagesByDeviceId.entrySet().stream()
-            .map(deviceIdAndMessage -> {
-              final byte deviceId = deviceIdAndMessage.getKey();
-              final Envelope message = deviceIdAndMessage.getValue();
-              final UUID messageGuid = UUID.randomUUID();
+              if (!accountIdentifier.equals(sourceServiceIdentifier.uuid()) && message.getType() != Envelope.Type.SERVER_DELIVERY_RECEIPT) {
+                insertResultsByDeviceId.get(deviceId).messageGuid().ifPresent(messageGuid -> {
+                  // Note that this is an asynchronous, best-effort, fire-and-forget operation
+                  reportMessageManager.store(sourceServiceIdentifier.toServiceIdentifierString(), messageGuid);
+                });
+              }
+            }
+          });
 
-              return messagesCache.insert(messageGuid, accountIdentifier, deviceId, message)
-                  .thenAccept(present -> {
-                    if (message.hasSourceServiceId() && !accountIdentifier.toString()
-                        .equals(message.getSourceServiceId())) {
-                      // Note that this is an asynchronous, best-effort, fire-and-forget operation
-                      reportMessageManager.store(message.getSourceServiceId(), messageGuid);
-                    }
+          return insertResultsByDeviceId.entrySet().stream()
+              .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().present()));
+        })
+        .whenComplete((_, throwable) -> {
+          if (throwable == null) {
+            return;
+          }
 
-                    devicePresenceById.put(deviceId, present);
-                  });
-            })
-            .toArray(CompletableFuture[]::new))
-        .thenApply(ignored -> devicePresenceById);
+          if (!(ExceptionUtils.unwrap(throwable) instanceof FDBException) && !ExceptionUtils.isBreakerOpen(throwable)) {
+            logger.warn("Failed to insert {} message(s) for {} into FoundationDB",
+                messagesByDeviceId.size(),
+                accountIdentifier,
+                throwable);
+          }
+        });
   }
 
   /**
@@ -127,10 +116,7 @@ public class MessagesManager {
    *                              connections to a Signal server or {@code false} otherwise
    * @param isUrgent              {@code true} if the given message is urgent or {@code false} otherwise
    *
-   * @return a map of accounts to maps of device IDs to a device's presence state (i.e. if the device has an active
-   * event listener)
-   *
-   * @see RedisMessageAvailabilityManager
+   * @return a map of accounts to maps of device IDs to a device's presence state
    */
   public CompletableFuture<Map<Account, Map<Byte, Boolean>>> insertMultiRecipientMessage(
       final SealedSenderMultiRecipientMessage multiRecipientMessage,
@@ -142,174 +128,160 @@ public class MessagesManager {
 
     final long serverTimestamp = clock.millis();
 
-    return insertSharedMultiRecipientMessagePayload(multiRecipientMessage)
-        .thenCompose(sharedMrmKey -> {
-          final Envelope.Builder envelopeBuilder = Envelope.newBuilder()
-              .setType(Envelope.Type.UNIDENTIFIED_SENDER)
-              .setClientTimestamp(clientTimestamp == 0 ? serverTimestamp : clientTimestamp)
-              .setServerTimestamp(serverTimestamp)
-              .setEphemeral(isEphemeral)
-              .setUrgent(isUrgent)
-              .setSharedMrmKey(ByteString.copyFrom(sharedMrmKey));
+    final Envelope.Builder envelopeBuilder = Envelope.newBuilder()
+        .setType(Envelope.Type.UNIDENTIFIED_SENDER)
+        .setClientTimestamp(clientTimestamp == 0 ? serverTimestamp : clientTimestamp)
+        .setServerTimestamp(serverTimestamp)
+        .setEphemeral(isEphemeral)
+        .setUrgent(isUrgent);
 
-          if (isStory) {
-            // Avoid sending this field if it's false.
-            envelopeBuilder.setStory(true);
-          }
+    if (isStory) {
+      // Avoid sending this field if it's false.
+      envelopeBuilder.setStory(true);
+    }
 
-          final Envelope prototypeMessage = envelopeBuilder.build();
+    final Envelope prototypeMessage = envelopeBuilder.build();
 
-          final Map<Account, Map<Byte, Boolean>> clientPresenceByAccountAndDevice = new ConcurrentHashMap<>();
+    final Map<Account, Map<Byte, Boolean>> clientPresenceByAccountAndDevice = new ConcurrentHashMap<>();
 
-          return CompletableFuture.allOf(multiRecipientMessage.getRecipients().entrySet().stream()
-                  .filter(serviceIdAndRecipient -> resolvedRecipients.containsKey(serviceIdAndRecipient.getValue()))
-                  .map(serviceIdAndRecipient -> {
-                    final ServiceIdentifier serviceIdentifier = ServiceIdentifier.fromLibsignal(serviceIdAndRecipient.getKey());
-                    final SealedSenderMultiRecipientMessage.Recipient recipient = serviceIdAndRecipient.getValue();
-                    final byte[] devices = recipient.getDevices();
+    return CompletableFuture.allOf(multiRecipientMessage.getRecipients().entrySet().stream()
+            .filter(serviceIdAndRecipient -> resolvedRecipients.containsKey(serviceIdAndRecipient.getValue()))
+            .map(serviceIdAndRecipient -> {
+              final ServiceIdentifier serviceIdentifier = ServiceIdentifier.fromLibsignal(serviceIdAndRecipient.getKey());
+              final SealedSenderMultiRecipientMessage.Recipient recipient = serviceIdAndRecipient.getValue();
+              final byte[] devices = recipient.getDevices();
 
-                    return insertAsync(resolvedRecipients.get(recipient).getIdentifier(IdentityType.ACI),
-                        IntStream.range(0, devices.length).mapToObj(i -> devices[i])
-                            .collect(Collectors.toMap(deviceId -> deviceId, deviceId -> prototypeMessage.toBuilder()
-                                .setDestinationServiceId(serviceIdentifier.toServiceIdentifierString())
-                                .build())))
-                        .thenAccept(clientPresenceByDeviceId ->
-                            clientPresenceByAccountAndDevice.put(resolvedRecipients.get(recipient),
-                                clientPresenceByDeviceId));
-                  })
-                  .toArray(CompletableFuture[]::new))
-              .thenApply(ignored -> clientPresenceByAccountAndDevice);
-        });
+              return insertAsync(resolvedRecipients.get(recipient).getAccountIdentifier(),
+                  IntStream.range(0, devices.length).mapToObj(i -> devices[i])
+                      .collect(Collectors.toMap(deviceId -> deviceId, _ -> prototypeMessage.toBuilder()
+                          .setContent(ByteString.copyFrom(multiRecipientMessage.messageForRecipient(serviceIdAndRecipient.getValue())))
+                          .setDestinationServiceId(serviceIdentifier.toCompactByteString())
+                          .build())))
+                  .thenAccept(clientPresenceByDeviceId ->
+                      clientPresenceByAccountAndDevice.put(resolvedRecipients.get(recipient),
+                          clientPresenceByDeviceId));
+            })
+            .toArray(CompletableFuture[]::new))
+        .thenApply(ignored -> clientPresenceByAccountAndDevice);
   }
 
   public CompletableFuture<Boolean> mayHavePersistedMessages(final UUID destinationUuid, final Device destinationDevice) {
-    return messagesDynamoDb.mayHaveMessages(destinationUuid, destinationDevice);
+    return foundationDbMessageStore.hasMessages(new AciServiceIdentifier(destinationUuid), destinationDevice.getId())
+        .thenCombine(messagesDynamoDb.mayHaveMessages(destinationUuid, destinationDevice), (a, b) -> a || b);
   }
 
   public CompletableFuture<Boolean> mayHaveMessages(final UUID destinationUuid, final Device destinationDevice) {
-    return messagesCache.hasMessagesAsync(destinationUuid, destinationDevice.getId())
-        .thenCombine(messagesDynamoDb.mayHaveMessages(destinationUuid, destinationDevice),
-            (mayHaveCachedMessages, mayHavePersistedMessages) -> {
-              final String outcome;
+    @SuppressWarnings("unchecked") final CompletableFuture<Boolean>[] mayHaveMessagesFutures = new CompletableFuture[] {
+        foundationDbMessageStore.hasMessages(new AciServiceIdentifier(destinationUuid), destinationDevice.getId()),
+        messagesDynamoDb.mayHaveMessages(destinationUuid, destinationDevice)
+    };
 
-              if (mayHaveCachedMessages && mayHavePersistedMessages) {
-                outcome = "both";
-              } else if (mayHaveCachedMessages) {
-                outcome = "cached";
-              } else if (mayHavePersistedMessages) {
-                outcome = "persisted";
-              } else {
-                outcome = "none";
-              }
-
-              Metrics.counter(MAY_HAVE_MESSAGES_COUNTER_NAME, "outcome", outcome).increment();
-
-              return mayHaveCachedMessages || mayHavePersistedMessages;
-            });
+    return CompletableFuture.allOf(mayHaveMessagesFutures)
+        .thenApply(_ -> Arrays.stream(mayHaveMessagesFutures).anyMatch(CompletableFuture::resultNow));
   }
 
   public CompletableFuture<Boolean> mayHaveUrgentPersistedMessages(final UUID destinationUuid, final Device destinationDevice) {
-    return messagesDynamoDb.mayHaveUrgentMessages(destinationUuid, destinationDevice);
-  }
-
-  public Mono<Pair<List<Envelope>, Boolean>> getMessagesForDevice(UUID destinationUuid, Device destinationDevice,
-      boolean cachedMessagesOnly) {
-
-    return Flux.from(
-            getMessagesForDevice(destinationUuid, destinationDevice, RESULT_SET_CHUNK_SIZE, cachedMessagesOnly))
-        .take(RESULT_SET_CHUNK_SIZE)
-        .collectList()
-        .map(envelopes -> new Pair<>(envelopes, envelopes.size() >= RESULT_SET_CHUNK_SIZE));
-  }
-
-  public Publisher<Envelope> getMessagesForDeviceReactive(UUID destinationUuid, Device destinationDevice,
-      final boolean cachedMessagesOnly) {
-
-    return getMessagesForDevice(destinationUuid, destinationDevice, null, cachedMessagesOnly);
+    return foundationDbMessageStore.mayHaveUrgentMessages(new AciServiceIdentifier(destinationUuid), destinationDevice.getId())
+        .thenCombine(messagesDynamoDb.mayHaveUrgentMessages(destinationUuid, destinationDevice), (a, b) -> a || b);
   }
 
   public MessageStream getMessages(final UUID destinationUuid, final Device destinationDevice) {
-    return new RedisDynamoDbMessageStream(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager, destinationUuid, destinationDevice);
+    return new ConcatenatingMessageStream(
+        new DynamoDbMessageStream(messagesDynamoDb, destinationUuid, destinationDevice),
+        foundationDbMessageStore.getMessages(new AciServiceIdentifier(destinationUuid), destinationDevice.getId())
+    );
   }
 
-  private Publisher<Envelope> getMessagesForDevice(UUID destinationUuid, Device destinationDevice,
-      @Nullable Integer limit, final boolean cachedMessagesOnly) {
-
-    final Publisher<Envelope> dynamoPublisher =
-        cachedMessagesOnly ? Flux.empty() : messagesDynamoDb.load(destinationUuid, destinationDevice, limit);
-    final Publisher<Envelope> cachePublisher = messagesCache.get(destinationUuid, destinationDevice.getId());
-
-    return Flux.concat(dynamoPublisher, cachePublisher)
-        .name(GET_MESSAGES_FOR_DEVICE_FLUX_NAME)
-        .tap(Micrometer.metrics(Metrics.globalRegistry));
+  public CompletableFuture<Void> clear(final UUID destinationUuid) {
+    return CompletableFuture.runAsync(() -> {
+      try {
+        foundationDbMessageStore.clearAll(new AciServiceIdentifier(destinationUuid));
+      } catch (final Exception e) {
+        if (!ExceptionUtils.isBreakerOpen(e)) {
+          logger.warn("Failed to clear messages for {}", destinationUuid, e);
+        }
+      }
+    }, messageDeletionExecutor);
   }
 
-  public CompletableFuture<Void> clear(UUID destinationUuid) {
-    return messagesCache.clear(destinationUuid);
-  }
-
-  public CompletableFuture<Void> clear(UUID destinationUuid, byte deviceId) {
-    return messagesCache.clear(destinationUuid, deviceId);
-  }
-
-  public CompletableFuture<Optional<RemovedMessage>> delete(final UUID destinationUuid,
-      final Device destinationDevice,
-      final UUID guid,
-      final long serverTimestamp) {
-
-    return messagesCache.remove(destinationUuid, destinationDevice.getId(), guid)
-        .thenComposeAsync(removed -> removed
-            .map(_ -> CompletableFuture.completedFuture(removed))
-            .orElseGet(() -> messagesDynamoDb.deleteMessage(destinationUuid, destinationDevice, guid, serverTimestamp)
-                .thenApply(maybeEnvelope -> maybeEnvelope.map(RemovedMessage::fromEnvelope))
-            ), messageDeletionExecutor);
-  }
-
-  /**
-   * @return the number of messages successfully removed from the cache.
-   */
-  public int persistMessages(
-      final UUID destinationUuid,
-      final Device destinationDevice,
-      final List<Envelope> messages) {
-
-    messagesDynamoDb.store(messages, destinationUuid, destinationDevice);
-
-    final List<UUID> messageGuids = messages.stream().map(message -> UUID.fromString(message.getServerGuid()))
-        .collect(Collectors.toList());
-    int messagesRemovedFromCache = 0;
-    try {
-      messagesRemovedFromCache = messagesCache.remove(destinationUuid, destinationDevice.getId(), messageGuids)
-          .get(30, TimeUnit.SECONDS).size();
-      PERSIST_MESSAGE_COUNTER.increment(messages.size());
-      PERSIST_MESSAGE_BYTES_COUNTER.increment(messages.stream()
-          .mapToInt(Envelope::getSerializedSize)
-          .sum());
-
-    } catch (InterruptedException | ExecutionException | TimeoutException e) {
-      logger.warn("Failed to remove messages from cache", e);
-    }
-    return messagesRemovedFromCache;
+  public CompletableFuture<Void> clear(final UUID destinationUuid, final byte deviceId) {
+    return CompletableFuture.runAsync(() -> {
+      try {
+        foundationDbMessageStore.clearAll(new AciServiceIdentifier(destinationUuid), deviceId);
+      } catch (final Exception e) {
+        if (!ExceptionUtils.isBreakerOpen(e)) {
+          logger.warn("Failed to clear messages for {}:{}", destinationUuid, deviceId, e);
+        }
+      }
+    }, messageDeletionExecutor);
   }
 
   public CompletableFuture<Optional<Instant>> getEarliestUndeliveredTimestampForDevice(UUID destinationUuid, Device destinationDevice) {
     // If there's any message in the persisted layer, return the oldest
     return Mono.from(messagesDynamoDb.load(destinationUuid, destinationDevice, 1)).map(Envelope::getServerTimestamp)
-        // If not, return the oldest message in the cache
-        .switchIfEmpty(messagesCache.getEarliestUndeliveredTimestamp(destinationUuid, destinationDevice.getId()))
+        // And if there are none there, then check FoundationDB
+        .switchIfEmpty(Mono.fromFuture(() -> foundationDbMessageStore.getEarliestUndeliveredMessageTimestamp(new AciServiceIdentifier(destinationUuid), destinationDevice.getId()))
+            .mapNotNull(maybeTimestamp -> maybeTimestamp.map(Instant::toEpochMilli).orElse(null)))
         .map(epochMilli -> Optional.of(Instant.ofEpochMilli(epochMilli)))
         .switchIfEmpty(Mono.just(Optional.empty()))
         .toFuture();
   }
 
-  /**
-   * Inserts the shared multi-recipient message payload to storage.
-   *
-   * @return a key where the shared data is stored
-   * @see MessagesCacheInsertSharedMultiRecipientPayloadAndViewsScript
-   */
-  private CompletableFuture<byte[]> insertSharedMultiRecipientMessagePayload(
-      final SealedSenderMultiRecipientMessage sealedSenderMultiRecipientMessage) {
-    return messagesCache.insertSharedMultiRecipientMessagePayload(sealedSenderMultiRecipientMessage);
+  /// Checks whether the given device is in a suspected "delivery loop" where it is repeatedly requesting but not
+  /// acknowledging messages.
+  ///
+  /// @param accountIdentifier the identifier of the account to check for a delivery loop
+  /// @param deviceId the ID of the device to check for a delivery loop
+  ///
+  /// @return a future that yields `true` if the identified device is suspected of being stuck in a message delivery
+  /// loop or `false` otherwise
+  public CompletableFuture<Boolean> hasSuspectedDeliveryLoop(final UUID accountIdentifier, final byte deviceId) {
+    return foundationDbMessageStore.getReadsSinceLastAcknowledgedMessage(new AciServiceIdentifier(accountIdentifier), deviceId)
+        .thenApply(readsSinceLastAcknowledgedMessage -> readsSinceLastAcknowledgedMessage >= DELIVERY_LOOP_READ_THRESHOLD);
+  }
+
+  /// Record versionstamps for the current time in the FoundationDB database(s).
+  public void recordFoundationDbVersionstamps() {
+    foundationDbMessageStore.recordVersionstamps();
+  }
+
+  /// Clean up expired entries in the FoundationDB versionstamp clock.
+  ///
+  /// @param oldestRetainedEntryTimestamp the earliest time for which we still want to be able to obtain a versionstamp
+  public void expireOldFoundationDbVersionstamps(final Instant oldestRetainedEntryTimestamp) {
+    foundationDbMessageStore.expireOldVersionstamps(oldestRetainedEntryTimestamp);
+  }
+
+  /// Delete messages in FoundationDB for the given devices that were inserted before the given
+  /// time. (Expiration of messages from Redis and Dynamo is handled automatically and do not
+  /// require any interaction with this class.)
+  ///
+  /// @param accountDeviceIdentifiers a map from ACI to the list of device IDs for which expired messages should be
+  /// trimmed.
+  ///
+  /// @param cutoffTime the expiration threshold. Messages inserted before this time may be deleted; messages inserted
+  /// after it will not be.
+  public void deleteFoundationDbMessagesBefore(final Map<AciServiceIdentifier, List<Byte>> accountDeviceIdentifiers, final Instant cutoffTime) {
+    foundationDbMessageStore.deleteMessagesBefore(accountDeviceIdentifiers, cutoffTime);
+  }
+
+  /// Trim the provided message queue if needed.
+  ///
+  /// @param aci The ACI of the message queue to trim
+  /// @param device The device of the message queue to trim
+  /// @param maxQueueSizeBytes The threshold size beyond which the message queue will be trimmed
+  /// @param targetQueueSizeBytes The target size to trim to
+  /// @param rangeSplitChunkSizeBytes The approximate chunk size in bytes used to split the range covered by the message queue
+  /// @param dryRun Whether to actually trim the provided queue
+  public Mono<Void> trimQueue(
+      final AciServiceIdentifier aci,
+      final Device device,
+      final long maxQueueSizeBytes,
+      final long targetQueueSizeBytes,
+      final long rangeSplitChunkSizeBytes,
+      final boolean dryRun) {
+    // All trims will be considered successful during a dry run
+    final Function<Mono<Boolean>, Mono<Boolean>> deleteModifier = dryRun ? _ -> Mono.just(true) : Function.identity();
+    return foundationDbMessageStore.trimQueue(aci, device, maxQueueSizeBytes, targetQueueSizeBytes, rangeSplitChunkSizeBytes, deleteModifier);
   }
 }

@@ -30,8 +30,11 @@ import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
 import javax.annotation.Nullable;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.Metrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.util.ResilienceUtil;
@@ -56,7 +59,9 @@ public class AppleDeviceCheckManager {
 
   // How many distinct device keys we're willing to accept for a single Account
   @VisibleForTesting
-  static final int MAX_DEVICE_KEYS = 100;
+  static final int MAX_DEVICE_KEYS = 200;
+
+  private static final String KEY_COUNT_DISTRIBUTION_NAME = MetricsUtil.name(AppleDeviceCheckManager.class, "keyCount");
 
   private final AppleDeviceChecks appleDeviceChecks;
   private final FaultTolerantRedisClusterClient redisClient;
@@ -109,13 +114,17 @@ public class AppleDeviceCheckManager {
       return;
     }
 
+    DistributionSummary.builder(KEY_COUNT_DISTRIBUTION_NAME)
+        .register(Metrics.globalRegistry)
+        .record(existingKeys.size());
+
     if (existingKeys.size() >= MAX_DEVICE_KEYS) {
       // This is best-effort, since we don't check the number of keys transactionally. We just don't want to allow
       // the keys for an account to grow arbitrarily large
       throw new TooManyKeysException();
     }
 
-    final String redisChallengeKey = challengeKey(ChallengeType.ATTEST, account.getUuid());
+    final String redisChallengeKey = challengeKey(ChallengeType.ATTEST, account.getAccountIdentifier());
 
     @Nullable final String challenge = ResilienceUtil.getGeneralRedisRetry(RETRY_NAME)
         .executeSupplier(() -> redisClient.withCluster(cluster -> cluster.sync().get(redisChallengeKey)));
@@ -129,7 +138,8 @@ public class AppleDeviceCheckManager {
     final DCAttestationData dcAttestationData;
     try {
       dcAttestationData = deviceCheckManager.validate(dcAttestationRequest,
-          new DCAttestationParameters(new DCServerProperty(teamId, bundleId, new DefaultChallenge(challenge))));
+          new DCAttestationParameters(new DCServerProperty(teamId, bundleId,
+              new DefaultChallenge(challenge.getBytes(StandardCharsets.UTF_8)))));
     } catch (VerificationException e) {
       logger.info("Failed to verify attestation", e);
       throw new DeviceCheckVerificationFailedException(e);
@@ -175,7 +185,7 @@ public class AppleDeviceCheckManager {
       final byte[] assertion)
       throws ChallengeNotFoundException, DeviceCheckVerificationFailedException, DeviceCheckKeyIdNotFoundException, RequestReuseException {
 
-    final String redisChallengeKey = challengeKey(challengeType, account.getUuid());
+    final String redisChallengeKey = challengeKey(challengeType, account.getAccountIdentifier());
     @Nullable final String storedChallenge = ResilienceUtil.getGeneralRedisRetry(RETRY_NAME)
             .executeSupplier(() -> redisClient.withCluster(cluster -> cluster.sync().get(redisChallengeKey)));
 
@@ -220,7 +230,7 @@ public class AppleDeviceCheckManager {
    * @return The challenge to be included as part of an attestation or assertion
    */
   public String createChallenge(final ChallengeType challengeType, final Account account) {
-    final UUID accountIdentifier = account.getUuid();
+    final UUID accountIdentifier = account.getAccountIdentifier();
 
     final String challengeKey = challengeKey(challengeType, accountIdentifier);
     return ResilienceUtil.getGeneralRedisRetry(RETRY_NAME)

@@ -16,14 +16,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.when;
 
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
+import com.google.common.net.InetAddresses;
 import io.netty.resolver.dns.DnsNameResolver;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.concurrent.SucceededFuture;
 import java.io.IOException;
-import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -40,7 +41,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
-import org.whispersystems.textsecuregcm.tests.util.AuthHelper;
 
 @ExtendWith(MockitoExtension.class)
 public class CloudflareTurnCredentialsManagerTest {
@@ -126,9 +126,9 @@ public class CloudflareTurnCredentialsManagerTest {
 
     when(dnsResolver.resolveAll(TURN_HOSTNAME))
         .thenReturn(new SucceededFuture<>(GlobalEventExecutor.INSTANCE,
-            List.of(InetAddress.getByName("127.0.0.1"), InetAddress.getByName("::1"))));
+            List.of(InetAddresses.forString("127.0.0.1"), InetAddresses.forString("::1"))));
 
-    TurnToken token = cloudflareTurnCredentialsManager.retrieveFromCloudflare(AuthHelper.VALID_UUID);
+    final TurnToken token = cloudflareTurnCredentialsManager.retrieveFromCloudflare(UUID.randomUUID());
 
     wireMock.verify(postRequestedFor(urlEqualTo(GET_CREDENTIALS_PATH))
         .withHeader("Content-Type", equalTo("application/json"))

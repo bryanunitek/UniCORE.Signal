@@ -8,16 +8,15 @@ import com.google.common.annotations.VisibleForTesting;
 import io.dropwizard.lifecycle.Managed;
 import io.micrometer.core.instrument.Metrics;
 import io.netty.bootstrap.ServerBootstrap;
-import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.ByteBufAllocatorMetricProvider;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
-import io.netty.channel.DefaultEventLoopGroup;
+import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleUserEventChannelHandler;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.DecoderException;
@@ -34,15 +33,19 @@ import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.Mapping;
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.SocketException;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicOmnibusConfiguration;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 
 /// An HTTP/2 server that proxies H2 streams to configurable backends via path-based routing
@@ -55,35 +58,39 @@ public class OmnibusH2Server implements Managed {
       new OmnibusExceptionHandler("omnibus-handshake", List.of(SocketException.class, DecoderException.class, IOException.class));
   private static final OmnibusExceptionHandler SESSION_EXCEPTION_HANDLER =
       new OmnibusExceptionHandler("omnibus-session", List.of(Http2Exception.class));
+  private static final OmnibusLoadShedHandler LOAD_SHED_HANDLER = new OmnibusLoadShedHandler();
+  private static final TlsHandshakeMetricsHandler TLS_HANDSHAKE_METRICS_HANDLER =
+      new TlsHandshakeMetricsHandler(Metrics.globalRegistry);
   private static final String IDLE_DISCONNECT_COUNTER_NAME = MetricsUtil.name(OmnibusH2Server.class, "idleDisconnect");
 
   private final @Nullable Mapping<String, SslContext> sslContextBySni;
   private final OmnibusRouter router;
+  private final Supplier<DynamicOmnibusConfiguration> configurationSupplier;
   private final Duration idleTimeout;
-  private final DefaultEventLoopGroup localEventLoopGroup;
-  private final NioEventLoopGroup nioEventLoopGroup;
+  private final EventLoopGroup nioEventLoopGroup;
   private final SocketAddress bindAddress;
 
   private Channel serverChannel;
 
   /// Create an omnibus server
   ///
-  /// @param sslContextBySni     If not null, a mapping between domain (SNI) and the appropriate SslContext to use for
-  ///                            that SNI. If null, the server will not include TLS (h2c with prior-knowledge)
-  /// @param nioEventLoopGroup   Event loop to use for all NIO channel pipelines
-  /// @param localEventLoopGroup Event loop to use for all local channel pipelines
-  /// @param bindAddress         The address the server should listen on
-  /// @param router              How the server should select backends based on request paths
+  /// @param sslContextBySni       If not null, a mapping between domain (SNI) and the appropriate SslContext to use for
+  ///                              that SNI. If null, the server will not include TLS (h2c with prior-knowledge)
+  /// @param nioEventLoopGroup     An Event loop with a [NioIoHandler#newFactory()] to use for all NIO channel pipelines
+  /// @param bindAddress           The address the server should listen on
+  /// @param router                How the server should select backends based on request paths
+  /// @param configurationSupplier Dynamic configuration supplier
+  /// @param idleTimeout           How long to wait since the last data was received from the client before terminating TCP connections
   public OmnibusH2Server(
       final @Nullable Mapping<String, SslContext> sslContextBySni,
-      final NioEventLoopGroup nioEventLoopGroup,
-      final DefaultEventLoopGroup localEventLoopGroup,
+      final EventLoopGroup nioEventLoopGroup,
       final SocketAddress bindAddress,
       final OmnibusRouter router,
+      final Supplier<DynamicOmnibusConfiguration> configurationSupplier,
       final Duration idleTimeout) {
     this.sslContextBySni = sslContextBySni;
+    this.configurationSupplier = configurationSupplier;
     this.nioEventLoopGroup = nioEventLoopGroup;
-    this.localEventLoopGroup = localEventLoopGroup;
     this.bindAddress = bindAddress;
     this.router = router;
     this.idleTimeout = idleTimeout;
@@ -102,7 +109,7 @@ public class OmnibusH2Server implements Managed {
         .childHandler(new ChannelInitializer<SocketChannel>() {
           @Override
           protected void initChannel(final SocketChannel ch) {
-            ch.pipeline().addLast(new IdleStateHandler(0, 0, idleTimeout.toMillis(), TimeUnit.MILLISECONDS));
+            ch.pipeline().addLast(new IdleStateHandler(idleTimeout.toMillis(), 0, 0, TimeUnit.MILLISECONDS));
             ch.pipeline().addLast(new SimpleUserEventChannelHandler<IdleStateEvent>() {
               @Override
               protected void eventReceived(final ChannelHandlerContext ctx, final IdleStateEvent evt) {
@@ -114,9 +121,18 @@ public class OmnibusH2Server implements Managed {
             ch.pipeline().addLast(new ProxyProtocolHandler());
             ch.pipeline().addLast(new ProxyMessageAttributeSetterHandler());
             if (sslContextBySni == null) {
-              configureH2Pipeline(ch.pipeline());
+              // Defer setting up the H2 pipeline until the channel is active, so we know we can immediately write
+              // to it if we need to.
+              ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                @Override
+                public void channelActive(final ChannelHandlerContext ctx) {
+                  configureH2Pipeline(ctx.pipeline());
+                  ctx.pipeline().remove(this);
+                }
+              });
             } else {
               ch.pipeline().addLast(new SniHandler(sslContextBySni));
+              ch.pipeline().addLast(TLS_HANDSHAKE_METRICS_HANDLER);
               ch.pipeline().addLast(new ApplicationProtocolNegotiationHandler(ApplicationProtocolNames.HTTP_2) {
                 @Override
                 protected void configurePipeline(final ChannelHandlerContext ctx, final String protocol) {
@@ -156,12 +172,24 @@ public class OmnibusH2Server implements Managed {
     // Advertise support for RFC-8441 extended connect
     final Http2Settings settings = Http2Settings.defaultSettings().connectProtocolEnabled(true);
     pipeline.addLast(Http2FrameCodecBuilder.forServer().initialSettings(settings).build());
+    if (shouldRejectConnection()) {
+      pipeline.addLast(LOAD_SHED_HANDLER);
+      return;
+    }
+
     pipeline.addLast(new Http2MultiplexHandler(new ChannelInitializer<Http2StreamChannel>() {
       @Override
       protected void initChannel(final Http2StreamChannel ch) {
-        ch.pipeline().addLast(new OmnibusH2StreamHandler(nioEventLoopGroup, localEventLoopGroup, router));
+        ch.pipeline().addLast(new OmnibusH2StreamHandler(router));
       }
     }));
     pipeline.addLast(SESSION_EXCEPTION_HANDLER);
+  }
+
+  private boolean shouldRejectConnection() {
+    final DynamicOmnibusConfiguration configuration = configurationSupplier.get();
+    final BigDecimal rejectionRatio = configuration.rejectConnectionRatio();
+    return rejectionRatio.compareTo(BigDecimal.ZERO) > 0 &&
+        ThreadLocalRandom.current().nextDouble() < rejectionRatio.doubleValue();
   }
 }

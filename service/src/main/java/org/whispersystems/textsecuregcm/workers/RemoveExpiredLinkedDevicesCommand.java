@@ -116,7 +116,7 @@ public class RemoveExpiredLinkedDevicesCommand extends AbstractSinglePassCrawlAc
           return accountUpdate
               .doOnNext(successCounter::increment)
               .onErrorResume(t -> {
-                logger.warn("Failed to remove expired linked devices for {}", account.getUuid(), t);
+                logger.warn("Failed to remove expired linked devices for {}", account.getAccountIdentifier(), t);
                 return Mono.empty();
               });
         }, maxConcurrency)
@@ -131,12 +131,12 @@ public class RemoveExpiredLinkedDevicesCommand extends AbstractSinglePassCrawlAc
 
     return Flux.fromIterable(expiredDevices)
         .flatMap(deviceId ->
-                Mono.fromRunnable(() -> getCommandDependencies().accountsManager().removeDevice(account.getIdentifier(IdentityType.ACI), deviceId))
+                Mono.fromRunnable(() -> getCommandDependencies().accountsManager().removeDevice(account.getAccountIdentifier(), deviceId))
                     .retryWhen(Retry.backoff(maxRetries, Duration.ofSeconds(1))
                         .doAfterRetry(ignored -> retryCounter.increment())
                         .onRetryExhaustedThrow((spec, rs) -> rs.failure()))
                     .onErrorResume(t -> {
-                      logger.info("Failed to remove expired linked device {}.{}", account.getUuid(), deviceId, t);
+                      logger.info("Failed to remove expired linked device {}.{}", account.getAccountIdentifier(), deviceId, t);
                       errorCounter.increment();
                       return Mono.empty();
                     }),

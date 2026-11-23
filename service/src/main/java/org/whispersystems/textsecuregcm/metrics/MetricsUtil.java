@@ -5,7 +5,6 @@
 
 package org.whispersystems.textsecuregcm.metrics;
 
-import com.codahale.metrics.SharedMetricRegistries;
 import com.google.common.annotations.VisibleForTesting;
 import io.dropwizard.core.setup.Environment;
 import io.micrometer.core.instrument.Meter;
@@ -36,7 +35,6 @@ import org.eclipse.jetty.util.component.LifeCycle;
 import org.whispersystems.textsecuregcm.WhisperServerConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
-import org.whispersystems.textsecuregcm.util.Constants;
 
 public class MetricsUtil {
 
@@ -68,8 +66,6 @@ public class MetricsUtil {
     }
 
     registeredMetrics = true;
-
-    SharedMetricRegistries.add(Constants.METRICS_NAME, environment.metrics());
 
     Duration shutdownWaitDuration = Duration.ZERO;
 

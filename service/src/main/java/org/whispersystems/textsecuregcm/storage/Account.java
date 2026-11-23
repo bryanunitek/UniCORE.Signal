@@ -9,12 +9,9 @@ import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 import com.fasterxml.jackson.annotation.JsonFilter;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.databind.DeserializationContext;
 import com.fasterxml.jackson.databind.JsonDeserializer;
-import com.fasterxml.jackson.databind.JsonSerializer;
-import com.fasterxml.jackson.databind.SerializerProvider;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 import io.micrometer.core.instrument.Metrics;
@@ -25,27 +22,34 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.IntStream;
 import javax.annotation.Nullable;
 import org.apache.commons.lang3.StringUtils;
 import org.signal.libsignal.protocol.IdentityKey;
+import org.signal.libsignal.zkgroup.ZkCredentialPublicKey;
 import org.signal.libsignal.zkgroup.backups.BackupCredentialType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.SaltedTokenHash;
 import org.whispersystems.textsecuregcm.auth.StoredRegistrationLock;
 import org.whispersystems.textsecuregcm.entities.AccountAttributes;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.util.ByteArrayBase64UrlAdapter;
 import org.whispersystems.textsecuregcm.util.IdentityKeyAdapter;
+import org.whispersystems.textsecuregcm.util.ZkCredentialPublicKeyAdapter;
 
 @JsonFilter("Account")
 public class Account {
+
+  public static final int MAX_MFA_KEY_ID = Byte.MAX_VALUE;
 
   private static final Logger logger = LoggerFactory.getLogger(Account.class);
 
@@ -53,9 +57,11 @@ public class Account {
   private UUID uuid;
 
   @JsonProperty("pni")
+  @Nullable
   private UUID phoneNumberIdentifier;
 
   @JsonProperty
+  @Nullable
   private String number;
 
   @JsonProperty
@@ -89,6 +95,7 @@ public class Account {
   @JsonProperty("pniIdentityKey")
   @JsonSerialize(using = IdentityKeyAdapter.Serializer.class)
   @JsonDeserialize(using = IdentityKeyAdapter.Deserializer.class)
+  @Nullable
   private IdentityKey phoneNumberIdentityKey;
 
   @JsonProperty("cpv")
@@ -128,7 +135,9 @@ public class Account {
 
   @JsonProperty("zck")
   @Nullable
-  private byte[] zkCredentialKey;
+  @JsonSerialize(using = ZkCredentialPublicKeyAdapter.Serializer.class)
+  @JsonDeserialize(using = ZkCredentialPublicKeyAdapter.Deserializer.class)
+  private ZkCredentialPublicKey zkCredentialKey;
 
   @JsonProperty("zckr")
   @Nullable
@@ -140,6 +149,25 @@ public class Account {
   @JsonProperty("holds")
   private List<UsernameHold> usernameHolds = Collections.emptyList();
 
+  @JsonProperty("arps")
+  @Nullable
+  private String accountRecoveryPasswordSalt;
+
+  @JsonProperty("arph")
+  @Nullable
+  private String accountRecoveryPasswordHash;
+
+  @JsonProperty("acs")
+  @Nullable
+  private byte[] authCredentialSalt;
+
+  @JsonProperty("pendingTotp")
+  @Nullable
+  private TotpKey pendingTotpKey;
+
+  @JsonProperty("mfa")
+  private Map<Byte, AnnotatedMfaKey> mfaKeys = Collections.emptyMap();
+
   @JsonIgnore
   private boolean stale;
 
@@ -147,37 +175,34 @@ public class Account {
 
   public record BackupVoucher(@JsonProperty("rl") long receiptLevel, @JsonProperty("e") Instant expiration) {}
 
-  public UUID getIdentifier(final IdentityType identityType) {
-    return switch (identityType) {
-      case ACI -> getUuid();
-      case PNI -> getPhoneNumberIdentifier();
-    };
-  }
-
-  public UUID getUuid() {
+  /// Returns the core account identifier (ACI) for this account. An account's core identifier never changes.
+  ///
+  /// @return the core account identifier for this account
+  public UUID getAccountIdentifier() {
     // this is the one method that may be called on a stale account
     return uuid;
   }
 
-  public void setUuid(final UUID uuid) {
+  public void setAccountIdentifier(final UUID accountIdentifier) {
     requireNotStale();
 
-    this.uuid = uuid;
+    this.uuid = accountIdentifier;
   }
 
-  public UUID getPhoneNumberIdentifier() {
+  /// Returns the phone number identifier for this account or empty if this account does not have a phone number.
+  ///
+  /// @return the phone number identifier for this account or empty if this account does not have a phone number
+  public Optional<UUID> getPhoneNumberIdentifier() {
     requireNotStale();
 
-    return phoneNumberIdentifier;
+    return Optional.ofNullable(phoneNumberIdentifier);
   }
 
-  /**
-   * Tests whether this account's account identifier or phone number identifier (depending on the given service
-   * identifier's identity type) matches the given service identifier.
-   *
-   * @param serviceIdentifier the identifier to test
-   * @return {@code true} if this account's identifier or phone number identifier matches
-   */
+  /// Tests whether this account's account identifier or phone number identifier (depending on the given service
+  /// identifier's identity type) matches the given service identifier.
+  ///
+  /// @param serviceIdentifier the identifier to test
+  /// @return `true` if this account's identifier or phone number identifier matches
   public boolean isIdentifiedBy(final ServiceIdentifier serviceIdentifier) {
     return switch (serviceIdentifier.identityType()) {
       case ACI -> serviceIdentifier.uuid().equals(uuid);
@@ -185,10 +210,13 @@ public class Account {
     };
   }
 
-  public String getNumber() {
+  /// Returns the phone number for this account or empty if this account does not have a phone number.
+  ///
+  /// @return the phone number for this account or empty if this account does not have a phone number
+  public Optional<String> getNumber() {
     requireNotStale();
 
-    return number;
+    return Optional.ofNullable(number);
   }
 
   public void setNumber(final String number, final UUID phoneNumberIdentifier) {
@@ -319,16 +347,29 @@ public class Account {
     this.identityKey = identityKey;
   }
 
-  public IdentityKey getIdentityKey(final IdentityType identityType) {
+  /// Returns an identity key for the ACI identity for this account.
+  public IdentityKey getAccountIdentityKey() {
     requireNotStale();
-
-    return switch (identityType) {
-      case ACI -> identityKey;
-      case PNI -> phoneNumberIdentityKey;
-    };
+    return identityKey;
   }
 
+  /// Returns an identity key for the phone-number identity for this account, if it has such an identity.
+  ///
+  /// @return the identity key for the PNI identity for the account if it has one, or an empty `Optional` otherwise.
+  public Optional<IdentityKey> getPhoneNumberIdentityKey() {
+    requireNotStale();
+    return Optional.ofNullable(phoneNumberIdentityKey);
+  }
+
+  /// Sets the identity key for the phone-number identity of this account.
+  ///
+  /// @throws IllegalStateException if the account does not have a phone number identifier.
   public void setPhoneNumberIdentityKey(final IdentityKey phoneNumberIdentityKey) {
+    requireNotStale();
+
+    if (this.phoneNumberIdentifier == null) {
+      throw new IllegalStateException();
+    }
     this.phoneNumberIdentityKey = phoneNumberIdentityKey;
   }
 
@@ -434,8 +475,13 @@ public class Account {
     }
   }
 
-  public void setRegistrationLock(final String registrationLock, final String registrationLockSalt) {
+  public void setRegistrationLock(@Nullable final String registrationLock, @Nullable final String registrationLockSalt) {
     requireNotStale();
+
+    // Accounts without a phone number can't set a registration lock
+    if (number == null && (registrationLock != null || registrationLockSalt != null)) {
+      throw new IllegalArgumentException("Cannot set registration lock on account with no phone number");
+    }
 
     this.registrationLock     = registrationLock;
     this.registrationLockSalt = registrationLockSalt;
@@ -473,10 +519,17 @@ public class Account {
     this.unrestrictedUnidentifiedAccess = unrestrictedUnidentifiedAccess;
   }
 
+  /// Indicates whether this account may be discovered by its phone number via the contact discovery system (CDS).
+  ///
+  /// @return `true` if this account has a phone number and has opted into discovery by phone number or `false`
+  /// otherwise
+  ///
+  /// @see #getPhoneNumberIdentifier()
+  /// @see #setDiscoverableByPhoneNumber(boolean)
   public boolean isDiscoverableByPhoneNumber() {
     requireNotStale();
 
-    return this.discoverableByPhoneNumber;
+    return getPhoneNumberIdentifier().isPresent() && this.discoverableByPhoneNumber;
   }
 
   public void setDiscoverableByPhoneNumber(final boolean discoverableByPhoneNumber) {
@@ -527,26 +580,22 @@ public class Account {
     this.backupVoucher = backupVoucher;
   }
 
-  /**
-   * Have all this account's devices been manually locked?
-   *
-   * @see Device#hasLockedCredentials
-   *
-   * @return true if all the account's devices were locked, false otherwise.
-   */
+  /// Have all this account's devices been manually locked?
+  ///
+  /// @see Device#hasLockedCredentials
+  ///
+  /// @return true if all the account's devices were locked, false otherwise.
   public boolean hasLockedCredentials() {
     return devices.stream().allMatch(Device::hasLockedCredentials);
   }
 
-  /**
-   * Lock account by invalidating authentication tokens.
-   *
-   * We only want to do this in cases where there is a potential conflict between the
-   * phone number holder and the registration lock holder. In that case, locking the
-   * account will ensure that either the registration lock holder proves ownership
-   * of the phone number, or after 7 days the phone number holder can register a new
-   * account.
-   */
+  /// Lock account by invalidating authentication tokens.
+  ///
+  /// We only want to do this in cases where there is a potential conflict between the
+  /// phone number holder and the registration lock holder. In that case, locking the
+  /// account will ensure that either the registration lock holder proves ownership
+  /// of the phone number, or after 7 days the phone number holder can register a new
+  /// account.
   public void lockAuthTokenHash() {
     devices.forEach(Device::lockAuthTokenHash);
   }
@@ -560,12 +609,11 @@ public class Account {
     this.usernameHolds = usernameHolds;
   }
 
-  @Nullable
-  public byte[] getZkCredentialKey() {
-    return zkCredentialKey;
+  public Optional<ZkCredentialPublicKey> getZkCredentialKey() {
+    return Optional.ofNullable(zkCredentialKey);
   }
 
-  public void setZkCredentialKey(@Nullable final byte[] zkCredentialKey) {
+  public void setZkCredentialKey(@Nullable final ZkCredentialPublicKey zkCredentialKey) {
     this.zkCredentialKey = zkCredentialKey;
   }
 
@@ -576,6 +624,75 @@ public class Account {
 
   public void setZkCredentialKeyRotationId(@Nullable final Long zkCredentialKeyRotationId) {
     this.zkCredentialKeyRotationId = zkCredentialKeyRotationId;
+  }
+
+  public Optional<SaltedTokenHash> getAccountRecoveryPassword() {
+    requireNotStale();
+
+    return accountRecoveryPasswordHash != null && accountRecoveryPasswordSalt != null
+        ? Optional.of(new SaltedTokenHash(accountRecoveryPasswordHash, accountRecoveryPasswordSalt))
+        : Optional.empty();
+  }
+
+  public void setAccountRecoveryPassword(final byte[] accountRecoveryPassword) {
+    requireNotStale();
+
+    setAccountRecoveryPassword(SaltedTokenHash.generateFor(HexFormat.of().formatHex(accountRecoveryPassword)));
+  }
+
+  public void setAccountRecoveryPassword(final SaltedTokenHash saltedAccountRecoveryPasswordHash) {
+    requireNotStale();
+
+    this.accountRecoveryPasswordSalt = saltedAccountRecoveryPasswordHash.salt();
+    this.accountRecoveryPasswordHash = saltedAccountRecoveryPasswordHash.hash();
+  }
+
+  public void clearAccountRecoveryPassword() {
+    requireNotStale();
+
+    this.accountRecoveryPasswordSalt = null;
+    this.accountRecoveryPasswordHash = null;
+  }
+
+  public Optional<byte[]> getAuthCredentialSalt() {
+    requireNotStale();
+    return Optional.ofNullable(authCredentialSalt);
+  }
+
+  public void setAuthCredentialSalt(final byte[] authCredentialSalt) {
+    requireNotStale();
+    this.authCredentialSalt = authCredentialSalt;
+  }
+
+  public void setPendingTotpKey(@Nullable final TotpKey pendingTotpKey) {
+    requireNotStale();
+    this.pendingTotpKey = pendingTotpKey;
+  }
+
+  public Optional<TotpKey> getPendingTotpKey() {
+    requireNotStale();
+    return Optional.ofNullable(pendingTotpKey);
+  }
+
+  public byte getNextMfaKeyId() {
+    requireNotStale();
+
+    final Set<Byte> usedKeys = new HashSet<>(mfaKeys.keySet());
+
+    return (byte) IntStream.range(0, MAX_MFA_KEY_ID + 1)
+        .filter(b -> !usedKeys.contains((byte) b))
+        .findFirst()
+        .orElseThrow(IllegalStateException::new);
+  }
+
+  public Map<Byte, AnnotatedMfaKey> getMfaKeys() {
+    requireNotStale();
+    return mfaKeys;
+  }
+
+  public void setMfaKeys(final Map<Byte, AnnotatedMfaKey> mfaKeys) {
+    requireNotStale();
+    this.mfaKeys = mfaKeys;
   }
 
   public void markStale() {

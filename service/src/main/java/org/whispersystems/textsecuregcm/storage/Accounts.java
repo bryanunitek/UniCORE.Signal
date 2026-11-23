@@ -6,7 +6,6 @@ package org.whispersystems.textsecuregcm.storage;
 
 import static java.util.Objects.requireNonNull;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
-import static org.whispersystems.textsecuregcm.util.Util.getAlternateForms;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectWriter;
@@ -26,7 +25,6 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -37,15 +35,16 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import org.apache.commons.lang3.StringUtils;
 import org.signal.libsignal.zkgroup.backups.BackupCredentialType;
+import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialPresentation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.util.AsyncTimerUtil;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
 import org.whispersystems.textsecuregcm.util.ExceptionUtils;
 import org.whispersystems.textsecuregcm.util.SystemMapper;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.textsecuregcm.util.Util;
+import org.whispersystems.textsecuregcm.util.logging.ImpossibleEvents;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import software.amazon.awssdk.core.SdkBytes;
@@ -169,6 +168,7 @@ public class Accounts {
 
   private final DynamoDbClient dynamoDbClient;
   private final DynamoDbAsyncClient dynamoDbAsyncClient;
+  private final RedeemedReceiptsManager redeemedReceiptsManager;
 
   private final String phoneNumberConstraintTableName;
   private final String phoneNumberIdentifierConstraintTableName;
@@ -181,6 +181,7 @@ public class Accounts {
       final Clock clock,
       final DynamoDbClient dynamoDbClient,
       final DynamoDbAsyncClient dynamoDbAsyncClient,
+      final RedeemedReceiptsManager redeemedReceiptsManager,
       final String accountsTableName,
       final String phoneNumberConstraintTableName,
       final String phoneNumberIdentifierConstraintTableName,
@@ -191,6 +192,7 @@ public class Accounts {
     this.clock = clock;
     this.dynamoDbClient = dynamoDbClient;
     this.dynamoDbAsyncClient = dynamoDbAsyncClient;
+    this.redeemedReceiptsManager = redeemedReceiptsManager;
     this.phoneNumberConstraintTableName = phoneNumberConstraintTableName;
     this.phoneNumberIdentifierConstraintTableName = phoneNumberIdentifierConstraintTableName;
     this.accountsTableName = accountsTableName;
@@ -215,24 +217,27 @@ public class Accounts {
   boolean create(final Account account, final List<TransactWriteItem> additionalWriteItems)
       throws AccountAlreadyExistsException {
 
+    if (account.getNumber().isEmpty() || account.getPhoneNumberIdentifier().isEmpty()) {
+      throw new IllegalArgumentException("Phone number and phone number identifier must be set");
+    }
+
     final Timer.Sample sample = Timer.start();
 
     try {
-      final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getUuid());
-      final AttributeValue numberAttr = AttributeValues.fromString(account.getNumber());
-      final AttributeValue pniUuidAttr = AttributeValues.fromUUID(account.getPhoneNumberIdentifier());
+      final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getAccountIdentifier());
+      final AttributeValue numberAttr = AttributeValues.fromString(account.getNumber().get());
+      final AttributeValue pniUuidAttr = AttributeValues.fromUUID(account.getPhoneNumberIdentifier().get());
 
       final TransactWriteItem phoneNumberConstraintPut = buildConstraintTablePutIfAbsent(
           phoneNumberConstraintTableName, uuidAttr, ATTR_ACCOUNT_E164, numberAttr);
-
       final TransactWriteItem phoneNumberIdentifierConstraintPut = buildConstraintTablePutIfAbsent(
           phoneNumberIdentifierConstraintTableName, uuidAttr, ATTR_PNI_UUID, pniUuidAttr);
 
-      final TransactWriteItem accountPut = buildAccountPut(account, uuidAttr, numberAttr, pniUuidAttr);
+      final TransactWriteItem accountPut = buildAccountPut(account, uuidAttr, Optional.of(numberAttr), Optional.of(pniUuidAttr));
 
       // Clear any "recently deleted account" record for this number since, if it existed, we've used its old ACI for
       // the newly-created account.
-      final TransactWriteItem deletedAccountDelete = buildRemoveDeletedAccount(account.getPhoneNumberIdentifier());
+      final TransactWriteItem deletedAccountDelete = buildRemoveDeletedAccount(account.getPhoneNumberIdentifier().get());
 
       final Collection<TransactWriteItem> writeItems = new ArrayList<>(
           List.of(phoneNumberConstraintPut, phoneNumberIdentifierConstraintPut, accountPut, deletedAccountDelete));
@@ -293,6 +298,108 @@ public class Accounts {
     return true;
   }
 
+  /// Create an account record via a receipt presentation
+  ///
+  /// @param account                          The account to create
+  /// @param receiptCredentialPresentation    A presentation of a receipt credential that grants the ability to create
+  /// one account
+  /// @param accountRecoveryPasswordInRequest The account-recovery-password supplied in the request
+  /// @param additionalWriteItems             Additional items to include in the transaction
+  ///
+  /// @return true
+  /// @throws AccountAlreadyExistsException     An account was already created using this receipt
+  /// @throws ReceiptAlreadyRedeemedException   The receipt was already used to create an account and this creation
+  ///                                           request would require a new account
+  /// @throws AccountCreationConditionException One of the conditions in `additionalWriteItems` failed. The exception
+  ///                                           contains the index of the [TransactWriteItem] that failed
+  boolean create(final Account account,
+      final ReceiptCredentialPresentation receiptCredentialPresentation,
+      final byte[] accountRecoveryPasswordInRequest,
+      final List<TransactWriteItem> additionalWriteItems)
+      throws AccountAlreadyExistsException, ReceiptAlreadyRedeemedException, AccountCreationConditionException {
+
+    final Timer.Sample sample = Timer.start();
+
+    try {
+      final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getAccountIdentifier());
+
+      final TransactWriteItem signalLoginReceiptConstraintPut =
+          redeemedReceiptsManager.buildTransactWriteItemForReceipt(
+              receiptCredentialPresentation.getReceiptSerial(),
+              Instant.ofEpochSecond(receiptCredentialPresentation.getReceiptExpirationTime()),
+              receiptCredentialPresentation.getReceiptLevel(),
+              account.getAccountIdentifier());
+      final TransactWriteItem accountPut = buildAccountPut(account, uuidAttr, Optional.empty(), Optional.empty());
+
+      final Collection<TransactWriteItem> writeItems = new ArrayList<>(
+          List.of(signalLoginReceiptConstraintPut, accountPut));
+
+      final int additionalWriteItemsStart = writeItems.size();
+      writeItems.addAll(additionalWriteItems);
+
+      final TransactWriteItemsRequest request = TransactWriteItemsRequest.builder()
+          .transactItems(writeItems)
+          .build();
+
+      try {
+        dynamoDbClient.transactWriteItems(request);
+      } catch (final TransactionCanceledException e) {
+
+        final CancellationReason receiptSerialConstraintCancellationReason = e.cancellationReasons().get(0);
+
+        if (conditionalCheckFailed(receiptSerialConstraintCancellationReason)) {
+          final UUID existingAccountUuid = UUIDUtil.fromByteBuffer(receiptSerialConstraintCancellationReason.item()
+              .get(RedeemedReceiptsManager.ATTR_ACCOUNT_UUID).b().asByteBuffer());
+          final Account existingAccount = getByAccountIdentifier(existingAccountUuid)
+              // The account was already deleted, and we don't allow re-registering with the same receipt
+              .orElseThrow(ReceiptAlreadyRedeemedException::new);
+
+          final boolean accountRecoveryPasswordMatches = existingAccount.getAccountRecoveryPassword()
+              .map(arp -> PhoneNumberRecoveryPasswordsManager.verify(arp, accountRecoveryPasswordInRequest))
+              .orElse(false);
+
+          // Determine if this request is safe to idempotently succeed. It's safe if:
+          // - The account recovery password in the request matches the existing account's
+          // - The existing account does not have any MFA keys. If MFA keys were added to the account the caller should
+          //   have used numberless account recovery rather than using their original receipt
+          //
+          // If either of these conditions are not met, the caller is incorrectly using an already redeemed receipt.
+          final boolean isRetry = accountRecoveryPasswordMatches && existingAccount.getMfaKeys().isEmpty();
+
+          if (!isRetry) {
+            throw new ReceiptAlreadyRedeemedException();
+          }
+
+          throw new AccountAlreadyExistsException(existingAccount);
+        }
+
+        for (int i = additionalWriteItemsStart; i < e.cancellationReasons().size(); i++) {
+          if (conditionalCheckFailed(e.cancellationReasons().get(i))) {
+            // Indicate the first caller-supplied TransactWriteItem that failed
+            throw new AccountCreationConditionException(i - additionalWriteItemsStart);
+          }
+        }
+
+        final CancellationReason accountCancellationReason = e.cancellationReasons().get(1);
+        if (conditionalCheckFailed(accountCancellationReason)) {
+          throw new IllegalStateException("Tried to create an account with an ACI that already exists " + account.getAccountIdentifier());
+        }
+
+        if (TRANSACTION_CONFLICT.equals(accountCancellationReason.code())) {
+          // this should only happen if two clients manage to make concurrent create() calls
+          throw new ContestedOptimisticLockException();
+        }
+
+        // this shouldn't happen
+        throw new RuntimeException("could not create account: " + extractCancellationReasonCodes(e));
+      }
+    } finally {
+      sample.stop(CREATE_TIMER);
+    }
+
+    return true;
+  }
+
   /**
    * Copies over any account attributes that should be preserved when a new account reclaims an account identifier.
    *
@@ -303,12 +410,14 @@ public class Accounts {
       final Account accountToCreate,
       final Collection<TransactWriteItem> additionalWriteItems) {
 
-    if (!existingAccount.getUuid().equals(accountToCreate.getUuid()) ||
+    if (!existingAccount.getAccountIdentifier().equals(accountToCreate.getAccountIdentifier()) ||
+        existingAccount.getNumber().isPresent() != accountToCreate.getNumber().isPresent() ||
         !existingAccount.getPhoneNumberIdentifier().equals(accountToCreate.getPhoneNumberIdentifier())) {
 
       log.error("Reclaimed accounts must match. Old account {}:{}:{}, New account {}:{}:{}",
-          existingAccount.getUuid(), redactPhoneNumber(existingAccount.getNumber()), existingAccount.getPhoneNumberIdentifier(),
-          accountToCreate.getUuid(), redactPhoneNumber(accountToCreate.getNumber()), accountToCreate.getPhoneNumberIdentifier());
+          existingAccount.getAccountIdentifier(), existingAccount.getNumber().map(Accounts::redactPhoneNumber), existingAccount.getPhoneNumberIdentifier(),
+          accountToCreate.getAccountIdentifier(), accountToCreate.getNumber().map(Accounts::redactPhoneNumber), accountToCreate.getPhoneNumberIdentifier());
+
       throw new IllegalArgumentException("reclaimed accounts must match");
     }
 
@@ -326,8 +435,16 @@ public class Accounts {
       // Carry over the existing backup voucher to the new account
       accountToCreate.setBackupVoucher(existingAccount.getBackupVoucher());
 
+      // Carry over any existing badges to the new account
+      accountToCreate.setBadges(clock, existingAccount.getBadges());
+
       // Carry over the existing ZK credential key to the new account
-      accountToCreate.setZkCredentialKey(existingAccount.getZkCredentialKey());
+      accountToCreate.setZkCredentialKey(existingAccount.getZkCredentialKey().orElse(null));
+      accountToCreate.setZkCredentialKeyRotationId(existingAccount.getZkCredentialKeyRotationId());
+
+      // Carry over any existing MFA keys to the new account; we don't need to copy the pending TOTP key since that's
+      // just a temporary holding place for essentially ephemeral data
+      accountToCreate.setMfaKeys(new HashMap<>(existingAccount.getMfaKeys()));
 
       final List<TransactWriteItem> writeItems = new ArrayList<>();
 
@@ -359,7 +476,7 @@ public class Accounts {
                 .tableName(usernamesConstraintTableName)
                 .item(Map.of(
                     UsernameTable.KEY_USERNAME_HASH, AttributeValues.fromByteArray(usernameHash),
-                    UsernameTable.ATTR_ACCOUNT_UUID, AttributeValues.fromUUID(accountToCreate.getUuid()),
+                    UsernameTable.ATTR_ACCOUNT_UUID, AttributeValues.fromUUID(accountToCreate.getAccountIdentifier()),
                     UsernameTable.ATTR_TTL, AttributeValues.fromLong(expirationTime),
                     UsernameTable.ATTR_CONFIRMED, AttributeValues.fromBool(false),
                     UsernameTable.ATTR_RECLAIMABLE, AttributeValues.fromBool(true)))
@@ -370,7 +487,7 @@ public class Accounts {
                     "#uuid", UsernameTable.ATTR_ACCOUNT_UUID))
                 .expressionAttributeValues(Map.of(
                     ":now", AttributeValues.fromLong(clock.instant().getEpochSecond()),
-                    ":uuid", AttributeValues.fromUUID(accountToCreate.getUuid())))
+                    ":uuid", AttributeValues.fromUUID(accountToCreate.getAccountIdentifier())))
                 .returnValuesOnConditionCheckFailure(ReturnValuesOnConditionCheckFailure.ALL_OLD)
                 .build())
             .build());
@@ -378,20 +495,23 @@ public class Accounts {
 
       // Phone number canonicalization means that a user can use a different phone number in the same equivalence class
       // to reclaim the account.
-      if (!existingAccount.getNumber().equals(accountToCreate.getNumber())) {
-        if (getAlternateForms(existingAccount.getNumber()).contains(accountToCreate.getNumber())) {
-          final AttributeValue uuidAttr = AttributeValues.fromUUID(existingAccount.getUuid());
-          final AttributeValue numberAttr = AttributeValues.fromString(accountToCreate.getNumber());
+      if (!existingAccount.getNumber().equals(accountToCreate.getNumber())
+          && existingAccount.getNumber().isPresent()
+          && accountToCreate.getNumber().isPresent()) {
+        final String existingAccountNumber = existingAccount.getNumber().get();
+        final String accountToCreateNumber = accountToCreate.getNumber().get();
+        if (Util.getAlternateForms(existingAccountNumber).contains(accountToCreateNumber)) {
+          final AttributeValue uuidAttr = AttributeValues.fromUUID(existingAccount.getAccountIdentifier());
+          final AttributeValue numberAttr = AttributeValues.fromString(accountToCreateNumber);
           final TransactWriteItem phoneNumberConstraintPut = buildConstraintTablePutIfAbsent(
               phoneNumberConstraintTableName, uuidAttr, ATTR_ACCOUNT_E164, numberAttr);
 
-          writeItems.add(buildDelete(phoneNumberConstraintTableName, ATTR_ACCOUNT_E164, existingAccount.getNumber()));
+          writeItems.add(buildDelete(phoneNumberConstraintTableName, ATTR_ACCOUNT_E164, existingAccountNumber));
           writeItems.add(phoneNumberConstraintPut);
         } else {
-          log.error("Reclaiming account with a non-equivalent phone number. Old account {}:{}:{}, new account {}:{}:{}",
-              existingAccount.getUuid(), existingAccount.getNumber(), existingAccount.getPhoneNumberIdentifier(),
-              accountToCreate.getUuid(), accountToCreate.getNumber(), accountToCreate.getPhoneNumberIdentifier());
-          throw new IllegalArgumentException("reclaimed accounts must have equivalent phone numbers");
+          throw new IllegalStateException(String.format("Reclaiming account with a non-equivalent phone number. Old account %s:%s:%s, new account %s:%s:%s",
+              existingAccount.getAccountIdentifier(), redactPhoneNumber(existingAccountNumber), existingAccount.getPhoneNumberIdentifier(),
+              accountToCreate.getAccountIdentifier(), redactPhoneNumber(accountToCreateNumber), accountToCreate.getPhoneNumberIdentifier()));
         }
       }
 
@@ -409,10 +529,10 @@ public class Accounts {
             if (unwrapped instanceof TransactionCanceledException te) {
               if (Accounts.conditionalCheckFailed(te.cancellationReasons().get(updateAccountItemIndex))) {
                 final Map<String, AttributeValue> item = te.cancellationReasons().get(updateAccountItemIndex).item();
-                final String existingNumber = AttributeValues.getString(item, Accounts.ATTR_ACCOUNT_E164, null);
+                final Optional<String> existingNumber = Optional.ofNullable(AttributeValues.getString(item, Accounts.ATTR_ACCOUNT_E164, null));
                 if (!existingAccount.getNumber().equals(existingNumber)) {
                   log.error("Failed to update account due to unexpected existing phone number. Account {}. Expected {}, got {}",
-                      existingAccount.getUuid(), existingAccount.getNumber(), existingNumber);
+                      existingAccount.getAccountIdentifier(), existingAccount.getNumber(), existingNumber);
                   throw new UnexpectedExistingPhoneNumberException();
                 }
               }
@@ -447,8 +567,8 @@ public class Accounts {
       final Collection<TransactWriteItem> additionalWriteItems) {
 
     CHANGE_NUMBER_TIMER.record(() -> {
-      final String originalNumber = account.getNumber();
-      final UUID originalPni = account.getPhoneNumberIdentifier();
+      final String originalNumber = account.getNumber().orElseThrow(() -> new IllegalArgumentException("Account does not have a phone number"));
+      final UUID originalPni = account.getPhoneNumberIdentifier().orElseThrow(() -> new IllegalArgumentException("Account does not have a phone number"));
 
       boolean succeeded = false;
 
@@ -457,7 +577,7 @@ public class Accounts {
       int accountUpdateIndex = -1;
       try {
         final List<TransactWriteItem> writeItems = new ArrayList<>();
-        final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getUuid());
+        final AttributeValue uuidAttr = AttributeValues.fromUUID(account.getAccountIdentifier());
         final AttributeValue numberAttr = AttributeValues.fromString(number);
         final AttributeValue pniAttr = AttributeValues.fromUUID(phoneNumberIdentifier);
 
@@ -599,7 +719,7 @@ public class Accounts {
       final long expirationTimeSeconds) throws ContestedOptimisticLockException, TtlConflictException, UsernameHashNotAvailableException {
 
     // Use account UUID as a "reservation token" - by providing this, the client proves ownership of the hash
-    final UUID uuid = updatedAccount.getUuid();
+    final UUID uuid = updatedAccount.getAccountIdentifier();
 
     final List<TransactWriteItem> writeItems = new ArrayList<>();
 
@@ -786,7 +906,7 @@ public class Accounts {
     writeItems.add(TransactWriteItem.builder().put(Put.builder()
             .tableName(usernamesConstraintTableName)
             .item(Map.of(
-                UsernameTable.ATTR_ACCOUNT_UUID, AttributeValues.fromUUID(updatedAccount.getUuid()),
+                UsernameTable.ATTR_ACCOUNT_UUID, AttributeValues.fromUUID(updatedAccount.getAccountIdentifier()),
                 UsernameTable.KEY_USERNAME_HASH, AttributeValues.fromByteArray(usernameHash),
                 UsernameTable.ATTR_CONFIRMED, AttributeValues.fromBool(true)))
             // it's not in the constraint table OR it's expired OR it was reserved by us
@@ -798,7 +918,7 @@ public class Accounts {
                 "#confirmed", UsernameTable.ATTR_CONFIRMED))
             .expressionAttributeValues(Map.of(
                 ":now", AttributeValues.fromLong(clock.instant().getEpochSecond()),
-                ":aci", AttributeValues.fromUUID(updatedAccount.getUuid()),
+                ":aci", AttributeValues.fromUUID(updatedAccount.getAccountIdentifier()),
                 ":confirmed", AttributeValues.fromBool(false)))
             .returnValuesOnConditionCheckFailure(ReturnValuesOnConditionCheckFailure.ALL_OLD)
             .build())
@@ -809,11 +929,11 @@ public class Accounts {
 
     // 2?: Add a temporary hold for the old username to stop others from claiming it
     maybeOriginalUsernameHash.ifPresent(originalUsernameHash ->
-        writeItems.add(holdUsernameTransactItem(updatedAccount.getUuid(), originalUsernameHash, now)));
+        writeItems.add(holdUsernameTransactItem(updatedAccount.getAccountIdentifier(), originalUsernameHash, now)));
 
     // 3?: Adding that hold may have caused our account to exceed our maximum holds. Release an old hold
     holdToRemove.ifPresent(oldHold ->
-        writeItems.add(releaseHoldIfAllowedTransactItem(updatedAccount.getUuid(), oldHold, now)));
+        writeItems.add(releaseHoldIfAllowedTransactItem(updatedAccount.getAccountIdentifier(), oldHold, now)));
 
     try {
       dynamoDbClient.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(writeItems).build());
@@ -894,10 +1014,10 @@ public class Accounts {
     items.add(UpdateAccountSpec.forAccount(accountsTableName, updatedAccount).transactItem());
 
     // 1: Un-confirm our username, adding a temporary hold for the old username to stop others from claiming it
-    items.add(holdUsernameTransactItem(updatedAccount.getUuid(), usernameHash, now));
+    items.add(holdUsernameTransactItem(updatedAccount.getAccountIdentifier(), usernameHash, now));
 
     // 2?: Adding that hold may have caused our account to exceed our maximum holds. Release an old hold
-    holdToRemove.ifPresent(oldHold -> items.add(releaseHoldIfAllowedTransactItem(updatedAccount.getUuid(), oldHold, now)));
+    holdToRemove.ifPresent(oldHold -> items.add(releaseHoldIfAllowedTransactItem(updatedAccount.getAccountIdentifier(), oldHold, now)));
 
     try {
       dynamoDbClient.transactWriteItems(TransactWriteItemsRequest.builder().transactItems(items).build());
@@ -991,26 +1111,34 @@ public class Accounts {
     static UpdateAccountSpec forReclaimedAccount(
         final String accountTableName,
         final Account account,
-        final String expectedExistingE164) {
+        final Optional<String> maybeExpectedExistingE164) {
       final UpdateAccountSpec base = forAccount(accountTableName, account);
 
+      final Map<String, String> attrNames = new HashMap<>(base.attrNames());
       final Map<String, AttributeValue> attrValues = new HashMap<>(base.attrValues());
-      attrValues.put(":number", AttributeValues.fromString(account.getNumber()));
-
       final UpdateExpression updateExpression = base.updateExpression();
       final List<String> setClauses = new ArrayList<>(updateExpression.setClauses());
-      setClauses.add("#number = :number");
 
-      final MembershipExpression membershipExpression = MembershipExpression.build(getAlternateForms(expectedExistingE164));
-      attrValues.putAll(membershipExpression.values());
+      final String conditionExpression = account.getNumber()
+          .map(number -> {
+            attrNames.put("#number", ATTR_ACCOUNT_E164);
+            attrValues.put(":number", AttributeValues.fromString(number));
+            setClauses.add("#number = :number");
 
-      // Defensive check: we should only update the e164 to another e164 in the same equivalence class
-      final String conditionExpression = base.conditionExpression() + " AND #number IN %s".formatted(membershipExpression.expression());
+            final MembershipExpression membershipExpression = maybeExpectedExistingE164
+                .map(e164 -> MembershipExpression.build(Util.getAlternateForms(e164)))
+                .orElseThrow(() -> new IllegalArgumentException("E164 must be present on existing account"));
+
+            attrValues.putAll(membershipExpression.values());
+            // Defensive check: if an e164 exists on the account, we should only update it to another e164 in the same equivalence class
+            return base.conditionExpression() + " AND #number IN %s".formatted(membershipExpression.expression());
+          })
+          .orElse(base.conditionExpression());
 
       return new UpdateAccountSpec(
           base.tableName(),
           base.key(),
-          base.attrNames(),
+          attrNames,
           attrValues,
           new UpdateExpression(setClauses, updateExpression.addClauses(), updateExpression.removeClauses()),
           conditionExpression
@@ -1021,7 +1149,6 @@ public class Accounts {
         final String accountTableName,
         final Account account) {
       final Map<String, String> attrNames = new HashMap<>(Map.of(
-          "#number", ATTR_ACCOUNT_E164,
           "#data", ATTR_ACCOUNT_DATA,
           "#cds", ATTR_CANONICALLY_DISCOVERABLE,
           "#version", ATTR_VERSION));
@@ -1080,11 +1207,11 @@ public class Accounts {
 
       return new UpdateAccountSpec(
           accountTableName,
-          Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(account.getUuid())),
+          Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(account.getAccountIdentifier())),
           attrNames,
           attrValues,
           new UpdateExpression(setClauses, addClauses, removeClauses),
-          "attribute_exists(#number) AND #version = :version");
+          "#version = :version");
     }
   }
 
@@ -1102,7 +1229,7 @@ public class Accounts {
     } catch (final ConditionalCheckFailedException e) {
       // the exception doesn't give details about which condition failed,
       // but we can infer it was an optimistic locking failure if the UUID is known
-      if (getByAccountIdentifier(account.getUuid()).isPresent()) {
+      if (getByAccountIdentifier(account.getAccountIdentifier()).isPresent()) {
         throw new ContestedOptimisticLockException();
       } else {
         throw e;
@@ -1216,6 +1343,16 @@ public class Accounts {
             .map(Accounts::fromItem)));
   }
 
+  boolean accountExists(final UUID aci) {
+    final GetItemResponse response = dynamoDbClient.getItem(GetItemRequest.builder()
+        .tableName(accountsTableName)
+        .key(Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(aci)))
+        .projectionExpression(KEY_ACCOUNT_UUID)
+        .consistentRead(true)
+        .build());
+    return response.hasItem() && !response.item().isEmpty();
+  }
+
   private TransactWriteItem buildPutDeletedAccount(final UUID aci, final UUID pni) {
     return TransactWriteItem.builder()
         .put(Put.builder()
@@ -1241,7 +1378,7 @@ public class Accounts {
     return TransactWriteItem.builder()
         .delete(Delete.builder()
             .tableName(accountsTableName)
-            .key(Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(account.getUuid())))
+            .key(Map.of(KEY_ACCOUNT_UUID, AttributeValues.fromUUID(account.getAccountIdentifier())))
             .conditionExpression("#version = :version")
             .expressionAttributeNames(Map.of("#version", ATTR_VERSION))
             .expressionAttributeValues(Map.of(":version", AttributeValues.fromInt(account.getVersion())))
@@ -1306,12 +1443,17 @@ public class Accounts {
             account = maybeAccount.get();
           }
 
-          final List<TransactWriteItem> transactWriteItems = new ArrayList<>(List.of(
-              buildConditionalDeleteAccount(account),
-              buildDelete(phoneNumberConstraintTableName, ATTR_ACCOUNT_E164, account.getNumber()),
-              buildDelete(phoneNumberIdentifierConstraintTableName, ATTR_PNI_UUID, account.getPhoneNumberIdentifier()),
-              buildPutDeletedAccount(uuid, account.getPhoneNumberIdentifier())
-          ));
+
+          final List<TransactWriteItem> transactWriteItems = new ArrayList<>();
+          transactWriteItems.add(buildConditionalDeleteAccount(account));
+
+          account.getNumber().ifPresent(e164 -> transactWriteItems.add(
+              buildDelete(phoneNumberConstraintTableName, ATTR_ACCOUNT_E164, e164)));
+
+          account.getPhoneNumberIdentifier().ifPresent(pni -> {
+            transactWriteItems.add(buildDelete(phoneNumberIdentifierConstraintTableName, ATTR_PNI_UUID, pni));
+            transactWriteItems.add(buildPutDeletedAccount(uuid, pni));
+          });
 
           account.getUsernameHash().ifPresent(usernameHash -> transactWriteItems.add(
               buildDelete(usernamesConstraintTableName, UsernameTable.KEY_USERNAME_HASH, usernameHash)));
@@ -1485,13 +1627,14 @@ public class Accounts {
   private TransactWriteItem buildAccountPut(
       final Account account,
       final AttributeValue uuidAttr,
-      final AttributeValue numberAttr,
-      final AttributeValue pniUuidAttr) {
+      final Optional<AttributeValue> maybeNumberAttr,
+      final Optional<AttributeValue> maybePniUuidAttr) {
+    if (maybeNumberAttr.isPresent() != maybePniUuidAttr.isPresent()) {
+      throw new IllegalArgumentException("Number and PNI attribute values must both be provided together or not at all");
+    }
 
     final Map<String, AttributeValue> item = new HashMap<>(Map.of(
         KEY_ACCOUNT_UUID, uuidAttr,
-        ATTR_ACCOUNT_E164, numberAttr,
-        ATTR_PNI_UUID, pniUuidAttr,
         ATTR_ACCOUNT_DATA, accountDataAttributeValue(account),
         ATTR_VERSION, AttributeValues.fromInt(account.getVersion()),
         ATTR_CANONICALLY_DISCOVERABLE, AttributeValues.fromBool(account.isDiscoverableByPhoneNumber())));
@@ -1501,14 +1644,26 @@ public class Accounts {
         .map(AttributeValues::fromByteArray)
         .ifPresent(uak -> item.put(ATTR_UAK, uak));
 
-    return TransactWriteItem.builder()
-        .put(Put.builder()
-            .conditionExpression("attribute_not_exists(#pni) OR #pni = :pni")
-            .expressionAttributeNames(Map.of("#pni", ATTR_PNI_UUID))
-            .expressionAttributeValues(Map.of(":pni", pniUuidAttr))
+    final Put put = maybeNumberAttr.map(numberAttr -> {
+          item.put(ATTR_ACCOUNT_E164, numberAttr);
+          item.put(ATTR_PNI_UUID, maybePniUuidAttr.get());
+          return Put.builder()
+              .tableName(accountsTableName)
+              .item(item)
+              .conditionExpression("attribute_not_exists(#pni) OR #pni = :pni")
+              .expressionAttributeNames(Map.of("#pni", ATTR_PNI_UUID))
+              .expressionAttributeValues(Map.of(":pni", maybePniUuidAttr.get()))
+              .build();
+        })
+        .orElseGet(() -> Put.builder()
             .tableName(accountsTableName)
             .item(item)
-            .build())
+            .conditionExpression("attribute_not_exists(#uuid)")
+            .expressionAttributeNames(Map.of("#uuid", KEY_ACCOUNT_UUID))
+            .build());
+
+    return TransactWriteItem.builder()
+        .put(put)
         .build();
   }
 
@@ -1585,23 +1740,25 @@ public class Accounts {
   CompletableFuture<Void> regenerateConstraints(final Account account) {
     final List<CompletableFuture<?>> constraintFutures = new ArrayList<>();
 
-    constraintFutures.add(writeConstraint(phoneNumberConstraintTableName,
-        account.getIdentifier(IdentityType.ACI),
-        ATTR_ACCOUNT_E164,
-        AttributeValues.fromString(account.getNumber())));
+    account.getNumber().ifPresent(phoneNumber ->
+        constraintFutures.add(writeConstraint(phoneNumberConstraintTableName,
+            account.getAccountIdentifier(),
+            ATTR_ACCOUNT_E164,
+            AttributeValues.fromString(phoneNumber))));
 
-    constraintFutures.add(writeConstraint(phoneNumberIdentifierConstraintTableName,
-        account.getIdentifier(IdentityType.ACI),
-        ATTR_PNI_UUID,
-        AttributeValues.fromUUID(account.getPhoneNumberIdentifier())));
+    account.getPhoneNumberIdentifier().ifPresent(phoneNumberIdentifier ->
+        constraintFutures.add(writeConstraint(phoneNumberIdentifierConstraintTableName,
+            account.getAccountIdentifier(),
+            ATTR_PNI_UUID,
+            AttributeValues.fromUUID(phoneNumberIdentifier))));
 
     account.getUsernameHash().ifPresent(usernameHash ->
-        constraintFutures.add(writeUsernameConstraint(account.getIdentifier(IdentityType.ACI),
+        constraintFutures.add(writeUsernameConstraint(account.getAccountIdentifier(),
             usernameHash,
             Optional.empty())));
 
     account.getUsernameHolds().forEach(usernameHold ->
-        constraintFutures.add(writeUsernameConstraint(account.getIdentifier(IdentityType.ACI),
+        constraintFutures.add(writeUsernameConstraint(account.getAccountIdentifier(),
             usernameHold.usernameHash(),
             Optional.of(Instant.ofEpochSecond(usernameHold.expirationSecs())))));
 
@@ -1655,7 +1812,6 @@ public class Accounts {
   @Nonnull
   static Account fromItem(final Map<String, AttributeValue> item) {
     if (!item.containsKey(ATTR_ACCOUNT_DATA)
-        || !item.containsKey(ATTR_ACCOUNT_E164)
         || !item.containsKey(KEY_ACCOUNT_UUID)
         || !item.containsKey(ATTR_CANONICALLY_DISCOVERABLE)) {
       throw new RuntimeException("item missing values");
@@ -1666,21 +1822,20 @@ public class Accounts {
       final UUID accountIdentifier = UUIDUtil.fromByteBuffer(item.get(KEY_ACCOUNT_UUID).b().asByteBuffer());
       final UUID phoneNumberIdentifierFromAttribute = AttributeValues.getUUID(item, ATTR_PNI_UUID, null);
 
-      if (account.getPhoneNumberIdentifier() == null || phoneNumberIdentifierFromAttribute == null ||
-          !Objects.equals(account.getPhoneNumberIdentifier(), phoneNumberIdentifierFromAttribute)) {
-
-        log.warn("Missing or mismatched PNIs for account {}. From JSON: {}; from attribute: {}",
+      if (!account.getPhoneNumberIdentifier().equals(Optional.ofNullable(phoneNumberIdentifierFromAttribute))) {
+        log.warn("Mismatched PNIs for account {}. From JSON: {}; from attribute: {}",
             accountIdentifier, account.getPhoneNumberIdentifier(), phoneNumberIdentifierFromAttribute);
       }
 
-      final String attributeNumber = item.get(ATTR_ACCOUNT_E164).s();
-      if (account.getNumber() == null || !account.getNumber().equals(attributeNumber)) {
-        log.error("Missing or mismatched phone numbers for account {}. From JSON: {}; from attribute: {}",
+      final String attributeNumber = AttributeValues.getString(item, ATTR_ACCOUNT_E164, null);
+      if (!account.getNumber().equals(Optional.ofNullable(attributeNumber))) {
+        ImpossibleEvents.logImpossible(log,
+            "Mismatched phone numbers for account {}. From JSON: {}; from attribute: {}",
             accountIdentifier, account.getNumber(), attributeNumber);
       }
 
       account.setNumber(attributeNumber, phoneNumberIdentifierFromAttribute);
-      account.setUuid(accountIdentifier);
+      account.setAccountIdentifier(accountIdentifier);
       account.setUsernameHash(AttributeValues.getByteArray(item, ATTR_USERNAME_HASH, null));
       account.setUsernameLinkHandle(AttributeValues.getUUID(item, ATTR_USERNAME_LINK_UUID, null));
       account.setVersion(Integer.parseInt(item.get(ATTR_VERSION).n()));

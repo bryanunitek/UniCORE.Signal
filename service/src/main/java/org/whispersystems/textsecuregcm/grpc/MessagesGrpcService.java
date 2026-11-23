@@ -12,9 +12,16 @@ import com.google.protobuf.Empty;
 import java.time.Clock;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.Flow;
 import java.util.stream.Collectors;
+import io.grpc.StatusRuntimeException;
 import org.signal.chat.errors.NotFound;
+import org.signal.chat.messages.GetMessagesRequest;
+import org.signal.chat.messages.GetMessagesResponse;
 import org.signal.chat.messages.IndividualRecipientMessageBundle;
+import org.signal.chat.messages.ReportMessageRequest;
+import org.signal.chat.messages.ReportMessageResponse;
 import org.signal.chat.messages.SendAuthenticatedSenderMessageRequest;
 import org.signal.chat.messages.SendMessageAuthenticatedSenderResponse;
 import org.signal.chat.messages.SendMessageType;
@@ -38,33 +45,89 @@ import org.whispersystems.textsecuregcm.spam.SpamCheckResult;
 import org.whispersystems.textsecuregcm.spam.SpamChecker;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
+import org.whispersystems.textsecuregcm.storage.Device;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
+import org.whispersystems.textsecuregcm.storage.ReportMessageHelper;
+import org.whispersystems.textsecuregcm.storage.ReportMessageManager;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
+import reactor.adapter.JdkFlowAdapter;
+import reactor.core.publisher.Flux;
+import javax.annotation.Nullable;
 
 public class MessagesGrpcService extends SimpleMessagesGrpc.MessagesImplBase {
 
   private final AccountsManager accountsManager;
+  private final ReportMessageManager reportMessageManager;
+  private final PhoneNumberIdentifiers phoneNumberIdentifiers;
   private final RateLimiters rateLimiters;
   private final MessageSender messageSender;
   private final CardinalityEstimator messageByteLimitEstimator;
   private final SpamChecker spamChecker;
+  private final MessageDispatcher messageDispatcher;
   private final Clock clock;
 
   private static final SendMessageAuthenticatedSenderResponse SEND_MESSAGE_SUCCESS_RESPONSE =
       SendMessageAuthenticatedSenderResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
 
   public MessagesGrpcService(final AccountsManager accountsManager,
+      final ReportMessageManager reportMessageManager,
+      final PhoneNumberIdentifiers phoneNumberIdentifiers,
       final RateLimiters rateLimiters,
       final MessageSender messageSender,
       final CardinalityEstimator messageByteLimitEstimator,
       final SpamChecker spamChecker,
+      final MessageDispatcher messageDispatcher,
       final Clock clock) {
 
     this.accountsManager = accountsManager;
+    this.reportMessageManager = reportMessageManager;
+    this.phoneNumberIdentifiers = phoneNumberIdentifiers;
     this.rateLimiters = rateLimiters;
     this.messageSender = messageSender;
     this.messageByteLimitEstimator = messageByteLimitEstimator;
     this.spamChecker = spamChecker;
+    this.messageDispatcher = messageDispatcher;
     this.clock = clock;
   }
+
+  @Override
+  public Flow.Publisher<GetMessagesResponse> getMessages(final Flow.Publisher<GetMessagesRequest> request) throws Exception {
+    final AuthenticatedDevice authenticatedDevice = AuthenticationUtil.requireAuthenticatedDevice();
+    final Account account = accountsManager
+        .getByAccountIdentifier(authenticatedDevice.accountIdentifier())
+        .orElseThrow(() -> GrpcExceptions.invalidCredentials("invalid credentials"));
+    final Device device = account.getDevice(authenticatedDevice.deviceId())
+        .orElseThrow(() -> GrpcExceptions.invalidCredentials("invalid credentials"));
+    final String userAgent = RequestAttributesUtil.getUserAgent().orElse(null);
+
+    final Flux<GetMessagesRequest> requestFlux = JdkFlowAdapter.flowPublisherToFlux(request);
+
+    return JdkFlowAdapter.publisherToFlowPublisher(requestFlux.switchOnFirst((firstSignal, flux) -> {
+      @Nullable final GetMessagesRequest streamRequest = firstSignal.get();
+      if (streamRequest == null) {
+        // Just forward the error or completion signal
+        return flux.then().cast(GetMessagesResponse.class);
+      }
+      if (!streamRequest.hasOptions()) {
+        throw GrpcExceptions.fieldViolation("request", "the first request must be GetMessageOptions");
+      }
+      final boolean dropStories = streamRequest.getOptions().getDropStories();
+      return messageDispatcher.getMessages(dropStories, userAgent, account, device,
+          flux.skip(1).map(MessagesGrpcService::extractAckGuid));
+    }));
+  }
+
+  private static UUID extractAckGuid(final GetMessagesRequest ack) throws StatusRuntimeException {
+    if (!ack.hasServerGuidAck()) {
+      throw GrpcExceptions.fieldViolation("request", "All non-initial GetMessageRequests must contain a server_guid_ack");
+    }
+    try {
+      return UUIDUtil.fromByteString(ack.getServerGuidAck());
+    } catch (final IllegalArgumentException e) {
+      throw GrpcExceptions.fieldViolation("server_guid_ack", "invalid server_guid_ack");
+    }
+  }
+
 
   @Override
   public SendMessageAuthenticatedSenderResponse sendMessage(final SendAuthenticatedSenderMessageRequest request)
@@ -76,7 +139,7 @@ public class MessagesGrpcService extends SimpleMessagesGrpc.MessagesImplBase {
         .orElseThrow(() -> GrpcExceptions.invalidCredentials("invalid credentials"));
 
     final ServiceIdentifier destinationServiceIdentifier =
-        ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getDestination());
+        GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getDestination());
 
     if (sender.isIdentifiedBy(destinationServiceIdentifier)) {
       throw GrpcExceptions.invalidArguments("use `sendSyncMessage` to send messages to own account");
@@ -90,7 +153,7 @@ public class MessagesGrpcService extends SimpleMessagesGrpc.MessagesImplBase {
     }
     final Account destination = maybeDestination.get();
 
-    rateLimiters.getMessagesLimiter().validate(authenticatedDevice.accountIdentifier(), destination.getUuid());
+    rateLimiters.getMessagesLimiter().validate(authenticatedDevice.accountIdentifier(), destination.getAccountIdentifier());
 
     return sendMessage(destination,
         destinationServiceIdentifier,
@@ -159,8 +222,8 @@ public class MessagesGrpcService extends SimpleMessagesGrpc.MessagesImplBase {
                   .setType(getEnvelopeType(entry.getValue().getType()))
                   .setClientTimestamp(messages.getTimestamp())
                   .setServerTimestamp(clock.millis())
-                  .setDestinationServiceId(destinationServiceIdentifier.toServiceIdentifierString())
-                  .setSourceServiceId(new AciServiceIdentifier(sender.accountIdentifier()).toServiceIdentifierString())
+                  .setDestinationServiceId(destinationServiceIdentifier.toCompactByteString())
+                  .setSourceServiceId(new AciServiceIdentifier(sender.accountIdentifier()).toCompactByteString())
                   .setSourceDevice(sender.deviceId())
                   .setEphemeral(ephemeral)
                   .setUrgent(urgent)
@@ -208,5 +271,23 @@ public class MessagesGrpcService extends SimpleMessagesGrpc.MessagesImplBase {
       case UNSPECIFIED, UNRECOGNIZED ->
           throw GrpcExceptions.invalidArguments("unrecognized envelope type");
     };
+  }
+
+  @Override
+  public ReportMessageResponse reportMessage(final ReportMessageRequest request) {
+    final ServiceIdentifier sourceServiceIdentifier =
+        GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getSourceServiceIdentifier());
+
+    ReportMessageHelper.reportMessage(
+        sourceServiceIdentifier,
+        new AciServiceIdentifier(AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier()),
+        UUIDUtil.fromByteString(request.getMessageGuid()),
+        request.getReportSpamToken().isEmpty() ? null : request.getReportSpamToken().toByteArray(),
+        RequestAttributesUtil.getUserAgent().orElse(null),
+        accountsManager,
+        phoneNumberIdentifiers,
+        reportMessageManager);
+
+    return ReportMessageResponse.getDefaultInstance();
   }
 }

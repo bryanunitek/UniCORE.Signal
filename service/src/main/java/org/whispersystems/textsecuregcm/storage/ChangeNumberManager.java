@@ -6,11 +6,10 @@ package org.whispersystems.textsecuregcm.storage;
 
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
-import com.google.common.net.HttpHeaders;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
-import jakarta.ws.rs.container.ContainerRequestContext;
+import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
@@ -22,8 +21,12 @@ import javax.annotation.Nullable;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.auth.InvalidRegistrationSessionException;
 import org.whispersystems.textsecuregcm.auth.PhoneVerificationTokenManager;
+import org.whispersystems.textsecuregcm.auth.RecoveryPasswordVerificationFailedException;
+import org.whispersystems.textsecuregcm.auth.RegistrationLockFailureException;
 import org.whispersystems.textsecuregcm.auth.RegistrationLockVerificationManager;
+import org.whispersystems.textsecuregcm.auth.UnverifiedRegistrationSessionException;
 import org.whispersystems.textsecuregcm.controllers.AccountControllerV2;
 import org.whispersystems.textsecuregcm.controllers.MessageDeliveryNotAllowedException;
 import org.whispersystems.textsecuregcm.controllers.MismatchedDevicesException;
@@ -34,12 +37,13 @@ import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
 import org.whispersystems.textsecuregcm.entities.PhoneVerificationRequest;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
 import org.whispersystems.textsecuregcm.push.MessageSender;
 import org.whispersystems.textsecuregcm.push.MessageTooLargeException;
 import org.whispersystems.textsecuregcm.util.Pair;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
+import org.whispersystems.textsecuregcm.util.logging.ImpossibleEvents;
 
 public class ChangeNumberManager {
 
@@ -87,20 +91,24 @@ public class ChangeNumberManager {
       final Map<Byte, KEMSignedPreKey> devicePqLastResortPreKeys,
       final List<IncomingMessage> deviceMessages,
       final Map<Byte, Integer> pniRegistrationIds,
-      final ContainerRequestContext containerRequestContext)
-      throws InterruptedException, MismatchedDevicesException, MessageTooLargeException, RateLimitExceededException, MessageDeliveryNotAllowedException {
-
-    final String senderUserAgent = containerRequestContext.getHeaderString(HttpHeaders.USER_AGENT);
+      @Nullable final String userAgent,
+      @Nullable final String acceptLanguage,
+      @Nullable final String mostRecentProxy)
+      throws InterruptedException, MismatchedDevicesException, MessageTooLargeException, RateLimitExceededException, MessageDeliveryNotAllowedException, RegistrationLockFailureException, UnverifiedRegistrationSessionException, InvalidRegistrationSessionException, IOException, RecoveryPasswordVerificationFailedException {
 
     final Pair<Account, Optional<Account>> accountAndMaybeExistingAccount =
         accountsManager.getAccountsForChangeNumber(accountIdentifier, number);
 
     final Account account = accountAndMaybeExistingAccount.first();
 
-    // Only verify and check reglock if there's a data change to be made...
-    if (!account.getNumber().equals(number)) {
+    if (account.getNumber().isEmpty()) {
+      throw new IllegalArgumentException("account does not have a phone number");
+    }
 
-      final Optional<Duration> waitingPeriodRemaining = changeNumberWaitingPeriodManager.getWaitingPeriodRemaining(account.getUuid());
+    // Only verify and check reglock if there's a data change to be made...
+    if (!account.getNumber().get().equals(number)) {
+
+      final Optional<Duration> waitingPeriodRemaining = changeNumberWaitingPeriodManager.getWaitingPeriodRemaining(account.getAccountIdentifier());
       if (waitingPeriodRemaining.isPresent()) {
         Metrics.counter(POST_REGISTRATION_WAITING_PERIOD_NOT_MET_COUNTER_NAME).increment();
         throw new RateLimitExceededException(waitingPeriodRemaining.get());
@@ -109,23 +117,24 @@ public class ChangeNumberManager {
       rateLimiters.getRegistrationLimiter().validate(number);
 
       final PhoneVerificationRequest.VerificationType verificationType =
-          phoneVerificationTokenManager.verify(containerRequestContext, number, sessionId, recoveryPassword);
+          phoneVerificationTokenManager.verify(number, userAgent, acceptLanguage, mostRecentProxy, sessionId, recoveryPassword);
 
       final Optional<Account> existingAccount = accountAndMaybeExistingAccount.second();
 
       if (existingAccount.isPresent()) {
+        assert existingAccount.get().getNumber().isPresent();
         registrationLockVerificationManager.verifyRegistrationLock(existingAccount.get(), registrationLock,
-            senderUserAgent, RegistrationLockVerificationManager.Flow.CHANGE_NUMBER, verificationType);
+            userAgent, RegistrationLockVerificationManager.Flow.CHANGE_NUMBER, verificationType);
       }
 
-      Metrics.counter(CHANGE_NUMBER_COUNTER_NAME, Tags.of(UserAgentTagUtil.getPlatformTag(senderUserAgent),
+      Metrics.counter(CHANGE_NUMBER_COUNTER_NAME, Tags.of(UserAgentTagUtil.getPlatformTag(userAgent),
               Tag.of(VERIFICATION_TYPE_TAG_NAME, verificationType.name())))
           .increment();
     }
 
     // ...but always attempt to make the change in case a client retries and needs to re-send messages
     final long serverTimestamp = clock.millis();
-    final AciServiceIdentifier serviceIdentifier = new AciServiceIdentifier(account.getIdentifier(IdentityType.ACI));
+    final AciServiceIdentifier serviceIdentifier = new AciServiceIdentifier(account.getAccountIdentifier());
 
     // Note that these for-validation envelopes do NOT have the "updated PNI" field set, and we'll need to populate that
     // after actually changing the account's number.
@@ -151,28 +160,36 @@ public class ChangeNumberManager {
           messagesByDeviceId,
           registrationIdsByDeviceId,
           Optional.of(Device.PRIMARY_ID),
-          senderUserAgent);
+          userAgent);
     }
 
     final Account updatedAccount = accountsManager.changeNumber(
-        account.getIdentifier(IdentityType.ACI), number, pniIdentityKey, deviceSignedPreKeys, devicePqLastResortPreKeys, pniRegistrationIds);
+        account.getAccountIdentifier(), number, pniIdentityKey, deviceSignedPreKeys, devicePqLastResortPreKeys, pniRegistrationIds);
 
-    try {
-      // Now that we've actually updated the account, populate the "updated PNI" field on all envelopes
-      final String updatedPniString = updatedAccount.getIdentifier(IdentityType.PNI).toString();
+    if (!messagesByDeviceId.isEmpty()) {
+      try {
+        // Now that we've actually updated the account, populate the "updated PNI" field on all envelopes
+        messagesByDeviceId.replaceAll((_, envelope) ->
+            envelope.toBuilder().setUpdatedPni(UUIDUtil.toByteString(updatedAccount.getPhoneNumberIdentifier()
+                    .orElseThrow(() -> new AssertionError("Account does not have a PNI after changing number"))))
+                .build());
 
-      messagesByDeviceId.replaceAll((_, envelope) ->
-          envelope.toBuilder().setUpdatedPni(updatedPniString).build());
-
-      messageSender.sendMessages(updatedAccount,
-          serviceIdentifier,
-          messagesByDeviceId,
-          registrationIdsByDeviceId,
-          Optional.of(Device.PRIMARY_ID),
-          senderUserAgent);
-    } catch (final RuntimeException e) {
-      logger.warn("Changed number but could not send all device messages for {}", account.getIdentifier(IdentityType.ACI), e);
-      throw e;
+        messageSender.sendMessages(updatedAccount,
+            serviceIdentifier,
+            messagesByDeviceId,
+            registrationIdsByDeviceId,
+            Optional.of(Device.PRIMARY_ID),
+            userAgent);
+      } catch (MismatchedDevicesException | MessageTooLargeException e) {
+        ImpossibleEvents.logImpossible(logger,
+            "Changed number but could not send device messages after preliminary validation succeeded {}",
+            account.getAccountIdentifier(), e);
+        throw e;
+      } catch (final RuntimeException e) {
+        logger.warn("Changed number but could not send all device messages for {}",
+            account.getAccountIdentifier(), e);
+        throw e;
+      }
     }
 
     return updatedAccount;

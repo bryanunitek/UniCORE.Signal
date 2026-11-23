@@ -39,7 +39,6 @@ import jakarta.ws.rs.core.Response;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
-import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -51,6 +50,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.glassfish.jersey.server.ManagedAsync;
@@ -65,6 +65,7 @@ import org.signal.libsignal.zkgroup.profiles.ExpiringProfileKeyCredentialRespons
 import org.signal.libsignal.zkgroup.profiles.ProfileKeyCommitment;
 import org.signal.libsignal.zkgroup.profiles.ProfileKeyCredentialRequest;
 import org.signal.libsignal.zkgroup.profiles.ServerZkProfileOperations;
+import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
 import org.whispersystems.textsecuregcm.auth.Anonymous;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.GroupSendTokenHeader;
@@ -81,6 +82,7 @@ import org.whispersystems.textsecuregcm.entities.CreateProfileRequest;
 import org.whispersystems.textsecuregcm.entities.ExpiringProfileKeyCredentialProfileResponse;
 import org.whispersystems.textsecuregcm.entities.ProfileAvatarUploadAttributes;
 import org.whispersystems.textsecuregcm.entities.VersionedProfileResponse;
+import org.whispersystems.textsecuregcm.filters.RemoteAddressFilter;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
@@ -88,7 +90,6 @@ import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.RateLimitedByIp;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
-import org.whispersystems.textsecuregcm.s3.PolicySigner;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountBadge;
@@ -110,11 +111,11 @@ public class ProfileController {
   private final RateLimiters rateLimiters;
   private final ProfilesManager profilesManager;
   private final AccountsManager accountsManager;
+  private final Supplier<AsnInfoProvider> asnInfoProviderSupplier;
   private final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager;
   private final ProfileBadgeConverter profileBadgeConverter;
   private final Map<String, BadgeConfiguration> badgeConfigurationMap;
 
-  private final PolicySigner policySigner;
   private final PostPolicyGenerator policyGenerator;
   private final ServerSecretParams serverSecretParams;
   private final ServerZkProfileOperations zkProfileOperations;
@@ -127,30 +128,30 @@ public class ProfileController {
   private static final String DUPLICATE_AUTHENTICATION_COUNTER_NAME = name(ProfileController.class, "duplicateAuthentication");
 
   public ProfileController(
-      Clock clock,
-      RateLimiters rateLimiters,
-      AccountsManager accountsManager,
-      ProfilesManager profilesManager,
-      DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
-      ProfileBadgeConverter profileBadgeConverter,
-      BadgesConfiguration badgesConfiguration,
-      PostPolicyGenerator policyGenerator,
-      PolicySigner policySigner,
-      ServerSecretParams serverSecretParams,
-      ServerZkProfileOperations zkProfileOperations,
-      Executor batchIdentityCheckExecutor) {
+      final Clock clock,
+      final RateLimiters rateLimiters,
+      final AccountsManager accountsManager,
+      final ProfilesManager profilesManager,
+      final Supplier<AsnInfoProvider> asnInfoProviderSupplier,
+      final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
+      final ProfileBadgeConverter profileBadgeConverter,
+      final BadgesConfiguration badgesConfiguration,
+      final PostPolicyGenerator policyGenerator,
+      final ServerSecretParams serverSecretParams,
+      final ServerZkProfileOperations zkProfileOperations,
+      final Executor batchIdentityCheckExecutor) {
     this.clock = clock;
     this.rateLimiters = rateLimiters;
     this.accountsManager = accountsManager;
     this.profilesManager = profilesManager;
+    this.asnInfoProviderSupplier = asnInfoProviderSupplier;
     this.dynamicConfigurationManager = dynamicConfigurationManager;
     this.profileBadgeConverter = profileBadgeConverter;
-    this.badgeConfigurationMap = badgesConfiguration.getBadges().stream().collect(Collectors.toMap(
-        BadgeConfiguration::getId, Function.identity()));
+    this.badgeConfigurationMap = badgesConfiguration.getBadges().stream()
+        .collect(Collectors.toMap(BadgeConfiguration::getId, Function.identity()));
     this.serverSecretParams = serverSecretParams;
     this.zkProfileOperations = zkProfileOperations;
     this.policyGenerator = policyGenerator;
-    this.policySigner = policySigner;
     this.batchIdentityCheckExecutor = Preconditions.checkNotNull(batchIdentityCheckExecutor);
   }
 
@@ -166,29 +167,26 @@ public class ProfileController {
           description = "If the request changed the avatar, the response body contains an upload form.")))
   @ApiResponse(responseCode = "400", description = "Invalid create profile request.")
   @ApiResponse(responseCode = "401", description = "Account authentication check failed.")
-  @ApiResponse(responseCode = "403", description = "The request contained a payment address, but payments are not supported in the region of the account’s phone number.")
-  @ApiResponse(responseCode = "412", description = "The requesting account has the profiles_v2 capability")
+  @ApiResponse(responseCode = "403", description = "The request contained a payment address, but payments are not supported in the region of the account’s phone number or the caller's ASN if the account does not have a phone number.")
   @ApiResponse(responseCode = "422", description = "Invalid request format")
-  public Response setProfile(@Auth AuthenticatedDevice auth, @NotNull @Valid CreateProfileRequest request) {
+  @ManagedAsync
+  public Response setProfile(@Auth AuthenticatedDevice auth,
+      @NotNull @Valid CreateProfileRequest request,
+      @Context final ContainerRequestContext requestContext) {
 
     final Account account = accountsManager.getByAccountIdentifier(auth.accountIdentifier())
         .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
-    if (account.hasCapability(DeviceCapability.PROFILES_V2)) {
-      return Response.status(Response.Status.PRECONDITION_FAILED).build();
-    }
-
     final Optional<VersionedProfileV1> currentProfile =
         profilesManager.getV1(auth.accountIdentifier(), request.version());
 
-    if (request.paymentAddress() != null && request.paymentAddress().length != 0) {
-      final boolean hasDisallowedPrefix =
-          dynamicConfigurationManager.getConfiguration().getPaymentsConfiguration().getDisallowedPrefixes().stream()
-              .anyMatch(prefix -> account.getNumber().startsWith(prefix));
+    final String remoteAddress = (String) requestContext.getProperty(RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
 
-      if (hasDisallowedPrefix && currentProfile.map(VersionedProfileV1::paymentAddress).isEmpty()) {
-        return Response.status(Response.Status.FORBIDDEN).build();
-      }
+    if (request.paymentAddress() != null &&
+        request.paymentAddress().length != 0 &&
+        ProfileHelper.isPaymentAddressUpdateForbidden(account, Optional.empty(), currentProfile, remoteAddress, asnInfoProviderSupplier.get(), dynamicConfigurationManager)) {
+
+      return Response.status(Response.Status.FORBIDDEN).build();
     }
 
     final Optional<String> currentAvatar = ProfileHelper.getCurrentAvatar(currentProfile);
@@ -209,7 +207,7 @@ public class ProfileController {
       currentAvatar.ifPresent(profilesManager::deleteAvatar);
     }
 
-    accountsManager.update(account.getIdentifier(IdentityType.ACI), a -> {
+    accountsManager.update(account.getAccountIdentifier(), a -> {
 
       final List<AccountBadge> updatedBadges = request.badges()
           .map(badges -> ProfileHelper.mergeBadgeIdsWithExistingAccountBadges(clock, badgeConfigurationMap, badges, a.getBadges()))
@@ -256,7 +254,7 @@ public class ProfileController {
 
     return buildVersionedProfileResponse(targetAccount,
         version,
-        maybeRequester.map(requester -> ProfileHelper.isSelfProfileRequest(requester.getUuid(), accountIdentifier)).orElse(false),
+        maybeRequester.map(requester -> ProfileHelper.isSelfProfileRequest(requester.getAccountIdentifier(), accountIdentifier)).orElse(false),
         false,
         containerRequestContext);
   }
@@ -276,6 +274,7 @@ public class ProfileController {
   @ApiResponse(responseCode = "401", description = "Not authorized to access this profile.")
   @ApiResponse(responseCode = "404", description = "Profile or account not found.")
   @ApiResponse(responseCode = "429", description = "Rate limit exceeded.")
+  @ManagedAsync
   public ExpiringProfileKeyCredentialProfileResponse getProfile(
       @Auth Optional<AuthenticatedDevice> maybeAuthenticatedDevice,
       @HeaderParam(HeaderUtils.UNIDENTIFIED_ACCESS_KEY) Optional<Anonymous> accessKey,
@@ -297,7 +296,7 @@ public class ProfileController {
                 .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED)));
 
     final Account targetAccount = verifyPermissionToReceiveProfile(maybeRequester, accessKey, accountIdentifier, "credentialRequest", userAgent);
-    final boolean isSelf = maybeRequester.map(requester -> ProfileHelper.isSelfProfileRequest(requester.getUuid(), accountIdentifier)).orElse(false);
+    final boolean isSelf = maybeRequester.map(requester -> ProfileHelper.isSelfProfileRequest(requester.getAccountIdentifier(), accountIdentifier)).orElse(false);
 
     return buildExpiringProfileKeyCredentialProfileResponse(targetAccount,
         version,
@@ -352,7 +351,7 @@ public class ProfileController {
     }
     return switch (identifier.identityType()) {
       case ACI -> buildBaseProfileResponseForAccountIdentity(targetAccount,
-          maybeRequester.map(requester -> ProfileHelper.isSelfProfileRequest(requester.getUuid(), identifier)).orElse(false),
+          maybeRequester.map(requester -> ProfileHelper.isSelfProfileRequest(requester.getAccountIdentifier(), identifier)).orElse(false),
           containerRequestContext);
       case PNI -> buildBaseProfileResponseForPhoneNumberIdentity(targetAccount);
     };
@@ -412,10 +411,16 @@ public class ProfileController {
     final Optional<Account> maybeAccount = accountsManager.getByServiceIdentifier(identifier);
 
     maybeAccount.ifPresent(account -> {
-      final IdentityKey identityKey = account.getIdentityKey(identifier.identityType());
-      if (identityKey == null) {
+      final Optional<IdentityKey> maybeIdentityKey = switch (identifier.identityType()) {
+        case ACI -> Optional.of(account.getAccountIdentityKey());
+        case PNI -> account.getPhoneNumberIdentityKey();
+      };
+
+      if (maybeIdentityKey.isEmpty()) {
         return;
       }
+
+      final IdentityKey identityKey = maybeIdentityKey.get();
 
       md.reset();
       byte[] digest = md.digest(identityKey.serialize());
@@ -437,13 +442,13 @@ public class ProfileController {
     final ExpiringProfileKeyCredentialResponse expiringProfileKeyCredentialResponse;
 
     if (account.getCurrentProfileVersion().map(v -> HexFormat.of().formatHex(v).equals(version)).orElse(false)) {
-      expiringProfileKeyCredentialResponse = profilesManager.getV1(account.getUuid(), version)
+      expiringProfileKeyCredentialResponse = profilesManager.getV1(account.getAccountIdentifier(), version)
           .map(profile -> {
             final ExpiringProfileKeyCredentialResponse profileKeyCredentialResponse;
             try {
               profileKeyCredentialResponse = ProfileHelper.getExpiringProfileKeyCredential(
                   new ProfileKeyCredentialRequest(HexFormat.of().parseHex(encodedCredentialRequest)),
-                  new ProfileKeyCommitment(profile.commitment()), new ServiceId.Aci(account.getUuid()),
+                  new ProfileKeyCommitment(profile.commitment()), new ServiceId.Aci(account.getAccountIdentifier()),
                   zkProfileOperations);
             } catch (VerificationFailedException | InvalidInputException e) {
               throw new BadRequestException(e);
@@ -466,7 +471,7 @@ public class ProfileController {
       final boolean hasCredentialRequest,
       final ContainerRequestContext containerRequestContext) {
 
-    final Optional<VersionedProfileV1> maybeProfile = profilesManager.getV1(account.getUuid(), version);
+    final Optional<VersionedProfileV1> maybeProfile = profilesManager.getV1(account.getAccountIdentifier(), version);
 
     if (maybeProfile.isEmpty()) {
       // this can happen if an account re-registers, which includes some device-transfer scenarios
@@ -501,7 +506,7 @@ public class ProfileController {
       final boolean isSelf,
       final ContainerRequestContext containerRequestContext) {
 
-    return new BaseProfileResponse(account.getIdentityKey(IdentityType.ACI),
+    return new BaseProfileResponse(account.getAccountIdentityKey(),
         account.getUnidentifiedAccessKey().map(UnidentifiedAccessChecksum::generateFor).orElse(null),
         account.isUnrestrictedUnidentifiedAccess(),
         getAccountCapabilities(account),
@@ -509,16 +514,18 @@ public class ProfileController {
             HeaderUtils.getAcceptableLanguagesForRequest(containerRequestContext),
             account.getBadges(),
             isSelf),
-        new AciServiceIdentifier(account.getUuid()));
+        new AciServiceIdentifier(account.getAccountIdentifier()));
   }
 
   private BaseProfileResponse buildBaseProfileResponseForPhoneNumberIdentity(final Account account) {
-    return new BaseProfileResponse(account.getIdentityKey(IdentityType.PNI),
+    return new BaseProfileResponse(account.getPhoneNumberIdentityKey()
+        .orElseThrow(() -> new IllegalStateException("Account retrieved by PNI does not have PNI identity key")),
         null,
         false,
         getAccountCapabilities(account),
         Collections.emptyList(),
-        new PniServiceIdentifier(account.getPhoneNumberIdentifier()));
+        new PniServiceIdentifier(account.getPhoneNumberIdentifier()
+            .orElseThrow(() -> new IllegalStateException("Account retrieved by PNI does not have PNI"))));
   }
 
   /**
@@ -548,7 +555,7 @@ public class ProfileController {
     }
 
     if (maybeRequester.isPresent()) {
-      rateLimiters.getProfileLimiter().validate(maybeRequester.get().getUuid());
+      rateLimiters.getProfileLimiter().validate(maybeRequester.get().getAccountIdentifier());
     }
 
     final Optional<Account> maybeTargetAccount = accountsManager.getByServiceIdentifier(accountIdentifier);
@@ -559,20 +566,18 @@ public class ProfileController {
     return maybeTargetAccount.get();
   }
 
-  private ProfileAvatarUploadAttributes generateAvatarUploadForm(
-      final String objectName) {
-    ZonedDateTime now = ZonedDateTime.now(clock);
-    Pair<String, String> policy = policyGenerator.createFor(now, objectName, ProfileHelper.MAX_PROFILE_AVATAR_SIZE_BYTES);
-    String signature = policySigner.getSignature(now, policy.second());
+  private ProfileAvatarUploadAttributes generateAvatarUploadForm(final String objectName) {
+    final PostPolicyGenerator.SignedPostPolicy signedPostPolicy =
+        policyGenerator.createFor(objectName, ProfileHelper.MAX_PROFILE_AVATAR_SIZE_BYTES, clock.instant());
 
-    return new ProfileAvatarUploadAttributes(objectName, policy.first(),
-        "private", "AWS4-HMAC-SHA256",
-        now.format(PostPolicyGenerator.AWS_DATE_TIME), policy.second(), signature);
+    return new ProfileAvatarUploadAttributes(objectName, signedPostPolicy.credential(),
+        PostPolicyGenerator.ACL, PostPolicyGenerator.ALGORITHM,
+        signedPostPolicy.formattedTimestamp(), signedPostPolicy.encodedPolicy(), signedPostPolicy.signature());
   }
 
   private static Map<String, Boolean> getAccountCapabilities(final Account account) {
     return Arrays.stream(DeviceCapability.values())
-        .filter(DeviceCapability::includeInProfile)
+        .filter(DeviceCapability::includeInLegacyProfile)
         .collect(Collectors.toMap(DeviceCapability::getName, account::hasCapability));
   }
 }

@@ -12,6 +12,8 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.apache.commons.lang3.StringUtils;
+import org.signal.chat.device.ChangeDevicePasswordRequest;
+import org.signal.chat.device.ChangeDevicePasswordResponse;
 import org.signal.chat.device.ClearPushTokenRequest;
 import org.signal.chat.device.ClearPushTokenResponse;
 import org.signal.chat.device.GetDevicesRequest;
@@ -28,7 +30,6 @@ import org.signal.chat.device.SimpleDevicesGrpc;
 import org.signal.chat.errors.NotFound;
 import org.whispersystems.textsecuregcm.auth.grpc.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.grpc.AuthenticationUtil;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
@@ -54,7 +55,7 @@ public class DevicesGrpcService extends SimpleDevicesGrpc.DevicesImplBase {
               GetDevicesResponse.LinkedDevice.newBuilder()
                   .setId(device.getId())
                   .setLastSeen(device.getLastSeen())
-                  .setRegistrationId(device.getRegistrationId(IdentityType.ACI))
+                  .setRegistrationId(device.getAccountRegistrationId())
                   .setCreatedAtCiphertext(ByteString.copyFrom(device.getCreatedAtCiphertext()));
 
           if (device.getName() != null) {
@@ -104,7 +105,7 @@ public class DevicesGrpcService extends SimpleDevicesGrpc.DevicesImplBase {
       return SetDeviceNameResponse.newBuilder().setTargetDeviceNotFound(NotFound.getDefaultInstance()).build();
     }
 
-    accountsManager.updateDevice(account.getIdentifier(IdentityType.ACI), deviceId, device -> device.setName(request.getName().toByteArray()));
+    accountsManager.updateDevice(account.getAccountIdentifier(), deviceId, device -> device.setName(request.getName().toByteArray()));
 
     return SetDeviceNameResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
   }
@@ -138,8 +139,10 @@ public class DevicesGrpcService extends SimpleDevicesGrpc.DevicesImplBase {
     final Device device = account.getDevice(authenticatedDevice.deviceId())
         .orElseThrow(() -> GrpcExceptions.invalidCredentials("invalid credentials"));
 
-    if (!Objects.equals(device.getApnId(), apnsToken) || !Objects.equals(device.getGcmId(), fcmToken)) {
-      accountsManager.updateDevice(account.getIdentifier(IdentityType.ACI), authenticatedDevice.deviceId(), d -> {
+    // Unlike FCM tokens, we need current "last updated" timestamps for APNs tokens and so update device records
+    // unconditionally if it's an APNS request
+    if (request.hasApnsTokenRequest() || !Objects.equals(device.getGcmId(), fcmToken)) {
+      accountsManager.updateDevice(account.getAccountIdentifier(), authenticatedDevice.deviceId(), d -> {
         d.setApnId(apnsToken);
         d.setGcmId(fcmToken);
         d.setFetchesMessages(false);
@@ -180,6 +183,23 @@ public class DevicesGrpcService extends SimpleDevicesGrpc.DevicesImplBase {
         device -> device.setCapabilities(capabilities));
 
     return SetCapabilitiesResponse.getDefaultInstance();
+  }
+
+  @Override
+  public ChangeDevicePasswordResponse changeDevicePassword(final ChangeDevicePasswordRequest request) {
+    final AuthenticatedDevice authenticatedDevice = AuthenticationUtil.requireAuthenticatedDevice();
+
+    if (request.getNewPassword().isBlank()) {
+      throw GrpcExceptions.fieldViolation("new_password", "password must not be blank");
+    }
+
+    if (!accountsManager.updateDevicePassword(authenticatedDevice.accountIdentifier(), authenticatedDevice.deviceId(),
+        request.getNewPassword())) {
+
+      throw GrpcExceptions.invalidCredentials("invalid credentials");
+    }
+
+    return ChangeDevicePasswordResponse.getDefaultInstance();
   }
 
   private Account getAuthenticatedAccount() {

@@ -13,6 +13,7 @@ import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.Size;
+import java.util.Optional;
 import java.util.Set;
 import javax.annotation.Nullable;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
@@ -24,16 +25,16 @@ public record DeviceAttributes(
 
     int registrationId,
 
-    @JsonProperty("pniRegistrationId") int phoneNumberIdentityRegistrationId,
+    @JsonProperty("pniRegistrationId")
+    @Nullable
+    Integer phoneNumberIdentityRegistrationId,
 
     @JsonSerialize(using = ByteArrayAdapter.Serializing.class)
-
     @JsonDeserialize(using = ByteArrayAdapter.Deserializing.class)
     @Size(max = 225)
     byte[] name,
 
     @JsonSerialize(using = DeviceCapabilityAdapter.Serializer.class)
-
     @JsonDeserialize(using = DeviceCapabilityAdapter.Deserializer.class)
     @Nullable
     Set<DeviceCapability> capabilities) {
@@ -41,6 +42,7 @@ public record DeviceAttributes(
   @AssertTrue
   @Schema(hidden = true)
   public boolean isEachRegistrationIdValid() {
-    return validRegistrationId(registrationId) && validRegistrationId(phoneNumberIdentityRegistrationId);
+    return validRegistrationId(registrationId) &&
+        (phoneNumberIdentityRegistrationId == null || validRegistrationId(phoneNumberIdentityRegistrationId));
   }
 }

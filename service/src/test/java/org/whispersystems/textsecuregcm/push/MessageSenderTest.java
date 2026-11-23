@@ -47,7 +47,6 @@ import org.whispersystems.textsecuregcm.controllers.MismatchedDevicesException;
 import org.whispersystems.textsecuregcm.controllers.MultiRecipientMismatchedDevicesException;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
@@ -111,13 +110,13 @@ class MessageSenderTest {
         .setUrgent(urgent)
         .build();
 
-    when(account.getUuid()).thenReturn(accountIdentifier);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.isIdentifiedBy(serviceIdentifier)).thenReturn(true);
     when(account.getDevices()).thenReturn(List.of(device));
     when(account.getDevice(deviceId)).thenReturn(Optional.of(device));
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
 
     if (hasPushToken) {
       when(device.getApnId()).thenReturn("apns-token");
@@ -168,13 +167,13 @@ class MessageSenderTest {
     final Device device = mock(Device.class);
     final MessageProtos.Envelope message = MessageProtos.Envelope.newBuilder().build();
 
-    when(account.getUuid()).thenReturn(accountIdentifier);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.isIdentifiedBy(serviceIdentifier)).thenReturn(true);
     when(account.getDevices()).thenReturn(List.of(device));
     when(account.getDevice(deviceId)).thenReturn(Optional.of(device));
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
     when(device.getApnId()).thenReturn("apns-token");
 
     final MismatchedDevicesException mismatchedDevicesException =
@@ -199,7 +198,28 @@ class MessageSenderTest {
   }
 
   @Test
-  void sendMessageReadOnlyMode() {
+  void sendMessageDropEphemeral() {
+    final MessageProtos.Envelope message = MessageProtos.Envelope.newBuilder()
+        .setEphemeral(true)
+        .build();
+
+    when(dynamicMessageDeliveryConfiguration.dropEphemeralMessages()).thenReturn(true);
+
+    assertDoesNotThrow(() -> messageSender.sendMessages(mock(Account.class),
+        new AciServiceIdentifier(UUID.randomUUID()),
+        Map.of(Device.PRIMARY_ID, message),
+        Map.of(Device.PRIMARY_ID, 10),
+        Optional.empty(),
+        null));
+
+    verifyNoInteractions(messagesManager);
+    verifyNoInteractions(messageDeliveryListener);
+  }
+
+  @CartesianTest
+  void sendMessageReadOnlyModeOrDropEphemeral(
+      @CartesianTest.Values(booleans = {true, false}) final boolean dropEphemeralMessages,
+      @CartesianTest.Values(booleans = {true, false}) final boolean isEphemeral) {
     final UUID accountIdentifier = UUID.randomUUID();
     final ServiceIdentifier serviceIdentifier = new AciServiceIdentifier(accountIdentifier);
     final byte deviceId = Device.PRIMARY_ID;
@@ -207,25 +227,63 @@ class MessageSenderTest {
 
     final Account account = mock(Account.class);
     final Device device = mock(Device.class);
-    final MessageProtos.Envelope message = MessageProtos.Envelope.newBuilder().build();
+    final MessageProtos.Envelope message = MessageProtos.Envelope.newBuilder()
+        .setEphemeral(isEphemeral)
+        .build();
 
-    when(account.getUuid()).thenReturn(accountIdentifier);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.isIdentifiedBy(serviceIdentifier)).thenReturn(true);
     when(account.getDevices()).thenReturn(List.of(device));
     when(account.getDevice(deviceId)).thenReturn(Optional.of(device));
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
     when(device.getApnId()).thenReturn("apns-token");
 
+    when(dynamicMessageDeliveryConfiguration.dropEphemeralMessages()).thenReturn(dropEphemeralMessages);
     when(dynamicMessageDeliveryConfiguration.isReadOnly()).thenReturn(true);
 
-    assertThrows(MessageDeliveryNotAllowedException.class, () -> messageSender.sendMessages(account,
-        serviceIdentifier,
-        Map.of(device.getId(), message),
-        Map.of(device.getId(), registrationId),
-        Optional.empty(),
-        null));
+    if (isEphemeral && dropEphemeralMessages) {
+      assertDoesNotThrow(() -> messageSender.sendMessages(account,
+          serviceIdentifier,
+          Map.of(device.getId(), message),
+          Map.of(device.getId(), registrationId),
+          Optional.empty(),
+          null));
+    } else {
+      assertThrows(MessageDeliveryNotAllowedException.class, () -> messageSender.sendMessages(account,
+          serviceIdentifier,
+          Map.of(device.getId(), message),
+          Map.of(device.getId(), registrationId),
+          Optional.empty(),
+          null));
+    }
+  }
+
+  @Test
+  void sendMultiRecipientMessageDropEphemeral() throws InvalidMessageException, InvalidVersionException {
+    final ServiceIdentifier serviceIdentifier = new AciServiceIdentifier(UUID.randomUUID());
+
+    final SealedSenderMultiRecipientMessage multiRecipientMessage =
+        SealedSenderMultiRecipientMessage.parse(MultiRecipientMessageHelper.generateMultiRecipientMessage(
+            List.of(new TestRecipient(serviceIdentifier, Device.PRIMARY_ID, 7, new byte[48]))));
+
+    final SealedSenderMultiRecipientMessage.Recipient recipient =
+        multiRecipientMessage.getRecipients().values().iterator().next();
+
+    when(dynamicMessageDeliveryConfiguration.dropEphemeralMessages()).thenReturn(true);
+
+    assertDoesNotThrow(() -> messageSender.sendMultiRecipientMessage(multiRecipientMessage,
+            Map.of(recipient, mock(Account.class)),
+            System.currentTimeMillis(),
+            false,
+            true,
+            false,
+            null)
+        .join());
+
+    verifyNoInteractions(messagesManager);
+    verifyNoInteractions(messageDeliveryListener);
   }
 
   @CartesianTest
@@ -245,13 +303,13 @@ class MessageSenderTest {
     final Account account = mock(Account.class);
     final Device device = mock(Device.class);
 
-    when(account.getUuid()).thenReturn(accountIdentifier);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.isIdentifiedBy(serviceIdentifier)).thenReturn(true);
     when(account.getDevices()).thenReturn(List.of(device));
     when(account.getDevice(deviceId)).thenReturn(Optional.of(device));
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
     when(device.getApnId()).thenReturn("apns-token");
 
     if (hasPushToken) {
@@ -306,13 +364,13 @@ class MessageSenderTest {
     final Account account = mock(Account.class);
     final Device device = mock(Device.class);
 
-    when(account.getUuid()).thenReturn(accountIdentifier);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.isIdentifiedBy(serviceIdentifier)).thenReturn(true);
     when(account.getDevices()).thenReturn(List.of(device));
     when(account.getDevice(deviceId)).thenReturn(Optional.of(device));
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
     when(device.getApnId()).thenReturn("apns-token");
 
     final SealedSenderMultiRecipientMessage multiRecipientMessage =
@@ -349,9 +407,11 @@ class MessageSenderTest {
         anyBoolean());
   }
 
-  @Test
-  void sendMultiRecipientMessageReadOnlyMode()
-      throws NotPushRegisteredException, InvalidMessageException, InvalidVersionException {
+  @CartesianTest
+  void sendMultiRecipientMessageReadOnlyModeOrDropEphemeral(
+      @CartesianTest.Values(booleans = {true, false}) final boolean dropEphemeralMessages,
+      @CartesianTest.Values(booleans = {true, false}) final boolean isEphemeral
+  ) throws InvalidMessageException, InvalidVersionException {
 
     final UUID accountIdentifier = UUID.randomUUID();
     final ServiceIdentifier serviceIdentifier = new AciServiceIdentifier(accountIdentifier);
@@ -361,13 +421,13 @@ class MessageSenderTest {
     final Account account = mock(Account.class);
     final Device device = mock(Device.class);
 
-    when(account.getUuid()).thenReturn(accountIdentifier);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.isIdentifiedBy(serviceIdentifier)).thenReturn(true);
     when(account.getDevices()).thenReturn(List.of(device));
     when(account.getDevice(deviceId)).thenReturn(Optional.of(device));
     when(device.getId()).thenReturn(deviceId);
-    when(device.getRegistrationId(IdentityType.ACI)).thenReturn(registrationId);
+    when(device.getAccountRegistrationId()).thenReturn(registrationId);
     when(device.getApnId()).thenReturn("apns-token");
     when(device.getApnId()).thenReturn("apns-token");
 
@@ -379,16 +439,28 @@ class MessageSenderTest {
         multiRecipientMessage.getRecipients().values().iterator().next();
 
     when(dynamicMessageDeliveryConfiguration.isReadOnly()).thenReturn(true);
+    when(dynamicMessageDeliveryConfiguration.dropEphemeralMessages()).thenReturn(dropEphemeralMessages);
 
-    assertThrows(MessageDeliveryNotAllowedException.class,
-        () -> messageSender.sendMultiRecipientMessage(multiRecipientMessage,
-                Map.of(recipient, account),
-                System.currentTimeMillis(),
-                false,
-                false,
-                false,
-                null)
-            .join());
+    if (isEphemeral && dropEphemeralMessages) {
+      assertDoesNotThrow(() -> messageSender.sendMultiRecipientMessage(multiRecipientMessage,
+              Map.of(recipient, account),
+              System.currentTimeMillis(),
+              false,
+              isEphemeral,
+              false,
+              null)
+          .join());
+    } else {
+      assertThrows(MessageDeliveryNotAllowedException.class,
+          () -> messageSender.sendMultiRecipientMessage(multiRecipientMessage,
+                  Map.of(recipient, account),
+                  System.currentTimeMillis(),
+                  false,
+                  isEphemeral,
+                  false,
+                  null)
+              .join());
+    }
   }
 
   @ParameterizedTest
@@ -425,11 +497,11 @@ class MessageSenderTest {
 
     final Device primaryDevice = mock(Device.class);
     when(primaryDevice.getId()).thenReturn(primaryDeviceId);
-    when(primaryDevice.getRegistrationId(IdentityType.ACI)).thenReturn(primaryDeviceRegistrationId);
+    when(primaryDevice.getAccountRegistrationId()).thenReturn(primaryDeviceRegistrationId);
 
     final Device linkedDevice = mock(Device.class);
     when(linkedDevice.getId()).thenReturn(linkedDeviceId);
-    when(linkedDevice.getRegistrationId(IdentityType.ACI)).thenReturn(linkedDeviceRegistrationId);
+    when(linkedDevice.getAccountRegistrationId()).thenReturn(linkedDeviceRegistrationId);
 
     final Account destination = mock(Account.class);
     when(destination.isIdentifiedBy(any())).thenReturn(false);
@@ -555,7 +627,7 @@ class MessageSenderTest {
         .setContent(ByteString.copyFrom(TestRandomUtil.nextBytes(contentLength)));
 
     if (sourceIdentifier != null) {
-      envelopeBuilder.setSourceServiceId(sourceIdentifier.toServiceIdentifierString());
+      envelopeBuilder.setSourceServiceId(sourceIdentifier.toCompactByteString());
     }
 
     return envelopeBuilder.build();
@@ -594,13 +666,13 @@ class MessageSenderTest {
 
     final Device primaryDevice = mock(Device.class);
     when(primaryDevice.getId()).thenReturn(primaryDeviceId);
-    when(primaryDevice.getRegistrationId(IdentityType.ACI)).thenReturn(primaryDeviceAciRegistrationId);
-    when(primaryDevice.getRegistrationId(IdentityType.PNI)).thenReturn(primaryDevicePniRegistrationId);
+    when(primaryDevice.getAccountRegistrationId()).thenReturn(primaryDeviceAciRegistrationId);
+    when(primaryDevice.getPhoneNumberIdentityRegistrationId()).thenReturn(Optional.of(primaryDevicePniRegistrationId));
 
     final Device linkedDevice = mock(Device.class);
     when(linkedDevice.getId()).thenReturn(linkedDeviceId);
-    when(linkedDevice.getRegistrationId(IdentityType.ACI)).thenReturn(linkedDeviceAciRegistrationId);
-    when(linkedDevice.getRegistrationId(IdentityType.PNI)).thenReturn(linkedDevicePniRegistrationId);
+    when(linkedDevice.getAccountRegistrationId()).thenReturn(linkedDeviceAciRegistrationId);
+    when(linkedDevice.getPhoneNumberIdentityRegistrationId()).thenReturn(Optional.of(linkedDevicePniRegistrationId));
 
     final Account account = mock(Account.class);
     when(account.getDevices()).thenReturn(List.of(primaryDevice, linkedDevice));
@@ -686,8 +758,8 @@ class MessageSenderTest {
     final byte deviceId = Device.PRIMARY_ID;
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(accountIdentifier);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.isIdentifiedBy(serviceIdentifier)).thenReturn(true);
 
     final Account nonSyncDestination = mock(Account.class);
@@ -704,7 +776,7 @@ class MessageSenderTest {
     assertThrows(IllegalArgumentException.class, () -> messageSender.sendMessages(account,
         serviceIdentifier,
         Map.of(deviceId, MessageProtos.Envelope.newBuilder()
-            .setSourceServiceId(serviceIdentifier.toServiceIdentifierString())
+            .setSourceServiceId(serviceIdentifier.toCompactByteString())
             .setSourceDevice(deviceId)
             .build()),
         Map.of(deviceId, 17),

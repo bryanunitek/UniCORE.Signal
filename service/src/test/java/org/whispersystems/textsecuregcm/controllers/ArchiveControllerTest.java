@@ -79,7 +79,6 @@ import org.whispersystems.textsecuregcm.backup.CopyResult;
 import org.whispersystems.textsecuregcm.entities.RemoteAttachment;
 import org.whispersystems.textsecuregcm.mappers.BackupExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.CompletionExceptionMapper;
-import org.whispersystems.textsecuregcm.mappers.GrpcStatusRuntimeExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.RateLimitExceededExceptionMapper;
 import org.whispersystems.textsecuregcm.metrics.BackupMetrics;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -104,7 +103,6 @@ public class ArchiveControllerTest {
       .addProvider(AuthHelper.getAuthFilter())
       .addProvider(new AuthValueFactoryProvider.Binder<>(AuthenticatedDevice.class))
       .addProvider(new CompletionExceptionMapper())
-      .addResource(new GrpcStatusRuntimeExceptionMapper())
       .addResource(new BackupExceptionMapper())
       .addProvider(new RateLimitExceededExceptionMapper())
       .setMapper(SystemMapper.jsonMapper())
@@ -562,7 +560,7 @@ public class ArchiveControllerTest {
     final Optional<String> expectedCursor = cursorProvided ? Optional.of("myCursor") : Optional.empty();
     final Optional<String> returnedCursor = cursorReturned ? Optional.of("newCursor") : Optional.empty();
 
-    when(backupManager.list(any(), eq(expectedCursor), eq(17)))
+    when(backupManager.list(any(), eq(expectedCursor), eq(Optional.of(17))))
         .thenReturn(new BackupManager.ListMediaResult(
             List.of(new BackupManager.StorageDescriptorWithLength(1, mediaId, 100)),
             returnedCursor
@@ -615,15 +613,16 @@ public class ArchiveControllerTest {
 
   static Stream<Arguments> messagesUploadForm() {
     return Stream.of(
-        Arguments.of(Optional.empty(), true),
-        Arguments.of(Optional.of(MAX_MESSAGE_BACKUP_SIZE), true),
-        Arguments.of(Optional.of(MAX_MESSAGE_BACKUP_SIZE + 1), false)
+        Arguments.of(Optional.empty(), 200),
+        Arguments.of(Optional.of(-1L), 400),
+        Arguments.of(Optional.of(MAX_MESSAGE_BACKUP_SIZE), 200),
+        Arguments.of(Optional.of(MAX_MESSAGE_BACKUP_SIZE + 1), 413)
     );
   }
 
   @ParameterizedTest
   @MethodSource
-  public void messagesUploadForm(Optional<Long> uploadLength, boolean expectSuccess) throws VerificationFailedException, BackupException {
+  public void messagesUploadForm(Optional<Long> uploadLength, int expectedStatus) throws VerificationFailedException, BackupException {
     final BackupAuthCredentialPresentation presentation =
         backupAuthTestUtil.getPresentation(BackupLevel.PAID, messagesBackupKey, aci);
     when(backupManager.authenticateBackupUser(any(), any(), any()))
@@ -639,28 +638,27 @@ public class ArchiveControllerTest {
         .header("X-Signal-ZK-Auth", Base64.getEncoder().encodeToString(presentation.serialize()))
         .header("X-Signal-ZK-Auth-Signature", "aaa")
         .get();
-    if (expectSuccess) {
-      assertThat(response.getStatus()).isEqualTo(200);
+    assertThat(response.getStatus()).isEqualTo(expectedStatus);
+    if (200 == expectedStatus) {
       ArchiveController.UploadDescriptorResponse desc = response.readEntity(ArchiveController.UploadDescriptorResponse.class);
       assertThat(desc)
           .isEqualTo(new ArchiveController.UploadDescriptorResponse(3, "abc", Map.of("k", "v"), "example.org"));
       verify(backupManager).createMessageBackupUploadDescriptor(any(), eq(uploadLength.orElse(MAX_MESSAGE_BACKUP_SIZE)));
-    } else {
-      assertThat(response.getStatus()).isEqualTo(413);
     }
   }
 
   static Stream<Arguments> mediaUploadForm() {
     return Stream.of(
-        Arguments.of(Optional.empty(), true),
-        Arguments.of(Optional.of(MAX_ATTACHMENT_SIZE), true),
-        Arguments.of(Optional.of(MAX_ATTACHMENT_SIZE + 1), false)
+        Arguments.of(Optional.empty(), 200),
+        Arguments.of(Optional.of(-1L), 400),
+        Arguments.of(Optional.of(MAX_ATTACHMENT_SIZE), 200),
+        Arguments.of(Optional.of(MAX_ATTACHMENT_SIZE + 1), 413)
     );
   }
 
   @ParameterizedTest
   @MethodSource
-  public void mediaUploadForm(Optional<Long> uploadLength, boolean expectSuccess) throws VerificationFailedException, BackupException, RateLimitExceededException {
+  public void mediaUploadForm(Optional<Long> uploadLength, int expectedSuccess) throws VerificationFailedException, BackupException, RateLimitExceededException {
     final BackupAuthCredentialPresentation presentation =
         backupAuthTestUtil.getPresentation(BackupLevel.PAID, messagesBackupKey, aci);
     when(backupManager.authenticateBackupUser(any(), any(), any()))
@@ -675,15 +673,13 @@ public class ArchiveControllerTest {
         .header("X-Signal-ZK-Auth", Base64.getEncoder().encodeToString(presentation.serialize()))
         .header("X-Signal-ZK-Auth-Signature", "aaa")
         .get();
-    if (expectSuccess) {
-      assertThat(response.getStatus()).isEqualTo(200);
+    assertThat(response.getStatus()).isEqualTo(expectedSuccess);
+    if (200 == expectedSuccess) {
       final ArchiveController.UploadDescriptorResponse desc =
           response.readEntity(ArchiveController.UploadDescriptorResponse.class);
       assertThat(desc)
           .isEqualTo(new ArchiveController.UploadDescriptorResponse(3, "abc", Map.of("k", "v"), "example.org"));
       verify(backupManager).createTemporaryAttachmentUploadDescriptor(any(), eq(uploadLength.orElse(MAX_ATTACHMENT_SIZE)));
-    } else {
-      assertThat(response.getStatus()).isEqualTo(413);
     }
   }
 

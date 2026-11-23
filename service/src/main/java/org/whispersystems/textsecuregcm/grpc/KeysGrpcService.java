@@ -11,9 +11,6 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
-import org.signal.chat.common.EcPreKey;
-import org.signal.chat.common.EcSignedPreKey;
-import org.signal.chat.common.KemSignedPreKey;
 import org.signal.chat.errors.NotFound;
 import org.signal.chat.keys.GetPreKeyCountRequest;
 import org.signal.chat.keys.GetPreKeyCountResponse;
@@ -26,16 +23,10 @@ import org.signal.chat.keys.SetOneTimeKemSignedPreKeysRequest;
 import org.signal.chat.keys.SetPreKeyResponse;
 import org.signal.chat.keys.SimpleKeysGrpc;
 import org.signal.libsignal.protocol.IdentityKey;
-import org.signal.libsignal.protocol.InvalidKeyException;
-import org.signal.libsignal.protocol.ecc.ECPublicKey;
-import org.signal.libsignal.protocol.kem.KEMPublicKey;
 import org.whispersystems.textsecuregcm.auth.grpc.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.grpc.AuthenticationUtil;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.controllers.RateLimitKeys;
-import org.whispersystems.textsecuregcm.entities.ECPreKey;
-import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
-import org.whispersystems.textsecuregcm.entities.KEMSignedPreKey;
 import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
@@ -69,17 +60,21 @@ public class KeysGrpcService extends SimpleKeysGrpc.KeysImplBase {
     final AuthenticatedDevice authenticatedDevice = AuthenticationUtil.requireAuthenticatedDevice();
     final Account account = getAuthenticatedAccount(authenticatedDevice.accountIdentifier());
 
-    final CompletableFuture<Integer> aciEcKeyCountFuture =
-        keysManager.getEcCount(account.getIdentifier(IdentityType.ACI), authenticatedDevice.deviceId());
+    final UUID aci = account.getAccountIdentifier();
 
-    final CompletableFuture<Integer> pniEcKeyCountFuture =
-        keysManager.getEcCount(account.getIdentifier(IdentityType.PNI), authenticatedDevice.deviceId());
+    final CompletableFuture<Integer> aciEcKeyCountFuture =
+        keysManager.getEcCount(aci, authenticatedDevice.deviceId());
+
+    final CompletableFuture<Integer> pniEcKeyCountFuture = account.getPhoneNumberIdentifier()
+        .map(pni -> keysManager.getEcCount(pni, authenticatedDevice.deviceId()))
+        .orElseGet(() -> CompletableFuture.completedFuture(0));
 
     final CompletableFuture<Integer> aciKemKeyCountFuture =
-        keysManager.getPqCount(account.getIdentifier(IdentityType.ACI), authenticatedDevice.deviceId());
+        keysManager.getPqCount(aci, authenticatedDevice.deviceId());
 
-    final CompletableFuture<Integer> pniKemKeyCountFuture =
-        keysManager.getPqCount(account.getIdentifier(IdentityType.PNI), authenticatedDevice.deviceId());
+    final CompletableFuture<Integer> pniKemKeyCountFuture = account.getPhoneNumberIdentifier()
+        .map(pni -> keysManager.getPqCount(pni, authenticatedDevice.deviceId()))
+        .orElseGet(() -> CompletableFuture.completedFuture(0));
 
     CompletableFuture.allOf(aciEcKeyCountFuture, pniEcKeyCountFuture, aciKemKeyCountFuture, pniKemKeyCountFuture).join();
 
@@ -96,7 +91,7 @@ public class KeysGrpcService extends SimpleKeysGrpc.KeysImplBase {
     final AuthenticatedDevice authenticatedDevice = AuthenticationUtil.requireAuthenticatedDevice();
 
     final ServiceIdentifier targetIdentifier =
-        ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getTargetIdentifier());
+        GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getTargetIdentifier());
 
 
     final Optional<Account> maybeTargetAccount = accountsManager.getByServiceIdentifier(targetIdentifier);
@@ -108,7 +103,10 @@ public class KeysGrpcService extends SimpleKeysGrpc.KeysImplBase {
     final Optional<Integer> targetRegistrationId = maybeTargetAccount
         .filter(_ -> request.hasDeviceId())
         .flatMap(targetAccount -> targetAccount.getDevice(deviceId))
-        .map(device -> device.getRegistrationId(targetIdentifier.identityType()));
+        .flatMap(device -> switch (targetIdentifier.identityType()) {
+          case ACI -> Optional.of(device.getAccountRegistrationId());
+          case PNI -> device.getPhoneNumberIdentityRegistrationId();
+        });
 
     final String rateLimitKey = RateLimitKeys.preKeyLimiterKey(
         authenticatedDevice.accountIdentifier(),
@@ -136,7 +134,7 @@ public class KeysGrpcService extends SimpleKeysGrpc.KeysImplBase {
     storeOneTimePreKeys(authenticatedDevice.accountIdentifier(),
         request.getPreKeysList(),
         IdentityTypeUtil.fromGrpcIdentityType(request.getIdentityType()),
-        (requestPreKey, _) -> checkEcPreKey(requestPreKey),
+        (requestPreKey, _) -> KeysGrpcHelper.checkEcPreKey(requestPreKey, INVALID_PUBLIC_KEY_EXCEPTION),
         (identifier, preKeys) -> keysManager.storeEcOneTimePreKeys(identifier, authenticatedDevice.deviceId(), preKeys));
 
     return SetPreKeyResponse.getDefaultInstance();
@@ -149,7 +147,7 @@ public class KeysGrpcService extends SimpleKeysGrpc.KeysImplBase {
     storeOneTimePreKeys(authenticatedDevice.accountIdentifier(),
         request.getPreKeysList(),
         IdentityTypeUtil.fromGrpcIdentityType(request.getIdentityType()),
-        KeysGrpcService::checkKemSignedPreKey,
+        (preKey, identityKey) -> KeysGrpcHelper.checkKemSignedPreKey(preKey, identityKey, INVALID_PUBLIC_KEY_EXCEPTION, INVALID_SIGNATURE_EXCEPTION),
         (identifier, preKeys) -> keysManager.storeKemOneTimePreKeys(identifier, authenticatedDevice.deviceId(), preKeys));
 
     return SetPreKeyResponse.getDefaultInstance();
@@ -163,11 +161,19 @@ public class KeysGrpcService extends SimpleKeysGrpc.KeysImplBase {
 
     final Account account = getAuthenticatedAccount(authenticatedAccountUuid);
 
+    final IdentityKey identityKey = switch (identityType) {
+      case ACI -> account.getAccountIdentityKey();
+      case PNI -> account.getPhoneNumberIdentityKey()
+          .orElseThrow(() -> new IllegalArgumentException("Account does not have a PNI identity key"));
+    };
+
+    final UUID identifier = getIdentifier(account, identityType);
+
     final List<K> preKeys = requestPreKeys.stream()
-        .map(requestPreKey -> extractPreKeyFunction.apply(requestPreKey, account.getIdentityKey(identityType)))
+        .map(requestPreKey -> extractPreKeyFunction.apply(requestPreKey, identityKey))
         .toList();
 
-    storeKeysFunction.apply(account.getIdentifier(identityType), preKeys).join();
+    storeKeysFunction.apply(identifier, preKeys).join();
   }
 
   @Override
@@ -175,15 +181,10 @@ public class KeysGrpcService extends SimpleKeysGrpc.KeysImplBase {
     final AuthenticatedDevice authenticatedDevice = AuthenticationUtil.requireAuthenticatedDevice();
 
     storeRepeatedUseKey(authenticatedDevice.accountIdentifier(),
-        request.getIdentityType(),
+        IdentityTypeUtil.fromGrpcIdentityType(request.getIdentityType()),
         request.getSignedPreKey(),
-        KeysGrpcService::checkEcSignedPreKey,
-        (account, signedPreKey) -> {
-          final IdentityType identityType = IdentityTypeUtil.fromGrpcIdentityType(request.getIdentityType());
-          final UUID identifier = account.getIdentifier(identityType);
-
-          return keysManager.storeEcSignedPreKeys(identifier, authenticatedDevice.deviceId(), signedPreKey);
-        });
+        (preKey, identityKey) -> KeysGrpcHelper.checkEcSignedPreKey(preKey, identityKey, INVALID_PUBLIC_KEY_EXCEPTION, INVALID_SIGNATURE_EXCEPTION),
+        (identifier, signedPreKey) -> keysManager.storeEcSignedPreKeys(identifier, authenticatedDevice.deviceId(), signedPreKey));
 
     return SetPreKeyResponse.getDefaultInstance();
   }
@@ -193,75 +194,46 @@ public class KeysGrpcService extends SimpleKeysGrpc.KeysImplBase {
     final AuthenticatedDevice authenticatedDevice = AuthenticationUtil.requireAuthenticatedDevice();
 
     storeRepeatedUseKey(authenticatedDevice.accountIdentifier(),
-        request.getIdentityType(),
+        IdentityTypeUtil.fromGrpcIdentityType(request.getIdentityType()),
         request.getSignedPreKey(),
-        KeysGrpcService::checkKemSignedPreKey,
-        (account, lastResortKey) -> {
-          final UUID identifier =
-              account.getIdentifier(IdentityTypeUtil.fromGrpcIdentityType(request.getIdentityType()));
-
-          return keysManager.storePqLastResort(identifier, authenticatedDevice.deviceId(), lastResortKey);
-        });
+        (preKey, identityKey) -> KeysGrpcHelper.checkKemSignedPreKey(preKey, identityKey, INVALID_PUBLIC_KEY_EXCEPTION, INVALID_SIGNATURE_EXCEPTION),
+        (identifier, lastResortKey) -> keysManager.storePqLastResort(identifier, authenticatedDevice.deviceId(), lastResortKey));
 
     return SetPreKeyResponse.getDefaultInstance();
   }
 
   private <K, R> void storeRepeatedUseKey(final UUID authenticatedAccountUuid,
-      final org.signal.chat.common.IdentityType identityType,
+      final IdentityType identityType,
       final R storeKeyRequest,
       final BiFunction<R, IdentityKey, K> extractKeyFunction,
-      final BiFunction<Account, K, CompletableFuture<Void>> storeKeyFunction) {
+      final BiFunction<UUID, K, CompletableFuture<Void>> storeKeyFunction) {
 
     final Account account = getAuthenticatedAccount(authenticatedAccountUuid);
+    final IdentityKey identityKey = switch (identityType) {
+      case ACI -> account.getAccountIdentityKey();
+      case PNI -> account.getPhoneNumberIdentityKey()
+          .orElseThrow(() -> GrpcExceptions.invalidArguments("account does not have a PNI identity key"));
+    };
 
-    final IdentityKey identityKey = account.getIdentityKey(IdentityTypeUtil.fromGrpcIdentityType(identityType));
+    final UUID identifier = getIdentifier(account, identityType);
     final K key = extractKeyFunction.apply(storeKeyRequest, identityKey);
 
-    storeKeyFunction.apply(account, key).join();
-  }
-
-  private static ECPreKey checkEcPreKey(final EcPreKey preKey) {
-    try {
-      return new ECPreKey(preKey.getKeyId(), new ECPublicKey(preKey.getPublicKey().toByteArray()));
-    } catch (final InvalidKeyException e) {
-      throw INVALID_PUBLIC_KEY_EXCEPTION;
-    }
-  }
-
-  private static ECSignedPreKey checkEcSignedPreKey(final EcSignedPreKey preKey, final IdentityKey identityKey) {
-    try {
-      final ECSignedPreKey ecSignedPreKey = new ECSignedPreKey(preKey.getKeyId(),
-          new ECPublicKey(preKey.getPublicKey().toByteArray()),
-          preKey.getSignature().toByteArray());
-
-      if (ecSignedPreKey.signatureValid(identityKey)) {
-        return ecSignedPreKey;
-      } else {
-        throw INVALID_SIGNATURE_EXCEPTION;
-      }
-    } catch (final InvalidKeyException e) {
-      throw INVALID_PUBLIC_KEY_EXCEPTION;
-    }
-  }
-
-  private static KEMSignedPreKey checkKemSignedPreKey(final KemSignedPreKey preKey, final IdentityKey identityKey) {
-    try {
-      final KEMSignedPreKey kemSignedPreKey = new KEMSignedPreKey(preKey.getKeyId(),
-          new KEMPublicKey(preKey.getPublicKey().toByteArray()),
-          preKey.getSignature().toByteArray());
-
-      if (kemSignedPreKey.signatureValid(identityKey)) {
-        return kemSignedPreKey;
-      } else {
-        throw INVALID_SIGNATURE_EXCEPTION;
-      }
-    } catch (final InvalidKeyException e) {
-      throw INVALID_PUBLIC_KEY_EXCEPTION;
-    }
+    storeKeyFunction.apply(identifier, key).join();
   }
 
   private Account getAuthenticatedAccount(final UUID authenticatedAccountId) {
     return accountsManager.getByAccountIdentifier(authenticatedAccountId)
         .orElseThrow(() -> GrpcExceptions.invalidCredentials("invalid credentials"));
   }
+
+  /// Get the identity of the requested `idenityType`, or throw an invalid arguments status if `account` does not
+  /// contain that type.
+  private static UUID getIdentifier(Account account, IdentityType identityType) {
+    return switch (identityType) {
+      case ACI -> account.getAccountIdentifier();
+      case PNI -> account.getPhoneNumberIdentifier()
+          .orElseThrow(() -> GrpcExceptions.invalidArguments("PNI identity type not allowed for an account without a phone number"));
+    };
+  }
+
 }

@@ -6,11 +6,15 @@
 package org.whispersystems.textsecuregcm.grpc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyByte;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -20,27 +24,43 @@ import static org.mockito.Mockito.when;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
+import io.grpc.Channel;
 import io.grpc.Status;
+import io.grpc.StatusException;
+import io.grpc.StatusRuntimeException;
+import io.grpc.stub.BlockingClientCall;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.function.ThrowingSupplier;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
 import org.mockito.Mock;
 import org.signal.chat.messages.ChallengeRequired;
+import org.signal.chat.messages.GetMessagesRequest;
+import org.signal.chat.messages.GetMessagesResponse;
 import org.signal.chat.messages.IndividualRecipientMessageBundle;
-import org.signal.chat.messages.SendMessageType;
 import org.signal.chat.messages.MessagesGrpc;
 import org.signal.chat.messages.MismatchedDevices;
+import org.signal.chat.messages.ReportMessageRequest;
 import org.signal.chat.messages.SendAuthenticatedSenderMessageRequest;
 import org.signal.chat.messages.SendMessageAuthenticatedSenderResponse;
+import org.signal.chat.messages.SendMessageType;
 import org.signal.chat.messages.SendSyncMessageRequest;
 import org.whispersystems.textsecuregcm.auth.grpc.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.controllers.MessageDeliveryNotAllowedException;
@@ -48,7 +68,7 @@ import org.whispersystems.textsecuregcm.controllers.MismatchedDevicesException;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
+import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.CardinalityEstimator;
 import org.whispersystems.textsecuregcm.limits.RateLimiter;
@@ -62,14 +82,25 @@ import org.whispersystems.textsecuregcm.spam.SpamChecker;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
+import org.whispersystems.textsecuregcm.storage.ReportMessageManager;
 import org.whispersystems.textsecuregcm.tests.util.DevicesHelper;
 import org.whispersystems.textsecuregcm.util.TestClock;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
-class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, MessagesGrpc.MessagesBlockingStub> {
+class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, MessagesGrpc.MessagesBlockingV2Stub> {
 
   @Mock
   private AccountsManager accountsManager;
+
+  @Mock
+  private ReportMessageManager reportMessageManager;
+
+  @Mock
+  private PhoneNumberIdentifiers phoneNumberIdentifiers;
 
   @Mock
   private RateLimiters rateLimiters;
@@ -98,6 +129,9 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
   @Mock
   private Device secondLinkedDevice;
 
+  @Mock
+  private MessageDispatcher messageDispatcher;
+
   private static final int AUTHENTICATED_REGISTRATION_ID = 7;
 
   private static final byte LINKED_DEVICE_ID = AUTHENTICATED_DEVICE_ID + 1;
@@ -109,17 +143,27 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
   private static final TestClock CLOCK = TestClock.pinned(Instant.now());
 
   @Override
+  protected MessagesGrpc.MessagesBlockingV2Stub createStub(final Channel channel) {
+    return MessagesGrpc.newBlockingV2Stub(channel);
+  }
+
+  @Override
   protected MessagesGrpcService createServiceBeforeEachTest() {
     return new MessagesGrpcService(accountsManager,
+        reportMessageManager,
+        phoneNumberIdentifiers,
         rateLimiters,
         messageSender,
         messageByteLimitEstimator,
         spamChecker,
+        messageDispatcher,
         CLOCK);
   }
 
   @BeforeEach
   void setUp() {
+    CLOCK.pin(Instant.now());
+
     when(accountsManager.getByServiceIdentifier(any())).thenReturn(Optional.empty());
 
     when(rateLimiters.getInboundMessageBytes()).thenReturn(rateLimiter);
@@ -129,23 +173,28 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
         .thenReturn(new SpamCheckResult<>(Optional.empty(), Optional.empty()));
 
     when(authenticatedDevice.getId()).thenReturn(AUTHENTICATED_DEVICE_ID);
-    when(authenticatedDevice.getRegistrationId(IdentityType.ACI)).thenReturn(AUTHENTICATED_REGISTRATION_ID);
+    when(authenticatedDevice.getAccountRegistrationId()).thenReturn(AUTHENTICATED_REGISTRATION_ID);
+    when(authenticatedDevice.getLastSeen()).thenReturn(CLOCK.instant().toEpochMilli());
+    when(authenticatedDevice.isPrimary()).thenReturn(true);
 
     when(linkedDevice.getId()).thenReturn(LINKED_DEVICE_ID);
-    when(linkedDevice.getRegistrationId(IdentityType.ACI)).thenReturn(LINKED_DEVICE_REGISTRATION_ID);
+    when(linkedDevice.getAccountRegistrationId()).thenReturn(LINKED_DEVICE_REGISTRATION_ID);
 
     when(secondLinkedDevice.getId()).thenReturn(SECOND_LINKED_DEVICE_ID);
-    when(secondLinkedDevice.getRegistrationId(IdentityType.ACI)).thenReturn(SECOND_LINKED_DEVICE_REGISTRATION_ID);
+    when(secondLinkedDevice.getAccountRegistrationId()).thenReturn(SECOND_LINKED_DEVICE_REGISTRATION_ID);
 
-    when(authenticatedAccount.getUuid()).thenReturn(AUTHENTICATED_ACI);
-    when(authenticatedAccount.getIdentifier(IdentityType.ACI)).thenReturn(AUTHENTICATED_ACI);
+    when(authenticatedAccount.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
+    when(authenticatedAccount.getAccountIdentifier()).thenReturn(AUTHENTICATED_ACI);
     when(authenticatedAccount.getDevice(anyByte())).thenReturn(Optional.empty());
     when(authenticatedAccount.getDevice(AUTHENTICATED_DEVICE_ID)).thenReturn(Optional.of(authenticatedDevice));
     when(authenticatedAccount.getDevice(LINKED_DEVICE_ID)).thenReturn(Optional.of(linkedDevice));
     when(authenticatedAccount.getDevice(SECOND_LINKED_DEVICE_ID)).thenReturn(Optional.of(secondLinkedDevice));
     when(authenticatedAccount.getDevices()).thenReturn(List.of(authenticatedDevice, linkedDevice, secondLinkedDevice));
+    when(authenticatedAccount.getPrimaryDevice()).thenReturn(authenticatedDevice);
 
     when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(AUTHENTICATED_ACI)))
+        .thenReturn(Optional.of(authenticatedAccount));
+    when(accountsManager.getByAccountIdentifier(AUTHENTICATED_ACI))
         .thenReturn(Optional.of(authenticatedAccount));
   }
 
@@ -157,7 +206,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
         @CartesianTest.Values(booleans = {true, false}) final boolean ephemeral,
         @CartesianTest.Values(booleans = {true, false}) final boolean urgent,
         @CartesianTest.Values(booleans = {true, false}) final boolean includeReportSpamToken)
-        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException {
+        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException, StatusException {
 
       final byte deviceId = Device.PRIMARY_ID;
       final int registrationId = 7;
@@ -201,9 +250,9 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
 
       final MessageProtos.Envelope.Builder expectedEnvelopeBuilder = MessageProtos.Envelope.newBuilder()
           .setType(expectedEnvelopeType)
-          .setSourceServiceId(new AciServiceIdentifier(AUTHENTICATED_ACI).toServiceIdentifierString())
+          .setSourceServiceId(new AciServiceIdentifier(AUTHENTICATED_ACI).toCompactByteString())
           .setSourceDevice(AUTHENTICATED_DEVICE_ID)
-          .setDestinationServiceId(serviceIdentifier.toServiceIdentifierString())
+          .setDestinationServiceId(serviceIdentifier.toCompactByteString())
           .setClientTimestamp(CLOCK.millis())
           .setServerTimestamp(CLOCK.millis())
           .setEphemeral(ephemeral)
@@ -251,8 +300,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
               .setType(SendMessageType.UNIDENTIFIED_SENDER)
               .build());
 
-      //noinspection ResultOfMethodCallIgnored,ThrowableNotThrown
-      GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT, () -> authenticatedServiceStub()
+      assertStatusException(Status.INVALID_ARGUMENT, () -> authenticatedServiceStub()
           .sendMessage(generateRequest(serviceIdentifier, false, true, messages)));
 
       verifyNoInteractions(messageSender);
@@ -260,7 +308,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
 
     @Test
     void mismatchedDevices()
-        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException {
+        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException, StatusException {
       final byte missingDeviceId = Device.PRIMARY_ID;
       final byte extraDeviceId = missingDeviceId + 1;
       final byte staleDeviceId = extraDeviceId + 1;
@@ -286,7 +334,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
 
       final SendMessageAuthenticatedSenderResponse expectedResponse = SendMessageAuthenticatedSenderResponse.newBuilder()
           .setMismatchedDevices(MismatchedDevices.newBuilder()
-              .setServiceIdentifier(ServiceIdentifierUtil.toGrpcServiceIdentifier(serviceIdentifier))
+              .setServiceIdentifier(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(serviceIdentifier))
               .addMissingDevices(missingDeviceId)
               .addStaleDevices(staleDeviceId)
               .addExtraDevices(extraDeviceId)
@@ -298,7 +346,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
 
     @Test
     void destinationNotFound()
-        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException {
+        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException, StatusException {
       final AciServiceIdentifier serviceIdentifier = new AciServiceIdentifier(UUID.randomUUID());
 
       final Map<Byte, IndividualRecipientMessageBundle.Message> messages =
@@ -342,8 +390,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
               .setType(SendMessageType.DOUBLE_RATCHET)
               .build());
 
-      //noinspection ResultOfMethodCallIgnored
-      GrpcTestUtils.assertRateLimitExceeded(retryDuration,
+      assertRateLimitExceeded(retryDuration,
           () -> authenticatedServiceStub().sendMessage(
               generateRequest(serviceIdentifier, false, true, messages)));
 
@@ -373,8 +420,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
       doThrow(new MessageTooLargeException())
           .when(messageSender).sendMessages(any(), any(), any(), any(), any(), any());
 
-      //noinspection ResultOfMethodCallIgnored,ThrowableNotThrown
-      GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT,
+      assertStatusException(Status.INVALID_ARGUMENT,
           () -> authenticatedServiceStub().sendMessage(
               generateRequest(serviceIdentifier, false, true, messages)));
     }
@@ -406,8 +452,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
               Optional.of(GrpcChallengeResponse.withStatusException(GrpcExceptions.rateLimitExceeded(null))),
               Optional.empty()));
 
-      //noinspection ResultOfMethodCallIgnored,ThrowableNotThrown
-      GrpcTestUtils.assertStatusException(Status.RESOURCE_EXHAUSTED, () -> authenticatedServiceStub()
+      assertStatusException(Status.RESOURCE_EXHAUSTED, () -> authenticatedServiceStub()
           .sendMessage(generateRequest(serviceIdentifier, false, true, messages)));
 
       verify(spamChecker).checkForIndividualRecipientSpamGrpc(MessageType.INDIVIDUAL_IDENTIFIED_SENDER,
@@ -420,7 +465,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
 
     @Test
     void spamWithResponse()
-        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException {
+        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException, StatusException {
       final byte deviceId = Device.PRIMARY_ID;
       final int registrationId = 7;
 
@@ -488,8 +533,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
       doThrow(MessageDeliveryNotAllowedException.class)
           .when(messageSender).sendMessages(any(), any(), any(), any(), any(), any());
 
-      //noinspection ResultOfMethodCallIgnored,ThrowableNotThrown
-      GrpcTestUtils.assertStatusException(Status.UNAVAILABLE,
+      assertStatusException(Status.UNAVAILABLE,
           () -> authenticatedServiceStub().sendMessage(generateRequest(serviceIdentifier, false, false, messages)));
     }
 
@@ -504,7 +548,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
       messages.forEach(messageBundleBuilder::putMessages);
 
       final SendAuthenticatedSenderMessageRequest.Builder requestBuilder = SendAuthenticatedSenderMessageRequest.newBuilder()
-          .setDestination(ServiceIdentifierUtil.toGrpcServiceIdentifier(serviceIdentifier))
+          .setDestination(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(serviceIdentifier))
           .setMessages(messageBundleBuilder)
           .setEphemeral(ephemeral)
           .setUrgent(urgent);
@@ -520,7 +564,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
     void sendMessage(@CartesianTest.Enum(mode = CartesianTest.Enum.Mode.EXCLUDE, names = {"UNSPECIFIED", "UNRECOGNIZED", "UNIDENTIFIED_SENDER"}) final SendMessageType messageType,
         @CartesianTest.Values(booleans = {true, false}) final boolean urgent,
         @CartesianTest.Values(booleans = {true, false}) final boolean includeReportSpamToken)
-        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException {
+        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException, StatusException {
 
       final AciServiceIdentifier serviceIdentifier = new AciServiceIdentifier(AUTHENTICATED_ACI);
       final byte[] payload = TestRandomUtil.nextBytes(128);
@@ -560,9 +604,9 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
       final Map<Byte, MessageProtos.Envelope> expectedEnvelopes = new HashMap<>(Map.of(
           LINKED_DEVICE_ID, MessageProtos.Envelope.newBuilder()
               .setType(expectedEnvelopeType)
-              .setSourceServiceId(serviceIdentifier.toServiceIdentifierString())
+              .setSourceServiceId(serviceIdentifier.toCompactByteString())
               .setSourceDevice(AUTHENTICATED_DEVICE_ID)
-              .setDestinationServiceId(serviceIdentifier.toServiceIdentifierString())
+              .setDestinationServiceId(serviceIdentifier.toCompactByteString())
               .setClientTimestamp(CLOCK.millis())
               .setServerTimestamp(CLOCK.millis())
               .setEphemeral(false)
@@ -572,9 +616,9 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
 
           SECOND_LINKED_DEVICE_ID, MessageProtos.Envelope.newBuilder()
               .setType(expectedEnvelopeType)
-              .setSourceServiceId(serviceIdentifier.toServiceIdentifierString())
+              .setSourceServiceId(serviceIdentifier.toCompactByteString())
               .setSourceDevice(AUTHENTICATED_DEVICE_ID)
-              .setDestinationServiceId(serviceIdentifier.toServiceIdentifierString())
+              .setDestinationServiceId(serviceIdentifier.toCompactByteString())
               .setClientTimestamp(CLOCK.millis())
               .setServerTimestamp(CLOCK.millis())
               .setEphemeral(false)
@@ -604,7 +648,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
 
     @Test
     void mismatchedDevices()
-        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException {
+        throws MessageTooLargeException, MismatchedDevicesException, MessageDeliveryNotAllowedException, StatusException {
       final byte missingDeviceId = Device.PRIMARY_ID;
       final byte extraDeviceId = missingDeviceId + 1;
       final byte staleDeviceId = extraDeviceId + 1;
@@ -625,7 +669,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
 
       final SendMessageAuthenticatedSenderResponse expectedResponse = SendMessageAuthenticatedSenderResponse.newBuilder()
           .setMismatchedDevices(MismatchedDevices.newBuilder()
-              .setServiceIdentifier(ServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(AUTHENTICATED_ACI)))
+              .setServiceIdentifier(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(new AciServiceIdentifier(AUTHENTICATED_ACI)))
               .addMissingDevices(missingDeviceId)
               .addStaleDevices(staleDeviceId)
               .addExtraDevices(extraDeviceId)
@@ -649,8 +693,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
               .setType(SendMessageType.DOUBLE_RATCHET)
               .build());
 
-      //noinspection ResultOfMethodCallIgnored
-      GrpcTestUtils.assertRateLimitExceeded(retryDuration, () ->
+      assertRateLimitExceeded(retryDuration, () ->
           authenticatedServiceStub().sendSyncMessage(generateRequest(true, messages)));
 
       verify(messageSender, never()).sendMessages(any(), any(), any(), any(), any(), any());
@@ -679,15 +722,13 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
       doThrow(new MessageTooLargeException())
           .when(messageSender).sendMessages(any(), any(), any(), any(), any(), any());
 
-      //noinspection ResultOfMethodCallIgnored,ThrowableNotThrown
-      GrpcTestUtils.assertStatusException(Status.INVALID_ARGUMENT, () -> authenticatedServiceStub()
+      assertStatusException(Status.INVALID_ARGUMENT, () -> authenticatedServiceStub()
           .sendSyncMessage( generateRequest( true, messages)));
     }
 
     @Test
     void messageDeliveryNotAllowed()
         throws MessageTooLargeException, MessageDeliveryNotAllowedException, MismatchedDevicesException {
-      final AciServiceIdentifier serviceIdentifier = new AciServiceIdentifier(AUTHENTICATED_ACI);
       final byte[] payload = TestRandomUtil.nextBytes(128);
 
       final Map<Byte, IndividualRecipientMessageBundle.Message> messages =
@@ -706,8 +747,7 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
       doThrow(MessageDeliveryNotAllowedException.class)
           .when(messageSender).sendMessages(any(), any(), any(), any(), any(), any());
 
-      //noinspection ResultOfMethodCallIgnored,ThrowableNotThrown
-      GrpcTestUtils.assertStatusException(Status.UNAVAILABLE,
+      assertStatusException(Status.UNAVAILABLE,
           () -> authenticatedServiceStub().sendSyncMessage(generateRequest(false, messages)));
     }
 
@@ -727,4 +767,127 @@ class MessagesGrpcServiceTest extends SimpleBaseGrpcTest<MessagesGrpcService, Me
       return requestBuilder.build();
     }
   }
+
+  @Timeout(value = 1, unit = TimeUnit.MINUTES, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  @Nested
+  class Retrieval {
+
+    @Test
+    public void invalidFirstRequest() throws InterruptedException, StatusException {
+      final BlockingClientCall<GetMessagesRequest, GetMessagesResponse> blockingCall = authenticatedServiceStub().getMessages();
+      blockingCall.write(GetMessagesRequest.newBuilder().setServerGuidAck(UUIDUtil.toByteString(UUID.randomUUID())).build());
+      assertStatusException(Status.INVALID_ARGUMENT, blockingCall::read);
+    }
+
+
+    static Stream<Arguments> invalidAckMessages() {
+      return Stream.of(
+          Arguments.argumentSet("Includes initial stream configuration", GetMessagesRequest.newBuilder()
+              .setOptions(GetMessagesRequest.GetMessageOptions.getDefaultInstance())
+              .build()),
+          Arguments.argumentSet("Missing ack guid", GetMessagesRequest.getDefaultInstance())
+      );
+    }
+
+    @ParameterizedTest
+    @MethodSource
+    void invalidAckMessages(final GetMessagesRequest request)
+        throws StatusException, InterruptedException {
+      doAnswer(invocation -> {
+        Flux<UUID> ackArg = invocation.getArgument(4);
+        // use mapNotNull instead of `then` because there is an interaction between the blocking client and
+        // simple-grpc where losing the per-request demand (that is, requesting an item on every delivery) prevents
+        // the blocking write channel from accepting writes.
+        return ackArg.mapNotNull(_ -> null).cast(GetMessagesResponse.class);
+      }).when(messageDispatcher).getMessages(anyBoolean(), any(), any(), any(), any());
+
+      final BlockingClientCall<GetMessagesRequest, GetMessagesResponse> blockingCall = authenticatedServiceStub().getMessages();
+      final CompletableFuture<StatusException> reader = CompletableFuture.supplyAsync(() ->  assertThrows(StatusException.class, blockingCall::read));
+
+      blockingCall.write(GetMessagesRequest.newBuilder().setOptions(GetMessagesRequest.GetMessageOptions.getDefaultInstance()).build());
+      blockingCall.write(request);
+      assertEquals(Status.INVALID_ARGUMENT.getCode(), reader.join().getStatus().getCode());
+    }
+
+    @Test
+    void getMessages() throws StatusException, InterruptedException {
+      final BlockingClientCall<GetMessagesRequest, GetMessagesResponse> blockingCall = authenticatedServiceStub().getMessages();
+      when(messageDispatcher.getMessages(anyBoolean(), any(), any(), any(), any())).thenReturn(Flux.just(
+              GetMessagesResponse.newBuilder().setEnvelope(MessageProtos.Envelope.getDefaultInstance()).build(),
+              GetMessagesResponse.newBuilder().setQueueEmpty(Empty.getDefaultInstance()).build())
+          // helps catch any issues with streaming concurrency (especially context propagation)
+          .publishOn(Schedulers.parallel()));
+      blockingCall.write(GetMessagesRequest.newBuilder().setOptions(GetMessagesRequest.GetMessageOptions.getDefaultInstance()).build());
+      assertTrue(blockingCall.read().hasEnvelope());
+      assertTrue(blockingCall.read().hasQueueEmpty());
+    }
+  }
+
+  @Timeout(value = 1, unit = TimeUnit.MINUTES, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  @Nested
+  class ReportMessage {
+
+    @Test
+    void reportMessage() throws StatusException {
+      final AciServiceIdentifier sourceServiceIdentifier = new AciServiceIdentifier(UUID.randomUUID());
+      final UUID messageGuid = UUID.randomUUID();
+      final byte[] reportSpamToken = TestRandomUtil.nextBytes(128);
+
+      //noinspection ResultOfMethodCallIgnored
+      authenticatedServiceStub().reportMessage(ReportMessageRequest.newBuilder()
+              .setSourceServiceIdentifier(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(sourceServiceIdentifier))
+              .setMessageGuid(UUIDUtil.toByteString(messageGuid))
+              .setReportSpamToken(ByteString.copyFrom(reportSpamToken))
+          .build());
+
+      verify(reportMessageManager).report(eq(Optional.empty()),
+          eq(sourceServiceIdentifier.uuid()),
+          eq(Optional.empty()),
+          eq(messageGuid),
+          eq(AUTHENTICATED_ACI),
+          argThat(maybeToken -> maybeToken.map(token -> Arrays.equals(token, reportSpamToken)).orElse(false)),
+          any(),
+          eq(true));
+    }
+
+    @Test
+    void reportMessageNoToken() throws StatusException {
+      final AciServiceIdentifier sourceServiceIdentifier = new AciServiceIdentifier(UUID.randomUUID());
+      final UUID messageGuid = UUID.randomUUID();
+
+      //noinspection ResultOfMethodCallIgnored
+      authenticatedServiceStub().reportMessage(ReportMessageRequest.newBuilder()
+          .setSourceServiceIdentifier(GrpcServiceIdentifierUtil.toGrpcServiceIdentifier(sourceServiceIdentifier))
+          .setMessageGuid(UUIDUtil.toByteString(messageGuid))
+          .build());
+
+      verify(reportMessageManager).report(eq(Optional.empty()),
+          eq(sourceServiceIdentifier.uuid()),
+          eq(Optional.empty()),
+          eq(messageGuid),
+          eq(AUTHENTICATED_ACI),
+          eq(Optional.empty()),
+          any(),
+          eq(true));
+    }
+  }
+
+  private static ThrowingSupplier<?> convertStatusException(final ThrowingSupplier<?> serviceCall) {
+    return () -> {
+      try {
+        return serviceCall.get();
+      } catch (final StatusException e) {
+        throw new StatusRuntimeException(e.getStatus(), e.getTrailers());
+      }
+    };
+  }
+
+  private static void assertRateLimitExceeded(final Duration expectedRetryAfter, final ThrowingSupplier<?> serviceCall) {
+    GrpcTestUtils.assertRateLimitExceeded(expectedRetryAfter, convertStatusException(serviceCall)::get);
+  }
+
+  private static void assertStatusException(final Status expected, final ThrowingSupplier<?> serviceCall) {
+    GrpcTestUtils.assertStatusException(expected, convertStatusException(serviceCall));
+  }
+
 }

@@ -8,7 +8,6 @@ package org.whispersystems.textsecuregcm.storage;
 import java.util.Collections;
 import java.util.List;
 import org.whispersystems.textsecuregcm.backup.BackupsDb;
-import org.whispersystems.textsecuregcm.experiment.PushNotificationExperimentSamples;
 import org.whispersystems.textsecuregcm.scheduler.JobScheduler;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceChecks;
 import software.amazon.awssdk.services.dynamodb.model.AttributeDefinition;
@@ -115,6 +114,14 @@ public final class DynamoDbExtensionSchema {
             .attributeType(ScalarAttributeType.S).build()),
         List.of(), List.of()),
 
+    DONATION_PERMITS("donation_permits_test",
+        DonationPermits.KEY_SPEND_ID,
+        null,
+        List.of(AttributeDefinition.builder()
+            .attributeName(DonationPermits.KEY_SPEND_ID)
+            .attributeType(ScalarAttributeType.B)
+            .build()), List.of(), List.of()),
+
     NUMBERS("numbers_test",
         Accounts.ATTR_ACCOUNT_E164,
         null,
@@ -149,20 +156,6 @@ public final class DynamoDbExtensionSchema {
             AttributeDefinition.builder()
                 .attributeName(PagedSingleUseKEMPreKeyStore.KEY_DEVICE_ID)
                 .attributeType(ScalarAttributeType.N)
-                .build()),
-        List.of(), List.of()),
-
-    PUSH_NOTIFICATION_EXPERIMENT_SAMPLES("push_notification_experiment_samples_test",
-        PushNotificationExperimentSamples.KEY_EXPERIMENT_NAME,
-        PushNotificationExperimentSamples.ATTR_ACI_AND_DEVICE_ID,
-        List.of(
-            AttributeDefinition.builder()
-                .attributeName(PushNotificationExperimentSamples.KEY_EXPERIMENT_NAME)
-                .attributeType(ScalarAttributeType.S)
-                .build(),
-            AttributeDefinition.builder()
-                .attributeName(PushNotificationExperimentSamples.ATTR_ACI_AND_DEVICE_ID)
-                .attributeType(ScalarAttributeType.B)
                 .build()),
         List.of(), List.of()),
 
@@ -267,6 +260,15 @@ public final class DynamoDbExtensionSchema {
                 .build()),
         List.of(), List.of()),
 
+    PROFILE_AVATARS("profileAvatars_test",
+        ProfileAvatars.KEY_IDENTITY,
+        null,
+        List.of(AttributeDefinition.builder()
+            .attributeName(ProfileAvatars.KEY_IDENTITY)
+            .attributeType(ScalarAttributeType.B)
+            .build()),
+        List.of(), List.of()),
+
     PROFILES_V2("profilesV2_test",
         ProfilesV2.KEY_ACCOUNT_UUID,
         ProfilesV2.KEY_VERSION,
@@ -299,11 +301,11 @@ public final class DynamoDbExtensionSchema {
             .build()),
         List.of(), List.of()),
 
-    REGISTRATION_RECOVERY_PASSWORDS("registration_recovery_passwords_test",
-        RegistrationRecoveryPasswords.KEY_PNI,
+    PHONE_NUMBER_RECOVERY_PASSWORDS("registration_recovery_passwords_test",
+        PhoneNumberRecoveryPasswords.KEY_PNI,
         null,
         List.of(AttributeDefinition.builder()
-            .attributeName(RegistrationRecoveryPasswords.KEY_PNI)
+            .attributeName(PhoneNumberRecoveryPasswords.KEY_PNI)
             .attributeType(ScalarAttributeType.S)
             .build()),
         List.of(), List.of()),
@@ -322,6 +324,15 @@ public final class DynamoDbExtensionSchema {
         null,
         List.of(AttributeDefinition.builder()
             .attributeName(ReportMessageDynamoDb.KEY_HASH)
+            .attributeType(ScalarAttributeType.B)
+            .build()),
+        List.of(), List.of()),
+
+    SANDBOX_ACCOUNTS("sandbox_accounts_test",
+        SandboxAccounts.KEY_ACCOUNT_UUID,
+        null,
+        List.of(AttributeDefinition.builder()
+            .attributeName(SandboxAccounts.KEY_ACCOUNT_UUID)
             .attributeType(ScalarAttributeType.B)
             .build()),
         List.of(), List.of()),

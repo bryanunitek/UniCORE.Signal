@@ -5,70 +5,112 @@
 
 package org.whispersystems.textsecuregcm.grpc;
 
-import java.time.Clock;
-import java.util.Optional;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.protobuf.Empty;
+import io.micrometer.core.instrument.Metrics;
+import java.time.Clock;
+import java.util.Base64;
+import java.util.Optional;
+import org.apache.commons.lang3.Strings;
 import org.signal.chat.errors.FailedUnidentifiedAuthorization;
+import org.signal.chat.errors.FailedZkAuthentication;
 import org.signal.chat.errors.NotFound;
 import org.signal.chat.profile.CredentialType;
-import org.signal.chat.profile.GetExpiringProfileKeyCredentialAnonymousRequest;
-import org.signal.chat.profile.GetExpiringProfileKeyCredentialAnonymousResponse;
-import org.signal.chat.profile.GetUnversionedProfileAnonymousRequest;
-import org.signal.chat.profile.GetUnversionedProfileAnonymousResponse;
-import org.signal.chat.profile.GetVersionedProfileAnonymousRequest;
-import org.signal.chat.profile.GetVersionedProfileAnonymousResponse;
+import org.signal.chat.profile.DeleteAvatarRequest;
+import org.signal.chat.profile.DeleteAvatarResponse;
+import org.signal.chat.profile.ExtendAvatarTTLRequest;
+import org.signal.chat.profile.ExtendAvatarTTLResponse;
+import org.signal.chat.profile.GetAvatarUploadFormRequest;
+import org.signal.chat.profile.GetAvatarUploadFormResponse;
+import org.signal.chat.profile.GetProfileAnonymousRequest;
+import org.signal.chat.profile.GetProfileAnonymousResponse;
+import org.signal.chat.profile.GetProfileKeyCredentialRequest;
+import org.signal.chat.profile.GetProfileKeyCredentialResponse;
 import org.signal.chat.profile.SimpleProfileAnonymousGrpc;
+import org.signal.libsignal.zkgroup.GenericServerSecretParams;
+import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.ServerSecretParams;
+import org.signal.libsignal.zkgroup.VerificationFailedException;
+import org.signal.libsignal.zkgroup.avatars.AvatarUploadCredentialPresentation;
 import org.signal.libsignal.zkgroup.profiles.ServerZkProfileOperations;
 import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
 import org.whispersystems.textsecuregcm.badges.ProfileBadgeConverter;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
+import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
+import org.whispersystems.textsecuregcm.limits.RateLimiters;
+import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
+import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
+import org.whispersystems.textsecuregcm.util.ProfileHelper;
 
 public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.ProfileAnonymousImplBase {
+
+  private static final String GET_PROFILE_RESPONSE_CASE_COUNTER_NAME = MetricsUtil.name(ProfileAnonymousGrpcService.class, "getProfile");
+
   private final AccountsManager accountsManager;
   private final ProfilesManager profilesManager;
   private final ProfileBadgeConverter profileBadgeConverter;
   private final ServerZkProfileOperations zkProfileOperations;
+  private final GenericServerSecretParams genericServerSecretParams;
   private final GroupSendTokenUtil groupSendTokenUtil;
+
+  private final PostPolicyGenerator policyGenerator;
+  private final String cdnBaseUrl;
+
+  private final RateLimiters rateLimiters;
+
+  private final Clock clock;
 
   public ProfileAnonymousGrpcService(
       final AccountsManager accountsManager,
       final ProfilesManager profilesManager,
       final ProfileBadgeConverter profileBadgeConverter,
-      final ServerSecretParams serverSecretParams) {
+      final PostPolicyGenerator policyGenerator,
+      final String cdnBaseUrl,
+      final GenericServerSecretParams genericServerSecretParams,
+      final ServerSecretParams serverSecretParams,
+      final RateLimiters rateLimiters,
+      final Clock clock) {
     this(accountsManager,
         profilesManager,
         profileBadgeConverter,
+        policyGenerator,
+        cdnBaseUrl,
+        genericServerSecretParams,
+        rateLimiters,
+        clock,
         new ServerZkProfileOperations(serverSecretParams),
-        new GroupSendTokenUtil(serverSecretParams, Clock.systemUTC()));
+        new GroupSendTokenUtil(serverSecretParams, clock));
   }
 
   @VisibleForTesting
   ProfileAnonymousGrpcService(final AccountsManager accountsManager,
       final ProfilesManager profilesManager,
       final ProfileBadgeConverter profileBadgeConverter,
+      final PostPolicyGenerator policyGenerator,
+      final String cdnBaseUrl,
+      final GenericServerSecretParams genericServerSecretParams,
+      final RateLimiters rateLimiters,
+      final Clock clock,
       final ServerZkProfileOperations zkProfileOperations,
       final GroupSendTokenUtil groupSendTokenUtil) {
     this.accountsManager = accountsManager;
     this.profilesManager = profilesManager;
     this.profileBadgeConverter = profileBadgeConverter;
+    this.policyGenerator = policyGenerator;
+    this.cdnBaseUrl = Strings.CS.removeEnd(cdnBaseUrl, "/");
+    this.genericServerSecretParams = genericServerSecretParams;
+    this.rateLimiters = rateLimiters;
+    this.clock = clock;
     this.zkProfileOperations = zkProfileOperations;
     this.groupSendTokenUtil = groupSendTokenUtil;
   }
 
   @Override
-  public GetUnversionedProfileAnonymousResponse getUnversionedProfile(final GetUnversionedProfileAnonymousRequest request) {
-    final ServiceIdentifier targetIdentifier =
-        ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getRequest().getServiceIdentifier());
-
-    // Callers must be authenticated to request unversioned profiles by PNI
-    if (targetIdentifier.identityType() == IdentityType.PNI) {
-      throw GrpcExceptions.invalidArguments("aci service identifier type required");
-    }
+  public GetProfileAnonymousResponse getProfile(final GetProfileAnonymousRequest request) {
+    final ServiceIdentifier targetIdentifier = GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getRequest().getAccountIdentifier());
 
     final Optional<Account> targetAccount = accountsManager.getByServiceIdentifier(targetIdentifier);
 
@@ -77,79 +119,161 @@ public class ProfileAnonymousGrpcService extends SimpleProfileAnonymousGrpc.Prof
       case UNIDENTIFIED_ACCESS_KEY ->
           targetAccount.map(a -> UnidentifiedAccessUtil.checkUnidentifiedAccess(a, request.getUnidentifiedAccessKey().toByteArray()))
               .orElse(false);
-      default -> throw GrpcExceptions.constraintViolation("invalid authentication");
+      default -> throw GrpcExceptions.invalidArguments("invalid authentication");
     };
 
     if (!authorized) {
-      return GetUnversionedProfileAnonymousResponse.newBuilder()
+      return GetProfileAnonymousResponse.newBuilder()
+          .setFailedUnidentifiedAuthorization(FailedUnidentifiedAuthorization.getDefaultInstance())
+          .build();
+    }
+    final byte[] version = request.getRequest().getVersion().toByteArray();
+
+    final GetProfileAnonymousResponse response = targetAccount.flatMap(account -> ProfileGrpcHelper
+            .getProfile(account, profilesManager, profileBadgeConverter, version)
+
+            // If the etag matches, drop the result
+            .map(profileResult -> request.getRequest().getEtag().equals(profileResult.getEtag())
+                ? GetProfileAnonymousResponse.newBuilder().setEtagMatched(true).build()
+                : GetProfileAnonymousResponse.newBuilder().setProfile(profileResult).build())
+
+            // If we didn't find a v2 profile, try a v1 profile
+            .or(() -> ProfileGrpcHelper
+                .getProfileV1(account, profilesManager, profileBadgeConverter, cdnBaseUrl, version)
+                .map(v1Result -> GetProfileAnonymousResponse.newBuilder().setProfileV1(v1Result).build())))
+        .orElseGet(() -> GetProfileAnonymousResponse.newBuilder().setNotFound(NotFound.getDefaultInstance()).build());
+
+    Metrics.counter(GET_PROFILE_RESPONSE_CASE_COUNTER_NAME, "responseCase", response.getResponseCase().name())
+        .increment();
+
+    return response;
+  }
+
+  @Override
+  public GetProfileKeyCredentialResponse getProfileKeyCredential(
+      final GetProfileKeyCredentialRequest request) {
+    final ServiceIdentifier targetIdentifier = GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getAccountIdentifier());
+
+    if (request.getCredentialType() != CredentialType.CREDENTIAL_TYPE_EXPIRING_PROFILE_KEY) {
+      throw GrpcExceptions.invalidArguments("invalid credential type");
+    }
+
+    final Optional<Account> maybeAccount = accountsManager.getByServiceIdentifier(targetIdentifier);
+    if (maybeAccount.isEmpty()) {
+      return GetProfileKeyCredentialResponse.newBuilder()
+          .setNotFound(NotFound.getDefaultInstance())
+          .build();
+    }
+
+    final Account account = maybeAccount.get();
+
+    if (!UnidentifiedAccessUtil.checkUnidentifiedAccess(account, request.getUnidentifiedAccessKey().toByteArray())) {
+      return GetProfileKeyCredentialResponse.newBuilder()
           .setFailedUnidentifiedAuthorization(FailedUnidentifiedAuthorization.getDefaultInstance())
           .build();
     }
 
-    return targetAccount.map(account ->
-            GetUnversionedProfileAnonymousResponse.newBuilder()
-                .setResult(ProfileGrpcHelper.buildUnversionedProfileResult(targetIdentifier,
-                    null,
-                    account,
-                    profileBadgeConverter))
-                .build())
-        .orElseGet(() -> GetUnversionedProfileAnonymousResponse.newBuilder()
+    // By presenting the correct unidentified access key, the client has confirmed they have the current profile key.
+    // If the credential request is somehow for a different profile version, then the below will fail (and it’s
+    // a client bug).
+    return account.getCurrentProfileVersion()
+        .flatMap(currentVersion ->
+            ProfileGrpcHelper.getProfileKeyCredentialResult(account,
+                    currentVersion, request.getCredentialRequest().toByteArray(),
+                    profilesManager, zkProfileOperations)
+                .map(result -> GetProfileKeyCredentialResponse.newBuilder()
+                    .setResult(result)
+                    .build()))
+        .orElseGet(() -> GetProfileKeyCredentialResponse.newBuilder()
             .setNotFound(NotFound.getDefaultInstance())
             .build());
   }
 
   @Override
-  public GetVersionedProfileAnonymousResponse getVersionedProfile(final GetVersionedProfileAnonymousRequest request) {
-    final ServiceIdentifier targetIdentifier = ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getRequest().getAccountIdentifier());
+  public GetAvatarUploadFormResponse getAvatarUploadForm(final GetAvatarUploadFormRequest request) throws RateLimitExceededException {
+    final AvatarUploadCredentialPresentation presentation;
 
-    final Optional<Account> targetAccount = getTargetAccountAndValidateUnidentifiedAccess(targetIdentifier, request.getUnidentifiedAccessKey().toByteArray());
+    try {
+      presentation = new AvatarUploadCredentialPresentation(
+          request.getAvatarCredentialPresentation().toByteArray());
 
-    return targetAccount.flatMap(account ->
-        ProfileGrpcHelper.getVersionedProfile(account,
-                profilesManager,
-                request.getRequest().getVersion().toByteArray(),
-                request.getRequest().getDataEtag().toByteArray(),
-                request.getRequest().getPaymentAddressEtag().toByteArray()))
-        .map(result ->
-            GetVersionedProfileAnonymousResponse.newBuilder()
-                .setResult(result)
-                .build())
-        .orElseGet(() ->
-            GetVersionedProfileAnonymousResponse.newBuilder()
-                .setNotFound(NotFound.getDefaultInstance())
-                .build());
+      presentation.verify(clock.instant(), this.genericServerSecretParams);
+
+    } catch (InvalidInputException _) {
+      throw GrpcExceptions.invalidArguments("invalid credential presentation");
+
+    } catch (VerificationFailedException _) {
+      return GetAvatarUploadFormResponse.newBuilder()
+          .setInvalidCredentialPresentation(FailedZkAuthentication.getDefaultInstance())
+          .build();
+    }
+
+    final byte[] identity = presentation.getCommitment();
+
+    rateLimiters.getProfileAvatarBytesLimiter().validate(Base64.getEncoder().encodeToString(identity), request.getUploadLength());
+
+    final String avatar = ProfileHelper.generateAvatarObjectName();
+
+    profilesManager.setAvatarForIdentity(identity, avatar);
+
+    return GetAvatarUploadFormResponse.newBuilder()
+        .setAvatarUploadForm(ProfileGrpcHelper.generateAvatarUploadForm(avatar, request.getUploadLength(), policyGenerator, clock))
+        .build();
   }
 
   @Override
-  public GetExpiringProfileKeyCredentialAnonymousResponse getExpiringProfileKeyCredential(
-      final GetExpiringProfileKeyCredentialAnonymousRequest request) {
-    final ServiceIdentifier targetIdentifier = ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getRequest().getAccountIdentifier());
-
-    if (request.getRequest().getCredentialType() != CredentialType.CREDENTIAL_TYPE_EXPIRING_PROFILE_KEY) {
-      throw GrpcExceptions.constraintViolation("invalid credential type");
+  public ExtendAvatarTTLResponse extendAvatarTTL(final ExtendAvatarTTLRequest request) {
+    final AvatarUploadCredentialPresentation presentation;
+    try {
+      presentation = new AvatarUploadCredentialPresentation(
+          request.getAvatarCredentialPresentation().toByteArray());
+    } catch (InvalidInputException _) {
+      throw GrpcExceptions.invalidArguments("invalid credential presentation");
     }
 
-    final Optional<Account> maybeAccount = getTargetAccountAndValidateUnidentifiedAccess(
-        targetIdentifier, request.getUnidentifiedAccessKey().toByteArray());
+    try {
+      presentation.verify(clock.instant(), this.genericServerSecretParams);
 
-    return maybeAccount.map(account ->
-        ProfileGrpcHelper.getExpiringProfileKeyCredentialResult(account,
-                request.getRequest().getVersion().toByteArray(), request.getRequest().getCredentialRequest().toByteArray(),
-                profilesManager, zkProfileOperations)
-            .map(result -> GetExpiringProfileKeyCredentialAnonymousResponse.newBuilder()
-                .setResult(result)
-                .build())
-            .orElseGet(() -> GetExpiringProfileKeyCredentialAnonymousResponse.newBuilder()
-                .setNotFound(NotFound.getDefaultInstance())
-                .build())).orElseGet(() -> GetExpiringProfileKeyCredentialAnonymousResponse.newBuilder()
-        .setNotFound(NotFound.getDefaultInstance())
-        .build());
+    } catch (VerificationFailedException _) {
+      return ExtendAvatarTTLResponse.newBuilder()
+          .setInvalidCredentialPresentation(FailedZkAuthentication.getDefaultInstance())
+          .build();
+    }
 
+    final byte[] identity = presentation.getCommitment();
+
+    return profilesManager.extendAvatarTtlForIdentity(identity)
+        .map(extendedPath -> ExtendAvatarTTLResponse.newBuilder()
+            .setUrl(ProfileGrpcHelper.cdnUrl(cdnBaseUrl, extendedPath))
+            .build())
+        .orElseGet(() -> ExtendAvatarTTLResponse.newBuilder()
+            .setNotFound(NotFound.getDefaultInstance())
+            .build());
   }
 
-  private Optional<Account> getTargetAccountAndValidateUnidentifiedAccess(final ServiceIdentifier targetIdentifier, final byte[] unidentifiedAccessKey)  {
+  @Override
+  public DeleteAvatarResponse deleteAvatar(final DeleteAvatarRequest request) {
+    final AvatarUploadCredentialPresentation presentation;
+    try {
+      presentation = new AvatarUploadCredentialPresentation(
+          request.getAvatarCredentialPresentation().toByteArray());
+    } catch (InvalidInputException _) {
+      throw GrpcExceptions.invalidArguments("invalid credential presentation");
+    }
 
-    return accountsManager.getByServiceIdentifier(targetIdentifier)
-        .filter(targetAccount -> UnidentifiedAccessUtil.checkUnidentifiedAccess(targetAccount, unidentifiedAccessKey));
+    try {
+      presentation.verify(clock.instant(), this.genericServerSecretParams);
+
+    } catch (VerificationFailedException _) {
+      return DeleteAvatarResponse.newBuilder()
+          .setInvalidCredentialPresentation(FailedZkAuthentication.getDefaultInstance())
+          .build();
+    }
+
+    final byte[] identity = presentation.getCommitment();
+
+    profilesManager.deleteAvatarForIdentity(identity);
+
+    return DeleteAvatarResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
   }
 }

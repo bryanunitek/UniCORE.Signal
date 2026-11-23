@@ -4,6 +4,9 @@
  */
 package org.whispersystems.textsecuregcm.storage;
 
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Tag;
+import io.micrometer.core.instrument.Tags;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Instant;
@@ -12,32 +15,39 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.VerificationFailedException;
 import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialRequest;
 import org.signal.libsignal.zkgroup.receipts.ReceiptCredentialResponse;
 import org.signal.libsignal.zkgroup.receipts.ServerZkReceiptOperations;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
-import org.whispersystems.textsecuregcm.controllers.SubscriptionController;
-import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreManager;
-import org.whispersystems.textsecuregcm.subscriptions.CustomerAwareSubscriptionPaymentProcessor;
-import org.whispersystems.textsecuregcm.subscriptions.GooglePlayBillingManager;
-import org.whispersystems.textsecuregcm.subscriptions.PaymentProvider;
-import org.whispersystems.textsecuregcm.subscriptions.ProcessorCustomer;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInformation;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionPaymentProcessor;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionForbiddenException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidArgumentsException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionInvalidLevelException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionNotFoundException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionPaymentRequiredException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionProcessorConflictException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionProcessorException;
-import org.whispersystems.textsecuregcm.subscriptions.SubscriptionReceiptRequestedForOpenPaymentException;
+import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
+import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
+import org.whispersystems.textsecuregcm.purchases.AppleAppStoreManager;
+import org.whispersystems.textsecuregcm.purchases.CustomerAwareSubscriptionPaymentProcessor;
+import org.whispersystems.textsecuregcm.purchases.GooglePlayBillingManager;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
+import org.whispersystems.textsecuregcm.purchases.ProcessorCustomer;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
+import org.whispersystems.textsecuregcm.purchases.SubscriberIdCreationNotPermittedException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseForbiddenException;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionInformation;
+import org.whispersystems.textsecuregcm.purchases.PurchaseInvalidArgumentsException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseInvalidIdempotencyKeyException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseInvalidLevelException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseNotFoundException;
+import org.whispersystems.textsecuregcm.purchases.SubscriptionPaymentProcessor;
+import org.whispersystems.textsecuregcm.purchases.PurchasePaymentRequiredException;
+import org.whispersystems.textsecuregcm.purchases.PurchasePaymentRequiresActionException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseProcessorConflictException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseProcessorException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseReceiptAlreadyRedeemedException;
+import org.whispersystems.textsecuregcm.purchases.PurchaseReceiptRequestedForOpenPaymentException;
+import org.whispersystems.textsecuregcm.util.ThrowingBiFunction;
 import org.whispersystems.textsecuregcm.util.ua.ClientPlatform;
 
 /**
@@ -49,6 +59,9 @@ import org.whispersystems.textsecuregcm.util.ua.ClientPlatform;
  * functionality as an argument to the method.
  */
 public class SubscriptionManager {
+
+  private static final String RECEIPT_ALREADY_REDEEMED_COUNTER_NAME = MetricsUtil.name(SubscriptionManager.class,
+      "receiptAlreadyRedeemed");
 
   private final Subscriptions subscriptions;
   private final EnumMap<PaymentProvider, SubscriptionPaymentProcessor> processors;
@@ -72,17 +85,17 @@ public class SubscriptionManager {
    *
    * @param subscriberCredentials Subscriber credentials derived from the subscriberId
    * @throws RateLimitExceededException            if rate-limited
-   * @throws SubscriptionNotFoundException         if the provided credentials are incorrect or the subscriber does not
+   * @throws PurchaseNotFoundException         if the provided credentials are incorrect or the subscriber does not
    *                                               exist
-   * @throws SubscriptionInvalidArgumentsException if a precondition for cancellation was not met
+   * @throws PurchaseInvalidArgumentsException if a precondition for cancellation was not met
    */
   public void deleteSubscriber(final SubscriberCredentials subscriberCredentials)
-      throws SubscriptionNotFoundException, SubscriptionInvalidArgumentsException, RateLimitExceededException {
+      throws PurchaseNotFoundException, PurchaseInvalidArgumentsException, RateLimitExceededException {
     final Subscriptions.GetResult getResult =
         subscriptions.get(subscriberCredentials.subscriberUser(), subscriberCredentials.hmac());
     if (getResult == Subscriptions.GetResult.NOT_STORED
         || getResult == Subscriptions.GetResult.PASSWORD_MISMATCH) {
-      throw new SubscriptionNotFoundException();
+      throw new PurchaseNotFoundException();
     }
 
     // a missing customer ID is OK; it means the subscriber never started to add a payment method, so we can skip cancelling
@@ -100,22 +113,29 @@ public class SubscriptionManager {
    * already exists, its last access time will be updated.
    *
    * @param subscriberCredentials Subscriber credentials derived from the subscriberId
-   * @throws SubscriptionForbiddenException if the subscriber credentials were incorrect
+   * @param createPermitted Whether creating a new subscriber is permitted if one does not exist
+   * @throws PurchaseForbiddenException if the subscriber credentials were incorrect
+   * @throws SubscriberIdCreationNotPermittedException if a new subscriber ID would be created, but the caller does not permit it
    */
-  public void updateSubscriber(final SubscriberCredentials subscriberCredentials)
-      throws SubscriptionForbiddenException {
+  public void updateSubscriber(final SubscriberCredentials subscriberCredentials, final boolean createPermitted)
+      throws PurchaseForbiddenException, SubscriberIdCreationNotPermittedException {
     final Subscriptions.GetResult getResult =
         subscriptions.get(subscriberCredentials.subscriberUser(), subscriberCredentials.hmac());
 
     if (getResult == Subscriptions.GetResult.PASSWORD_MISMATCH) {
-      throw new SubscriptionForbiddenException("subscriberId mismatch");
+      throw new PurchaseForbiddenException("subscriberId mismatch");
     } else if (getResult == Subscriptions.GetResult.NOT_STORED) {
+
+      if (!createPermitted) {
+        throw new SubscriberIdCreationNotPermittedException();
+      }
+
       // create a customer and write it to ddb
       final Subscriptions.Record updatedRecord = subscriptions.create(subscriberCredentials.subscriberUser(),
           subscriberCredentials.hmac(),
           subscriberCredentials.now());
       if (updatedRecord == null) {
-        throw new SubscriptionForbiddenException("subscriberId mismatch");
+        throw new PurchaseForbiddenException("subscriberId mismatch");
       }
     } else {
       // already exists so just touch access time and return
@@ -125,7 +145,7 @@ public class SubscriptionManager {
 
   public Optional<SubscriptionInformation> getSubscriptionInformation(
       final SubscriberCredentials subscriberCredentials)
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException, RateLimitExceededException {
+      throws PurchaseForbiddenException, PurchaseNotFoundException, RateLimitExceededException {
     final Subscriptions.Record record = getSubscriber(subscriberCredentials);
     if (record.subscriptionId == null) {
       return Optional.empty();
@@ -138,17 +158,17 @@ public class SubscriptionManager {
    * Get the subscriber record
    *
    * @param subscriberCredentials Subscriber credentials derived from the subscriberId
-   * @throws SubscriptionForbiddenException if the subscriber credentials were incorrect
-   * @throws SubscriptionNotFoundException  if the subscriber did not exist
+   * @throws PurchaseForbiddenException if the subscriber credentials were incorrect
+   * @throws PurchaseNotFoundException  if the subscriber did not exist
    */
   public Subscriptions.Record getSubscriber(final SubscriberCredentials subscriberCredentials)
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException {
+      throws PurchaseForbiddenException, PurchaseNotFoundException {
     final Subscriptions.GetResult getResult =
         subscriptions.get(subscriberCredentials.subscriberUser(), subscriberCredentials.hmac());
     if (getResult == Subscriptions.GetResult.PASSWORD_MISMATCH) {
-      throw new SubscriptionForbiddenException("subscriberId mismatch");
+      throw new PurchaseForbiddenException("subscriberId mismatch");
     } else if (getResult == Subscriptions.GetResult.NOT_STORED) {
-      throw new SubscriptionNotFoundException();
+      throw new PurchaseNotFoundException();
     } else {
       return getResult.record;
     }
@@ -162,51 +182,65 @@ public class SubscriptionManager {
   /**
    * Create a ZK receipt credential for a subscription that can be used to obtain the user entitlement
    *
-   * @param subscriberCredentials Subscriber credentials derived from the subscriberId
-   * @param request               The ZK Receipt credential request
-   * @param expiration            A function that takes a {@link CustomerAwareSubscriptionPaymentProcessor.ReceiptItem}
-   *                              and returns the expiration time of the receipt
+   * @param subscriberCredentials         Subscriber credentials derived from the subscriberId
+   * @param receiptCredentialRequestBytes The raw bytes of the ZK Receipt credential request
+   * @param expiration                    A function that takes a
+   *                                      {@link CustomerAwareSubscriptionPaymentProcessor.ReceiptItem} and returns the
+   *                                      expiration time of the receipt
+   * @param userAgent                     The requesting client's user agent
    * @return the requested ZK receipt credential
-   * @throws SubscriptionForbiddenException                      if the subscriber credentials were incorrect
-   * @throws SubscriptionNotFoundException                       if the subscriber did not exist or did not have a
+   * @throws PurchaseForbiddenException                      if the subscriber credentials were incorrect
+   * @throws PurchaseNotFoundException                       if the subscriber did not exist or did not have a
    *                                                             subscription attached
-   * @throws SubscriptionInvalidArgumentsException               if the receipt credential request failed verification
-   * @throws SubscriptionPaymentRequiredException                if the subscription is in a state does not grant the
+   * @throws PurchaseInvalidArgumentsException               if the receipt credential request failed verification
+   * @throws PurchasePaymentRequiredException                if the subscription is in a state does not grant the
    *                                                             user an entitlement
-   * @throws SubscriptionReceiptRequestedForOpenPaymentException if a receipt was requested while a payment transaction
+   * @throws PurchaseReceiptRequestedForOpenPaymentException if a receipt was requested while a payment transaction
    *                                                             was still open
+   * @throws PurchaseReceiptAlreadyRedeemedException         if the receipt was already redeemed by a different
+   *                                                             request
    * @throws RateLimitExceededException                          if rate-limited
    */
-  public ReceiptResult createReceiptCredentials(
+  public ReceiptResult createReceiptCredential(
       final SubscriberCredentials subscriberCredentials,
-      final SubscriptionController.GetReceiptCredentialsRequest request,
-      final Function<CustomerAwareSubscriptionPaymentProcessor.ReceiptItem, Instant> expiration)
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException, SubscriptionInvalidArgumentsException, SubscriptionPaymentRequiredException, RateLimitExceededException, SubscriptionReceiptRequestedForOpenPaymentException {
+      final byte[] receiptCredentialRequestBytes,
+      final Function<CustomerAwareSubscriptionPaymentProcessor.ReceiptItem, Instant> expiration,
+      @Nullable final String userAgent)
+      throws PurchaseForbiddenException, PurchaseNotFoundException, PurchaseInvalidArgumentsException, PurchasePaymentRequiredException, RateLimitExceededException, PurchaseReceiptRequestedForOpenPaymentException, PurchaseReceiptAlreadyRedeemedException {
     final Subscriptions.Record record = getSubscriber(subscriberCredentials);
     if (record.subscriptionId == null) {
-      throw new SubscriptionNotFoundException();
+      throw new PurchaseNotFoundException();
     }
 
-    ReceiptCredentialRequest receiptCredentialRequest;
+    final ReceiptCredentialRequest receiptCredentialRequest;
     try {
-      receiptCredentialRequest = new ReceiptCredentialRequest(request.receiptCredentialRequest());
-    } catch (InvalidInputException e) {
-      throw new SubscriptionInvalidArgumentsException("invalid receipt credential request", e);
+      receiptCredentialRequest = new ReceiptCredentialRequest(receiptCredentialRequestBytes);
+    } catch (final InvalidInputException e) {
+      throw new PurchaseInvalidArgumentsException("invalid receipt credential request", e);
     }
 
     final PaymentProvider processor = record.getProcessorCustomer().orElseThrow().processor();
     final SubscriptionPaymentProcessor manager = getProcessor(processor);
     final SubscriptionPaymentProcessor.ReceiptItem receipt = manager.getReceiptItem(record.subscriptionId);
-    issuedReceiptsManager
-        .recordIssuance(receipt.itemId(), manager.getProvider(), receiptCredentialRequest, subscriberCredentials.now());
-    ReceiptCredentialResponse receiptCredentialResponse;
+    final Instant expirationInstant = expiration.apply(receipt);
+    final ReceiptCredentialResponse receiptCredentialResponse;
     try {
+      issuedReceiptsManager
+          .recordIssuance(receipt.itemId(), manager.getProvider(), receiptCredentialRequest, expirationInstant);
       receiptCredentialResponse = zkReceiptOperations.issueReceiptCredential(
           receiptCredentialRequest,
-          expiration.apply(receipt).getEpochSecond(),
+          expirationInstant.getEpochSecond(),
           receipt.level());
-    } catch (VerificationFailedException e) {
-      throw new SubscriptionInvalidArgumentsException("receipt credential request failed verification", e);
+    } catch (final VerificationFailedException e) {
+      throw new PurchaseInvalidArgumentsException("receipt credential request failed verification", e);
+    } catch (final WriteConflictException _) {
+      Metrics.counter(RECEIPT_ALREADY_REDEEMED_COUNTER_NAME, Tags.of(
+              Tag.of("receiptLevel", ReceiptLevel.lookupLevel(receipt.level())
+                  .map(ReceiptLevel::name)
+                  .orElse("n/a")),
+              UserAgentTagUtil.getPlatformTag(userAgent)))
+          .increment();
+      throw new PurchaseReceiptAlreadyRedeemedException();
     }
     return new ReceiptResult(receiptCredentialResponse, receipt, processor);
   }
@@ -229,19 +263,19 @@ public class SubscriptionManager {
    * @param <T>                          A payment processor that has a notion of server-managed customers
    * @param <R>                          The return type of the paymentSetupFunction, which should be used by a client
    *                                     to configure the newly created payment method
+   * @param <E>                          An exception thrown by the paymentSetupFunction
    * @return The return value of the paymentSetupFunction
-   * @throws SubscriptionForbiddenException         if the subscriber credentials were incorrect
-   * @throws SubscriptionNotFoundException          if the subscriber did not exist or did not have a subscription
-   *                                                attached
-   * @throws SubscriptionProcessorConflictException if the new payment processor the existing processor associated with
+   * @throws PurchaseForbiddenException         if the subscriber credentials were incorrect
+   * @throws PurchaseNotFoundException          if the subscriber did not exist
+   * @throws PurchaseProcessorConflictException if the new payment processor does not match the existing processor associated with
    *                                                the subscriberId
    */
-  public <T extends CustomerAwareSubscriptionPaymentProcessor, R> R addPaymentMethodToCustomer(
+  public <T extends CustomerAwareSubscriptionPaymentProcessor, R, E extends Exception> R addPaymentMethodToCustomer(
       final SubscriberCredentials subscriberCredentials,
       final T subscriptionPaymentProcessor,
       final ClientPlatform clientPlatform,
-      final BiFunction<T, String, R> paymentSetupFunction)
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException, SubscriptionProcessorConflictException {
+      final ThrowingBiFunction<T, String, R, E> paymentSetupFunction)
+      throws PurchaseForbiddenException, PurchaseNotFoundException, PurchaseProcessorConflictException, E {
 
     Subscriptions.Record record = this.getSubscriber(subscriberCredentials);
     if (record.getProcessorCustomer().isEmpty()) {
@@ -255,7 +289,7 @@ public class SubscriptionManager {
         .orElseThrow(() -> new UncheckedIOException(new IOException("processor must now exist")));
 
     if (processorCustomer.processor() != subscriptionPaymentProcessor.getProvider()) {
-      throw new SubscriptionProcessorConflictException("existing processor does not match");
+      throw new PurchaseProcessorConflictException("existing processor does not match");
     }
     return paymentSetupFunction.apply(subscriptionPaymentProcessor, processorCustomer.customerId());
   }
@@ -290,13 +324,13 @@ public class SubscriptionManager {
    * @param subscriptionTemplateId Specifies the product associated with the provided level within the payment
    *                               processor
    * @param transitionValidator    A function that checks if the level update is valid
-   * @throws SubscriptionInvalidArgumentsException  if the transitionValidator failed for the level transition, or the
+   * @throws PurchaseInvalidArgumentsException  if the transitionValidator failed for the level transition, or the
    *                                                subscription could not be created because the payment provider
    *                                                requires additional action, or there was a failure because an
    *                                                idempotency key was reused on a * modified request
-   * @throws SubscriptionProcessorConflictException if the new payment processor the existing processor associated with
+   * @throws PurchaseProcessorConflictException if the new payment processor the existing processor associated with
    *                                                the subscriber
-   * @throws SubscriptionProcessorException         if there was no payment method on the customer
+   * @throws PurchaseProcessorException         if there was no payment method on the customer
    */
   public void updateSubscriptionLevelForCustomer(
       final SubscriberCredentials subscriberCredentials,
@@ -307,7 +341,7 @@ public class SubscriptionManager {
       final String idempotencyKey,
       final String subscriptionTemplateId,
       final LevelTransitionValidator transitionValidator)
-      throws SubscriptionInvalidArgumentsException, SubscriptionProcessorConflictException, SubscriptionProcessorException {
+      throws PurchaseInvalidLevelException, PurchaseInvalidIdempotencyKeyException, PurchasePaymentRequiresActionException, PurchaseProcessorConflictException, PurchaseProcessorException {
 
     if (record.subscriptionId != null) {
       // we already have a subscription in our records so let's check the level and currency,
@@ -321,7 +355,7 @@ public class SubscriptionManager {
         return;
       }
       if (!transitionValidator.isTransitionValid(existingLevelAndCurrency.level(), level)) {
-        throw new SubscriptionInvalidLevelException();
+        throw new PurchaseInvalidLevelException();
       }
       final CustomerAwareSubscriptionPaymentProcessor.SubscriptionId updatedSubscriptionId =
           processor.updateSubscription(subscription, subscriptionTemplateId, level, idempotencyKey);
@@ -355,12 +389,12 @@ public class SubscriptionManager {
    * @param purchaseToken            The client provided purchaseToken that represents a purchased subscription in the
    *                                 play store
    * @return the subscription level for the accepted subscription
-   * @throws SubscriptionForbiddenException         if the subscriber credentials were incorrect
-   * @throws SubscriptionNotFoundException          if the subscriber did not exist or did not have a subscription
-   *                                                attached
-   * @throws SubscriptionProcessorConflictException if the new payment processor the existing processor associated with
+   * @throws PurchaseForbiddenException         if the subscriber credentials were incorrect
+   * @throws PurchaseNotFoundException          if the subscriber did not exist, or the purchaseToken was not found
+   *                                                in the play store
+   * @throws PurchaseProcessorConflictException if the new payment processor does not match the existing processor associated with
    *                                                the subscriberId
-   * @throws SubscriptionPaymentRequiredException   if the subscription is not in a state that grants the user an
+   * @throws PurchasePaymentRequiredException   if the subscription is not in a state that grants the user an
    *                                                entitlement
    * @throws RateLimitExceededException             if rate-limited
    */
@@ -368,7 +402,7 @@ public class SubscriptionManager {
       final SubscriberCredentials subscriberCredentials,
       final GooglePlayBillingManager googlePlayBillingManager,
       final String purchaseToken)
-      throws SubscriptionProcessorConflictException, SubscriptionForbiddenException, SubscriptionNotFoundException, RateLimitExceededException, SubscriptionPaymentRequiredException {
+      throws PurchaseProcessorConflictException, PurchaseForbiddenException, PurchaseNotFoundException, RateLimitExceededException, PurchasePaymentRequiredException {
 
     // For IAP providers, the subscriptionId and the customerId are both just the purchaseToken. Changes to the
     // subscription always just result in a new purchaseToken
@@ -379,7 +413,7 @@ public class SubscriptionManager {
     // Check the record for an existing subscription
     if (record.processorCustomer != null
         && record.processorCustomer.processor() != PaymentProvider.GOOGLE_PLAY_BILLING) {
-      throw new SubscriptionProcessorConflictException("existing processor does not match");
+      throw new PurchaseProcessorConflictException("existing processor does not match");
     }
 
     // If we're replacing an existing purchaseToken, cancel it first
@@ -408,13 +442,14 @@ public class SubscriptionManager {
    * @param originalTransactionId The client provided originalTransactionId that represents a purchased subscription in
    *                              the app store
    * @return the subscription level for the accepted subscription
-   * @throws SubscriptionForbiddenException         if the subscriber credentials are incorrect
-   * @throws SubscriptionNotFoundException          if the originalTransactionId does not exist
-   * @throws SubscriptionProcessorConflictException if the new payment processor the existing processor associated with
+   * @throws PurchaseForbiddenException         if the subscriber credentials are incorrect
+   * @throws PurchaseNotFoundException          if the subscriber did not exist, or the originalTransactionId does
+   *                                                not exist
+   * @throws PurchaseProcessorConflictException if the new payment processor does not match the existing processor associated with
    *                                                the subscriber
-   * @throws SubscriptionInvalidArgumentsException  if the originalTransactionId is malformed or does not represent a
+   * @throws PurchaseInvalidArgumentsException  if the originalTransactionId is malformed or does not represent a
    *                                                valid subscription
-   * @throws SubscriptionPaymentRequiredException   if the subscription is not in a state that grants the user an
+   * @throws PurchasePaymentRequiredException   if the subscription is not in a state that grants the user an
    *                                                entitlement
    * @throws RateLimitExceededException             if rate-limited
    */
@@ -422,12 +457,12 @@ public class SubscriptionManager {
       final SubscriberCredentials subscriberCredentials,
       final AppleAppStoreManager appleAppStoreManager,
       final String originalTransactionId)
-      throws SubscriptionForbiddenException, SubscriptionNotFoundException, SubscriptionProcessorConflictException, SubscriptionInvalidArgumentsException, SubscriptionPaymentRequiredException, RateLimitExceededException {
+      throws PurchaseForbiddenException, PurchaseNotFoundException, PurchaseProcessorConflictException, PurchaseInvalidArgumentsException, PurchasePaymentRequiredException, RateLimitExceededException {
 
     final Subscriptions.Record record = getSubscriber(subscriberCredentials);
     if (record.processorCustomer != null
         && record.processorCustomer.processor() != PaymentProvider.APPLE_APP_STORE) {
-      throw new SubscriptionProcessorConflictException("existing processor does not match");
+      throw new PurchaseProcessorConflictException("existing processor does not match");
     }
 
     // For IAP providers, the subscriptionId and the customerId are both just the identifier for the subscription in

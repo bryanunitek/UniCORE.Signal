@@ -72,14 +72,12 @@ import org.whispersystems.textsecuregcm.attachments.TusAttachmentGenerator;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedBackupUser;
 import org.whispersystems.textsecuregcm.auth.ExternalServiceCredentials;
 import org.whispersystems.textsecuregcm.auth.ExternalServiceCredentialsGenerator;
+import org.whispersystems.textsecuregcm.configuration.BackupConfiguration;
 import org.whispersystems.textsecuregcm.configuration.SecureValueRecoveryConfiguration;
-import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicBackupConfiguration;
-import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.limits.RateLimiter;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.securevaluerecovery.SecureValueRecoveryClient;
-import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.DynamoDbExtension;
 import org.whispersystems.textsecuregcm.storage.DynamoDbExtensionSchema;
 import org.whispersystems.textsecuregcm.util.AttributeValues;
@@ -114,7 +112,7 @@ public class BackupManagerTest {
   private final RemoteStorageManager remoteStorageManager = mock(RemoteStorageManager.class);
   private final byte[] backupKey = TestRandomUtil.nextBytes(32);
   private final UUID aci = UUID.randomUUID();
-  private final DynamicBackupConfiguration backupConfiguration = new DynamicBackupConfiguration(
+  private final BackupConfiguration backupConfiguration = new BackupConfiguration(
     3, 4, 5, Duration.ofSeconds(30), MAX_TOTAL_MEDIA_BYTES);
 
 
@@ -146,11 +144,6 @@ public class BackupManagerTest {
         DYNAMO_DB_EXTENSION.getDynamoDbAsyncClient(),
         DynamoDbExtensionSchema.Tables.BACKUPS.tableName(),
         testClock);
-    @SuppressWarnings("unchecked") final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager =
-        mock(DynamicConfigurationManager.class);
-    final DynamicConfiguration dynamicConfiguration = mock(DynamicConfiguration.class);
-    when(dynamicConfiguration.getBackupConfiguration()).thenReturn(backupConfiguration);
-    when(dynamicConfigurationManager.getConfiguration()).thenReturn(dynamicConfiguration);
 
     this.backupManager = new BackupManager(
         backupsDb,
@@ -162,7 +155,7 @@ public class BackupManagerTest {
         svrbCredentialGenerator,
         svrbClient,
         testClock,
-        dynamicConfigurationManager);
+        backupConfiguration);
   }
 
   @ParameterizedTest
@@ -470,9 +463,9 @@ public class BackupManagerTest {
 
     final int slowIndex = backupConfiguration.usageCheckpointCount() - 1;
     final CompletableFuture<Void> slow = new CompletableFuture<>();
-    when(remoteStorageManager.copy(eq(3), anyString(), eq(100), any(), anyString()))
+    when(remoteStorageManager.copy(eq(3), anyString(), eq(100L), any(), anyString()))
         .thenReturn(CompletableFuture.completedFuture(null));
-    when(remoteStorageManager.copy(eq(3), eq(sourceKeys.get(slowIndex)), eq(100), any(), anyString()))
+    when(remoteStorageManager.copy(eq(3), eq(sourceKeys.get(slowIndex)), eq(100L), any(), anyString()))
         .thenReturn(slow);
     final ArrayBlockingQueue<CopyResult> copyResults = new ArrayBlockingQueue<>(100);
     final CompletableFuture<Void> future = backupManager
@@ -525,11 +518,11 @@ public class BackupManagerTest {
 
     when(tusCredentialGenerator.generateUpload(any(), anyLong()))
         .thenReturn(new BackupUploadDescriptor(3, "", Collections.emptyMap(), ""));
-    when(remoteStorageManager.copy(eq(3), eq("success"), eq(100), any(), any()))
+    when(remoteStorageManager.copy(eq(3), eq("success"), eq(100L), any(), any()))
         .thenReturn(CompletableFuture.completedFuture(null));
-    when(remoteStorageManager.copy(eq(3), eq("missing"), eq(200), any(), any()))
+    when(remoteStorageManager.copy(eq(3), eq("missing"), eq(200L), any(), any()))
         .thenReturn(CompletableFuture.failedFuture(new SourceObjectNotFoundException()));
-    when(remoteStorageManager.copy(eq(3), eq("badlength"), eq(300), any(), any()))
+    when(remoteStorageManager.copy(eq(3), eq("badlength"), eq(300L), any(), any()))
         .thenReturn(CompletableFuture.failedFuture(new InvalidLengthException("")));
 
     final List<CopyResult> results = backupManager
@@ -674,7 +667,7 @@ public class BackupManagerTest {
             Optional.of("newCursor")
         )));
 
-    final BackupManager.ListMediaResult result = backupManager.list(backupUser, cursor, 17);
+    final BackupManager.ListMediaResult result = backupManager.list(backupUser, cursor, Optional.of(17));
     assertThat(result.media()).hasSize(1);
     assertThat(result.media().getFirst().cdn()).isEqualTo(13);
     assertThat(result.media().getFirst().key()).isEqualTo(

@@ -41,15 +41,18 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.stream.Stream;
+import javax.annotation.Nullable;
 import org.assertj.core.api.Condition;
 import org.glassfish.jersey.server.ServerProperties;
 import org.glassfish.jersey.test.grizzly.GrizzlyWebTestContainerFactory;
@@ -76,8 +79,10 @@ import org.signal.libsignal.zkgroup.profiles.ProfileKeyCommitment;
 import org.signal.libsignal.zkgroup.profiles.ProfileKeyCredentialRequest;
 import org.signal.libsignal.zkgroup.profiles.ProfileKeyCredentialRequestContext;
 import org.signal.libsignal.zkgroup.profiles.ServerZkProfileOperations;
+import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessUtil;
+import org.whispersystems.textsecuregcm.badges.ProfileBadgeConverter;
 import org.whispersystems.textsecuregcm.configuration.BadgeConfiguration;
 import org.whispersystems.textsecuregcm.configuration.BadgesConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
@@ -92,13 +97,11 @@ import org.whispersystems.textsecuregcm.entities.ExpiringProfileKeyCredentialPro
 import org.whispersystems.textsecuregcm.entities.ProfileAvatarUploadAttributes;
 import org.whispersystems.textsecuregcm.entities.VersionedProfileResponse;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
 import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.limits.RateLimiter;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.mappers.RateLimitExceededExceptionMapper;
-import org.whispersystems.textsecuregcm.s3.PolicySigner;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountBadge;
@@ -107,6 +110,7 @@ import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.VersionedProfileV1;
+import org.whispersystems.textsecuregcm.purchases.ReceiptLevel;
 import org.whispersystems.textsecuregcm.tests.util.AccountsHelper;
 import org.whispersystems.textsecuregcm.tests.util.AuthHelper;
 import org.whispersystems.textsecuregcm.tests.util.ProfileTestHelper;
@@ -127,8 +131,7 @@ class ProfileControllerTest {
   private static final RateLimiter usernameRateLimiter = mock(RateLimiter.class);
 
   private static final PostPolicyGenerator postPolicyGenerator = new PostPolicyGenerator("us-west-1", "profile-bucket",
-      "accessKey");
-  private static final PolicySigner policySigner = new PolicySigner("accessSecret", "us-west-1");
+      "accessKey", "accessSecret");
   private static final ServerZkProfileOperations zkProfileOperations = mock(ServerZkProfileOperations.class);
   private static final ServerSecretParams serverSecretParams = ServerSecretParams.generate();
 
@@ -159,18 +162,35 @@ class ProfileControllerTest {
           rateLimiters,
           accountsManager,
           profilesManager,
+          () -> AsnInfoProvider.EMPTY,
           dynamicConfigurationManager,
-          (acceptableLanguages, accountBadges, isSelf) -> List.of(new Badge("TEST", "other", "Test Badge",
-              "This badge is in unit tests.", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld")))
-          ),
+          new ProfileBadgeConverter() {
+            @Override
+            public List<String> visibleBadgeIds(final List<AccountBadge> badges) {
+              return List.of("TEST");
+            }
+
+            @Override
+            public List<Badge> convert(final List<Locale> acceptableLanguages, final List<AccountBadge> accountBadges,
+                final boolean isSelf) {
+              return List.of(new Badge("TEST", "other", "Test Badge",
+                  "This badge is in unit tests.",
+                  List.of("l", "m", "h", "x", "xx", "xxx"),
+                  "SVG", List.of(new BadgeSvg("sl", "sd"),
+                  new BadgeSvg("ml", "md"),
+                  new BadgeSvg("ll", "ld"))));
+            }
+          },
           new BadgesConfiguration(List.of(
               new BadgeConfiguration("TEST", "other", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld"))),
               new BadgeConfiguration("TEST1", "testing", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld"))),
               new BadgeConfiguration("TEST2", "testing", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld"))),
               new BadgeConfiguration("TEST3", "testing", List.of("l", "m", "h", "x", "xx", "xxx"), "SVG", List.of(new BadgeSvg("sl", "sd"), new BadgeSvg("ml", "md"), new BadgeSvg("ll", "ld")))
-          ), List.of("TEST1"), Map.of(1L, "TEST1", 2L, "TEST2", 3L, "TEST3")),
+          ), Map.of(
+              ReceiptLevel.ONE_TIME_DONATION, "TEST1",
+              ReceiptLevel.SUBSCRIPTION_MEDIUM, "TEST2",
+              ReceiptLevel.SUBSCRIPTION_HIGH, "TEST3")),
           postPolicyGenerator,
-          policySigner,
           serverSecretParams,
           zkProfileOperations,
           Executors.newSingleThreadExecutor()))
@@ -187,18 +207,17 @@ class ProfileControllerTest {
 
     when(dynamicConfigurationManager.getConfiguration()).thenReturn(dynamicConfiguration);
     when(dynamicConfiguration.getPaymentsConfiguration()).thenReturn(dynamicPaymentsConfiguration);
-    when(dynamicPaymentsConfiguration.getDisallowedPrefixes()).thenReturn(Collections.emptyList());
+    when(dynamicPaymentsConfiguration.disallowedPrefixes()).thenReturn(Collections.emptyList());
 
     when(rateLimiters.getProfileLimiter()).thenReturn(rateLimiter);
     when(rateLimiters.getUsernameLookupLimiter()).thenReturn(usernameRateLimiter);
 
     profileAccount = mock(Account.class);
 
-    when(profileAccount.getIdentityKey(IdentityType.ACI)).thenReturn(ACCOUNT_TWO_IDENTITY_KEY);
-    when(profileAccount.getIdentityKey(IdentityType.PNI)).thenReturn(ACCOUNT_TWO_PHONE_NUMBER_IDENTITY_KEY);
-    when(profileAccount.getUuid()).thenReturn(AuthHelper.VALID_UUID_TWO);
-    when(profileAccount.getIdentifier(IdentityType.ACI)).thenReturn(AuthHelper.VALID_UUID_TWO);
-    when(profileAccount.getPhoneNumberIdentifier()).thenReturn(AuthHelper.VALID_PNI_TWO);
+    when(profileAccount.getAccountIdentityKey()).thenReturn(ACCOUNT_TWO_IDENTITY_KEY);
+    when(profileAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(ACCOUNT_TWO_PHONE_NUMBER_IDENTITY_KEY));
+    when(profileAccount.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID_TWO);
+    when(profileAccount.getPhoneNumberIdentifier()).thenReturn(Optional.of(AuthHelper.VALID_PNI_TWO));
     when(profileAccount.getCurrentProfileVersion()).thenReturn(Optional.empty());
     when(profileAccount.getUsernameHash()).thenReturn(Optional.of(USERNAME_HASH));
     when(profileAccount.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
@@ -207,10 +226,9 @@ class ProfileControllerTest {
 
     capabilitiesAccount = mock(Account.class);
 
-    when(capabilitiesAccount.getUuid()).thenReturn(AuthHelper.VALID_UUID);
-    when(capabilitiesAccount.getIdentifier(IdentityType.ACI)).thenReturn(AuthHelper.VALID_UUID);
-    when(capabilitiesAccount.getIdentityKey(IdentityType.ACI)).thenReturn(ACCOUNT_IDENTITY_KEY);
-    when(capabilitiesAccount.getIdentityKey(IdentityType.PNI)).thenReturn(ACCOUNT_PHONE_NUMBER_IDENTITY_KEY);
+    when(capabilitiesAccount.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
+    when(capabilitiesAccount.getAccountIdentityKey()).thenReturn(ACCOUNT_IDENTITY_KEY);
+    when(capabilitiesAccount.getPhoneNumberIdentityKey()).thenReturn(Optional.of(ACCOUNT_PHONE_NUMBER_IDENTITY_KEY));
 
     when(accountsManager.getByServiceIdentifier(any())).thenReturn(Optional.empty());
 
@@ -791,7 +809,7 @@ class ProfileControllerTest {
 
   @Test
   void testSetProfilePaymentAddressCountryNotAllowed() throws InvalidInputException {
-    when(dynamicPaymentsConfiguration.getDisallowedPrefixes())
+    when(dynamicPaymentsConfiguration.disallowedPrefixes())
         .thenReturn(List.of(AuthHelper.VALID_NUMBER_TWO.substring(0, 3)));
 
     final ProfileKeyCommitment commitment = new ProfileKey(new byte[32]).getCommitment(new ServiceId.Aci(AuthHelper.VALID_UUID));
@@ -818,15 +836,14 @@ class ProfileControllerTest {
   }
 
   @ParameterizedTest
-  @ValueSource(booleans = {true, false})
+  @MethodSource
   void testSetProfilePaymentAddressCountryNotAllowedExistingPaymentAddress(
-      final boolean existingPaymentAddressOnProfile) throws InvalidInputException {
-    when(dynamicPaymentsConfiguration.getDisallowedPrefixes())
+      @Nullable final byte[] existingPaymentAddressOnProfile, final byte[] requestPaymentAddress, final boolean expectAllowed) throws InvalidInputException {
+    when(dynamicPaymentsConfiguration.disallowedPrefixes())
         .thenReturn(List.of(AuthHelper.VALID_NUMBER_TWO.substring(0, 3)));
 
     final ProfileKeyCommitment commitment = new ProfileKey(new byte[32]).getCommitment(new ServiceId.Aci(AuthHelper.VALID_UUID));
     final byte[] name = TestRandomUtil.nextBytes(81);
-    final byte[] paymentAddress = TestRandomUtil.nextBytes(582);
     final byte[] phoneNumberSharing = TestRandomUtil.nextBytes(29);
 
     clearInvocations(AuthHelper.VALID_ACCOUNT_TWO);
@@ -834,7 +851,7 @@ class ProfileControllerTest {
     when(profilesManager.getV1(eq(AuthHelper.VALID_UUID_TWO), any()))
         .thenReturn(Optional.of(
             new VersionedProfileV1("1", name, null, null, null,
-                existingPaymentAddressOnProfile ? TestRandomUtil.nextBytes(582) : null,
+                existingPaymentAddressOnProfile,
                 phoneNumberSharing,
                 commitment.serialize())));
 
@@ -845,10 +862,10 @@ class ProfileControllerTest {
         .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_TWO, AuthHelper.VALID_PASSWORD_TWO))
         .put(Entity.entity(
             new CreateProfileRequest(commitment, version, name,
-                null, null, paymentAddress, false, false,
+                null, null, requestPaymentAddress, false, false,
                 Optional.of(List.of()), null), MediaType.APPLICATION_JSON_TYPE))) {
 
-      if (existingPaymentAddressOnProfile) {
+      if (expectAllowed) {
         assertThat(response.getStatus()).isEqualTo(200);
         assertThat(response.hasEntity()).isFalse();
 
@@ -866,7 +883,7 @@ class ProfileControllerTest {
         assertThat(profile.name()).isEqualTo(name);
         assertThat(profile.aboutEmoji()).isNull();
         assertThat(profile.about()).isNull();
-        assertThat(profile.paymentAddress()).isEqualTo(paymentAddress);
+        assertThat(profile.paymentAddress()).isEqualTo(requestPaymentAddress);
       } else {
         assertThat(response.getStatus()).isEqualTo(403);
         assertThat(response.hasEntity()).isFalse();
@@ -874,6 +891,16 @@ class ProfileControllerTest {
         verify(profilesManager, never()).setV1(any(), any());
       }
     }
+  }
+
+  static Collection<Arguments> testSetProfilePaymentAddressCountryNotAllowedExistingPaymentAddress() {
+    return List.of(
+        Arguments.argumentSet("null existing payment address, empty new", null, new byte[0], true),
+        Arguments.argumentSet("null existing payment address", null, TestRandomUtil.nextBytes(582), false),
+        Arguments.argumentSet("empty existing payment address, empty new", new byte[0], new byte[0], true),
+        Arguments.argumentSet("empty existing payment address", new byte[0], TestRandomUtil.nextBytes(582), false),
+        Arguments.argumentSet("valid existing payment address", TestRandomUtil.nextBytes(582), TestRandomUtil.nextBytes(582), true)
+    );
   }
 
   @Test
@@ -1013,8 +1040,8 @@ class ProfileControllerTest {
   @Test
   void testGetProfileWithExpiringProfileKeyCredentialVersionNotFound() throws VerificationFailedException {
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(AuthHelper.VALID_UUID);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
     when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version("version")));
 
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(account));
@@ -1225,13 +1252,13 @@ class ProfileControllerTest {
     final ProfileKeyCredentialRequest credentialRequest = profileKeyCredentialRequestContext.getRequest();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(AuthHelper.VALID_UUID);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
     when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version));
     when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
     when(account.isIdentifiedBy(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(true);
 
-    final Instant expiration = Instant.now().plus(org.whispersystems.textsecuregcm.util.ProfileHelper.EXPIRING_PROFILE_KEY_CREDENTIAL_EXPIRATION)
+    final Instant expiration = Instant.now().plus(org.whispersystems.textsecuregcm.util.ProfileHelper.PROFILE_KEY_CREDENTIAL_EXPIRATION)
         .truncatedTo(ChronoUnit.DAYS);
 
     final ExpiringProfileKeyCredentialResponse credentialResponse =
@@ -1294,7 +1321,7 @@ class ProfileControllerTest {
     final ProfileKeyCredentialRequest credentialRequest = profileKeyCredentialRequestContext.getRequest();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
     when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
     when(account.isIdentifiedBy(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(true);
     when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version));
@@ -1342,7 +1369,7 @@ class ProfileControllerTest {
     final ProfileKeyCredentialRequest credentialRequest = profileKeyCredentialRequestContext.getRequest();
 
     final Account account = mock(Account.class);
-    when(account.getUuid()).thenReturn(AuthHelper.VALID_UUID);
+    when(account.getAccountIdentifier()).thenReturn(AuthHelper.VALID_UUID);
     when(account.getUnidentifiedAccessKey()).thenReturn(Optional.of(UNIDENTIFIED_ACCESS_KEY));
     when(account.isIdentifiedBy(new AciServiceIdentifier(AuthHelper.VALID_UUID))).thenReturn(true);
     when(account.getCurrentProfileVersion()).thenReturn(Optional.of(version("the-current-version")));

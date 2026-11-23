@@ -4,6 +4,7 @@
  */
 package org.whispersystems.textsecuregcm.grpc.net;
 
+import com.google.common.net.InetAddresses;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.codec.haproxy.HAProxyMessage;
@@ -20,7 +21,7 @@ class ProxyMessageAttributeSetterHandler extends ChannelInboundHandlerAdapter {
   static final AttributeKey<InetAddress> PROXY_REMOTE_ADDRESS = AttributeKey.newInstance("proxyRemoteAddress");
 
   @Override
-  public void channelRead(final ChannelHandlerContext ctx, final Object msg) throws Exception {
+  public void channelRead(final ChannelHandlerContext ctx, final Object msg) {
     if (!(msg instanceof HAProxyMessage proxyMessage)) {
       ctx.pipeline().remove(this);
       ctx.fireChannelRead(msg);
@@ -30,7 +31,8 @@ class ProxyMessageAttributeSetterHandler extends ChannelInboundHandlerAdapter {
     try {
       final String sourceAddress = proxyMessage.sourceAddress();
       if (sourceAddress != null) {
-        ctx.channel().attr(PROXY_REMOTE_ADDRESS).set(InetAddress.getByName(sourceAddress));
+        // Assume that the server has been configured to only allow access from a trusted PPv2 provider
+        ctx.channel().attr(PROXY_REMOTE_ADDRESS).set(InetAddresses.forString(sourceAddress));
       } else {
         logger.warn("PROXY protocol message has no source address");
       }

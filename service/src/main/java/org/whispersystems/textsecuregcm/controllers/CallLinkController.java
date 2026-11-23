@@ -2,6 +2,7 @@ package org.whispersystems.textsecuregcm.controllers;
 
 import io.dropwizard.auth.Auth;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
@@ -9,9 +10,11 @@ import jakarta.ws.rs.BadRequestException;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.signal.libsignal.protocol.ServiceId;
 import org.signal.libsignal.zkgroup.GenericServerSecretParams;
 import org.signal.libsignal.zkgroup.InvalidInputException;
@@ -26,13 +29,16 @@ import org.whispersystems.textsecuregcm.limits.RateLimiters;
 public class CallLinkController {
   private final RateLimiters rateLimiters;
   private final GenericServerSecretParams genericServerSecretParams;
+  private final GenericServerSecretParams genericServerSecretParamsPreV101;
 
   public CallLinkController(
       final RateLimiters rateLimiters,
-      final GenericServerSecretParams genericServerSecretParams
+      final GenericServerSecretParams genericServerSecretParams,
+      final GenericServerSecretParams genericServerSecretParamsPreV101
   ) {
     this.rateLimiters = rateLimiters;
     this.genericServerSecretParams = genericServerSecretParams;
+    this.genericServerSecretParamsPreV101 = genericServerSecretParamsPreV101;
   }
 
   @POST
@@ -50,9 +56,12 @@ public class CallLinkController {
   @ApiResponse(responseCode = "401", description = "Account authentication check failed.")
   @ApiResponse(responseCode = "422", description = "Invalid request format.")
   @ApiResponse(responseCode = "429", description = "Ratelimited.")
+  @ManagedAsync
   public CreateCallLinkCredential getCreateAuth(
       final @Auth AuthenticatedDevice auth,
-      final @NotNull @Valid GetCreateCallLinkCredentialsRequest request
+      final @NotNull @Valid GetCreateCallLinkCredentialsRequest request,
+      @Parameter(description = "Whether to use libsignal v0.101.0+ secret params")
+      final @QueryParam("v101") boolean v101
   ) throws RateLimitExceededException {
 
     rateLimiters.getCreateCallLinkLimiter().validate(auth.accountIdentifier());
@@ -67,7 +76,7 @@ public class CallLinkController {
     }
 
     return new CreateCallLinkCredential(
-        createCallLinkCredentialRequest.issueCredential(new ServiceId.Aci(auth.accountIdentifier()), truncatedDayTimestamp, genericServerSecretParams).serialize(),
+        createCallLinkCredentialRequest.issueCredential(new ServiceId.Aci(auth.accountIdentifier()), truncatedDayTimestamp, v101 ? genericServerSecretParams : genericServerSecretParamsPreV101).serialize(),
         truncatedDayTimestamp.getEpochSecond()
     );
   }

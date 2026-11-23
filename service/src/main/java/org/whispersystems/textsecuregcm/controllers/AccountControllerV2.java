@@ -19,6 +19,7 @@ import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.ForbiddenException;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.HeaderParam;
+import jakarta.ws.rs.NotAuthorizedException;
 import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
@@ -28,11 +29,17 @@ import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import java.io.IOException;
 import java.time.Instant;
 import java.util.UUID;
 import org.apache.commons.lang3.StringUtils;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.ChangesPhoneNumber;
+import org.whispersystems.textsecuregcm.auth.InvalidRegistrationSessionException;
+import org.whispersystems.textsecuregcm.auth.RecoveryPasswordVerificationFailedException;
+import org.whispersystems.textsecuregcm.auth.RegistrationLockFailureException;
+import org.whispersystems.textsecuregcm.auth.UnverifiedRegistrationSessionException;
 import org.whispersystems.textsecuregcm.entities.AccountDataReportResponse;
 import org.whispersystems.textsecuregcm.entities.AccountIdentityResponse;
 import org.whispersystems.textsecuregcm.entities.ChangeNumberRequest;
@@ -40,6 +47,7 @@ import org.whispersystems.textsecuregcm.entities.MismatchedDevicesResponse;
 import org.whispersystems.textsecuregcm.entities.PhoneNumberDiscoverabilityRequest;
 import org.whispersystems.textsecuregcm.entities.RegistrationLockFailure;
 import org.whispersystems.textsecuregcm.entities.StaleDevicesResponse;
+import org.whispersystems.textsecuregcm.filters.RemoteAddressFilter;
 import org.whispersystems.textsecuregcm.push.MessageTooLargeException;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -77,10 +85,12 @@ public class AccountControllerV2 {
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, a positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+  @ManagedAsync
   public AccountIdentityResponse changeNumber(@Auth final AuthenticatedDevice authenticatedDevice,
       @NotNull @Valid final ChangeNumberRequest request,
       @HeaderParam(HttpHeaders.USER_AGENT) final String userAgentString,
-      @Context final ContainerRequestContext requestContext) throws RateLimitExceededException, InterruptedException {
+      @Context final ContainerRequestContext requestContext)
+      throws RateLimitExceededException, InterruptedException, RegistrationLockFailureException {
 
     if (authenticatedDevice.deviceId() != Device.PRIMARY_ID) {
       throw new ForbiddenException();
@@ -102,7 +112,9 @@ public class AccountControllerV2 {
           request.devicePniPqLastResortPrekeys(),
           request.deviceMessages(),
           request.pniRegistrationIds(),
-          requestContext);
+          userAgentString,
+          requestContext.getHeaderString(HttpHeaders.ACCEPT_LANGUAGE),
+          (String) requestContext.getProperty(RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME));
 
       return AccountIdentityResponseBuilder.fromAccount(updatedAccount);
     } catch (final MismatchedDevicesException e) {
@@ -124,6 +136,14 @@ public class AccountControllerV2 {
       throw new WebApplicationException(Response.Status.REQUEST_ENTITY_TOO_LARGE);
     } catch (final MessageDeliveryNotAllowedException e) {
       throw new ServiceUnavailableException();
+    } catch (final UnverifiedRegistrationSessionException e) {
+      throw new NotAuthorizedException("registration session is unverified");
+    } catch (final InvalidRegistrationSessionException e) {
+      throw new BadRequestException(e.getMessage());
+    } catch (final IOException e) {
+      throw new ServiceUnavailableException(e.getMessage());
+    } catch (final RecoveryPasswordVerificationFailedException e) {
+      throw new ForbiddenException("recovery password could not be verified");
     }
   }
 
@@ -133,12 +153,18 @@ public class AccountControllerV2 {
   @Produces(MediaType.APPLICATION_JSON)
   @Operation(summary = "Sets whether the account should be discoverable by phone number in the directory.")
   @ApiResponse(responseCode = "204", description = "The setting was successfully updated.")
+  @ManagedAsync
   public void setPhoneNumberDiscoverability(
       @Auth AuthenticatedDevice auth,
       @NotNull @Valid PhoneNumberDiscoverabilityRequest phoneNumberDiscoverability) {
 
-    accountsManager.update(auth.accountIdentifier(), a -> a.setDiscoverableByPhoneNumber(
-        phoneNumberDiscoverability.discoverableByPhoneNumber()));
+    accountsManager.update(auth.accountIdentifier(), account -> {
+      if (account.getNumber().isEmpty()) {
+        throw new BadRequestException();
+      }
+
+      account.setDiscoverableByPhoneNumber(phoneNumberDiscoverability.discoverableByPhoneNumber());
+    });
   }
 
   @GET
@@ -148,6 +174,7 @@ public class AccountControllerV2 {
   @ApiResponse(responseCode = "200",
       description = "Response with data report. A plain text representation is a field in the response.",
       useReturnTypeSchema = true)
+  @ManagedAsync
   public AccountDataReportResponse getAccountDataReport(@Auth final AuthenticatedDevice auth) {
 
     final Account account = accountsManager.getByAccountIdentifier(auth.accountIdentifier())

@@ -31,9 +31,11 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import java.io.IOException;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
+import org.whispersystems.textsecuregcm.captcha.InvalidCaptchaArgumentException;
 import org.whispersystems.textsecuregcm.entities.AnswerCaptchaChallengeRequest;
 import org.whispersystems.textsecuregcm.entities.AnswerChallengeRequest;
 import org.whispersystems.textsecuregcm.entities.AnswerPushChallengeRequest;
@@ -87,6 +89,7 @@ public class ChallengeController {
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+  @ManagedAsync
   public Response handleChallengeResponse(@Auth final AuthenticatedDevice auth,
       @Valid final AnswerChallengeRequest answerRequest,
       @Context final ContainerRequestContext requestContext,
@@ -126,6 +129,8 @@ public class ChallengeController {
       } else {
         tags = tags.and(CHALLENGE_TYPE_TAG, "unrecognized");
       }
+    } catch (final InvalidCaptchaArgumentException e) {
+      return Response.status(Response.Status.BAD_REQUEST.getStatusCode(), e.getMessage()).build();
     } catch (final IOException e) {
       logger.error("error assessing captcha during challenge response handling", e);
       return Response.status(Response.Status.SERVICE_UNAVAILABLE).build();
@@ -179,6 +184,7 @@ public class ChallengeController {
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+  @ManagedAsync
   public Response requestPushChallenge(@Auth final AuthenticatedDevice auth,
       @Context ContainerRequestContext requestContext) {
 

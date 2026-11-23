@@ -45,59 +45,65 @@
   </modules>
 
   <properties>
-    <aws.sdk2.version>2.42.27</aws.sdk2.version>
-    <braintree.version>3.48.0</braintree.version>
+    <aws.sdk2.version>2.59.1</aws.sdk2.version>
+    <braintree.version>3.56.0</braintree.version>
+    <!-- Weird stuff happens with parameter annotation counts under Java 27 with versions of Byte Buddy older than
+    1.18.9, so we need to pull in a newer version than we'd get via Dropwizard -> Mockito -> Byte Buddy. We can drop
+    this when Dropwizard updates and pulls in a newer version of Byte Buddy. -->
+    <byte-buddy.version>1.18.17-jdk5</byte-buddy.version>
     <commons-csv.version>1.14.1</commons-csv.version>
-    <commons-io.version>2.21.0</commons-io.version>
-    <dropwizard.version>5.0.1</dropwizard.version>
-    <!-- Note: when updating FoundationDB, also include a copy of `libfdb_c.so` from the FoundationDB release at
-    src/main/jib/usr/lib/libfdb_c.so. We use x86_64 builds without AVX instructions enabled (i.e. FoundationDB versions
-    with even-numbered patch versions). Also when updating FoundationDB, make sure to update the version of FoundationDB
-    used by GitHub Actions. -->
-    <foundationdb.version>7.3.62</foundationdb.version>
+    <commons-io.version>2.22.0</commons-io.version>
+    <dropwizard.version>5.0.2</dropwizard.version>
+    <!-- Note: We use x86_64 builds without AVX instructions enabled (i.e. FoundationDB versions with even-numbered
+    patch versions). -->
+    <foundationdb.version>7.3.76</foundationdb.version>
     <foundationdb.api-version>730</foundationdb.api-version>
-    <foundationdb.client-library-sha256>bfed237b787fae3cde1222676e6bfbb0d218fc27bf9e903397a7a7aa96fb2d33</foundationdb.client-library-sha256>
-    <google-cloud-libraries.version>26.79.0</google-cloud-libraries.version>
+    <foundationdb.client-library-sha256>af099848721d08904ff9e5d38fade0de24d92e86451ea491d9ab5ce84adcf62a</foundationdb.client-library-sha256>
+    <google-cloud-libraries.version>26.93.0</google-cloud-libraries.version>
     <grpc.version>1.76.3</grpc.version> <!-- should be kept in sync with the value from Google libraries-bom -->
-    <gson.version>2.13.2</gson.version>
-    <guava.version>33.5.0-jre</guava.version>
-    <!-- several libraries (AWS, Google Cloud) use Apache http components transitively, and we need to align them -->
-    <httpcore.version>4.4.16</httpcore.version>
+    <guava.version>33.8.0-jre</guava.version>
+    <!-- several libraries (AWS, Google Cloud) use Apache httpclient transitively, and we need to align them -->
     <httpclient.version>4.5.14</httpclient.version>
-    <jackson.version>2.21.2</jackson.version>
+    <jackson.version>2.23.0</jackson.version>
+    <java-otp.version>1.0.0</java-otp.version>
+    <jetty.version>12.1.9</jetty.version>
     <junit-pioneer.version>2.3.0</junit-pioneer.version>
     <jsr305.version>3.0.2</jsr305.version>
-    <kotlin.version>2.3.20</kotlin.version>
-    <logback.version>1.5.32</logback.version>
-    <logback-access-common.version>2.0.12</logback-access-common.version>
-    <lettuce.version>7.5.1.RELEASE</lettuce.version>
-    <libphonenumber.version>9.0.21</libphonenumber.version>
-    <logstash.logback.version>8.1</logstash.logback.version>
-    <log4j-bom.version>2.25.4</log4j-bom.version>
-    <luajava.version>3.5.0</luajava.version>
-    <micrometer.version>1.16.4</micrometer.version>
-    <netty.version>4.2.13.Final</netty.version>
-    <!-- Must be less than or equal to the value from Google libraries-bom which controls the protobuf runtime version.
-    See https://protobuf.dev/support/cross-version-runtime-guarantee/. -->
-    <protoc.version>4.33.2</protoc.version>
-    <pushy.version>0.15.4</pushy.version>
-    <reactor-bom.version>2025.0.4</reactor-bom.version> <!-- 3.8.4, see https://github.com/reactor/reactor#bom-versioning-scheme -->
+    <kotlin.version>2.4.21</kotlin.version>
+    <!-- dropwizard references a constant removed in 1.6. See also: dependabot.yml -->
+    <logback.version>1.5.38</logback.version>
+    <logback-access-common.version>2.0.15</logback-access-common.version>
+    <lettuce.version>7.9.0.RELEASE</lettuce.version>
+    <libphonenumber.version>9.0.43</libphonenumber.version>
+    <log4j-bom.version>2.26.1</log4j-bom.version>
+    <luajava.version>4.1.0</luajava.version>
+    <micrometer.version>1.17.2</micrometer.version>
+    <netty.version>4.2.20.Final</netty.version>
+    <!-- netty-bom doesn't manage the BoringSSL uber-jar; keep in sync with netty's tcnative.version -->
+    <netty-tcnative.version>2.0.85.Final</netty-tcnative.version>
+    <!-- Instrumentation releases target upstream opentelemetry versions and include that BOM by reference -->
+    <opentelemetry-instrumentation.version>2.33.1</opentelemetry-instrumentation.version>
+    <!-- must be greater than or equal to the value from Google libraries-bom, see https://protobuf.dev/support/cross-version-runtime-guarantee/ -->
+    <!-- the latest 4.x should be fine https://central.sonatype.com/artifact/com.google.protobuf/protobuf-java/versions -->
+    <protobuf.version>4.36.2</protobuf.version>
+    <pushy.version>0.15.6</pushy.version>
+    <reactor-bom.version>2025.0.8</reactor-bom.version> <!-- 3.8.4, see https://github.com/reactor/reactor#bom-versioning-scheme -->
     <resilience4j.version>2.4.0</resilience4j.version>
     <semver4j.version>3.1.0</semver4j.version>
-    <simple-grpc.version>0.2.0</simple-grpc.version>
-    <slf4j.version>2.0.17</slf4j.version>
-    <stripe.version>31.2.0</stripe.version>
-    <swagger.version>2.2.46</swagger.version>
-    <testcontainers.version>2.0.4</testcontainers.version>
+    <simple-grpc.version>0.3.0</simple-grpc.version>
+    <slf4j.version>2.0.20</slf4j.version>
+    <stripe.version>34.1.0</stripe.version>
+    <swagger.version>2.2.55</swagger.version>
+    <testcontainers.version>2.0.5</testcontainers.version>
+    <webauthn4j.version>0.32.0.RELEASE</webauthn4j.version>
 
-    <!-- images to use in tests via testcontainers  -->
-    <dynamodb.image>amazon/dynamodb-local:3.3.0@sha256:d89f8fcc6b1a39cb35976c248ed42a28c66ae00dc043099210f5571e42648ab4</dynamodb.image>
-    <localstack.image>localstack/localstack:4.13@sha256:46302bcb91a7e8008e6394be8afafdbfa40fb77a54d4046a38be35992042d5de</localstack.image>
-    <redis.image>redis:7.4-alpine@sha256:af1d0fc3f63b02b13ff7906c9baf7c5b390b8881ca08119cd570677fe2f60b55</redis.image>
+    <!-- Images to use in tests via testcontainers. See also: prepull-testcontainers-images <profile>  -->
+    <dynamodb.image>amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab</dynamodb.image>
+    <localstack.image>localstack/localstack:4.14@sha256:3ebc37595918b8accb852f8048fef2aff047d465167edd655528065b07bc364a</localstack.image>
+    <redis.image>redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99</redis.image>
     <redis-cluster.image>docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af</redis-cluster.image>
 
-    <!-- eclipse-temurin:25.0.2_10-jre-noble (note: always use the multi-arch manifest *LIST* here) -->
-    <docker.image.sha256>d2975fcad8dc9ac2180c0c278c8ae7b3443d36cb80845cb0811c20d9463f5fee</docker.image.sha256>
+    <docker.image>eclipse-temurin:27-jre-resolute@sha256:16a0cae9bfb17ab4257ac64e3d7585fc49233e7bdf3d376c4545289eaf193929</docker.image>
 
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
@@ -107,7 +113,9 @@
   <version>JGITVER</version>
 
   <dependencyManagement>
+    <!-- note: order matters, and earlier declarations take precedence -->
     <dependencies>
+      <!-- use a pinned version of jackson, rather than Dropwizard's BOM -->
       <dependency>
         <groupId>com.fasterxml.jackson</groupId>
         <artifactId>jackson-bom</artifactId>
@@ -115,24 +123,45 @@
         <type>pom</type>
         <scope>import</scope>
       </dependency>
+      <!-- use a pinned version of jetty, rather than Dropwizard's BOM -->
       <dependency>
-        <groupId>io.dropwizard</groupId>
-        <artifactId>dropwizard-dependencies</artifactId>
-        <version>${dropwizard.version}</version>
+        <groupId>org.eclipse.jetty</groupId>
+        <artifactId>jetty-bom</artifactId>
+        <version>${jetty.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
-      <!-- Needed for gRPC with Java 9+ -->
+      <!-- use a pinned version of jetty, rather than Dropwizard's BOM -->
       <dependency>
-        <groupId>org.apache.tomcat</groupId>
-        <artifactId>annotations-api</artifactId>
-        <version>6.0.53</version>
-        <scope>provided</scope>
+        <groupId>org.eclipse.jetty.ee10</groupId>
+        <artifactId>jetty-ee10-bom</artifactId>
+        <version>${jetty.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
       </dependency>
       <dependency>
         <groupId>io.netty</groupId>
         <artifactId>netty-bom</artifactId>
         <version>${netty.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>io.netty</groupId>
+        <artifactId>netty-tcnative-boringssl-static</artifactId>
+        <version>${netty-tcnative.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-bom</artifactId>
+        <type>pom</type>
+        <scope>import</scope>
+        <version>${protobuf.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.google.cloud</groupId>
+        <artifactId>libraries-bom</artifactId>
+        <version>${google-cloud-libraries.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
@@ -144,11 +173,28 @@
         <scope>import</scope>
       </dependency>
       <dependency>
-        <groupId>com.google.cloud</groupId>
-        <artifactId>libraries-bom</artifactId>
-        <version>${google-cloud-libraries.version}</version>
+        <groupId>io.dropwizard</groupId>
+        <artifactId>dropwizard-dependencies</artifactId>
+        <version>${dropwizard.version}</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy</artifactId>
+        <version>${byte-buddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy-agent</artifactId>
+        <version>${byte-buddy.version}</version>
+      </dependency>
+      <!-- Needed for gRPC with Java 9+ -->
+      <dependency>
+        <groupId>org.apache.tomcat</groupId>
+        <artifactId>annotations-api</artifactId>
+        <version>6.0.53</version>
+        <scope>provided</scope>
       </dependency>
       <dependency>
         <groupId>io.github.resilience4j</groupId>
@@ -165,16 +211,9 @@
         <scope>import</scope>
       </dependency>
       <dependency>
-        <groupId>io.opentelemetry</groupId>
-        <artifactId>opentelemetry-bom</artifactId>
-        <version>1.60.1</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-      <dependency>
         <groupId>io.opentelemetry.instrumentation</groupId>
         <artifactId>opentelemetry-instrumentation-bom</artifactId>
-        <version>2.26.1</version>
+        <version>${opentelemetry-instrumentation.version}</version>
         <type>pom</type>
         <scope>import</scope>
       </dependency>
@@ -191,6 +230,11 @@
         <version>${kotlin.version}</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.eatthepath</groupId>
+        <artifactId>java-otp</artifactId>
+        <version>${java-otp.version}</version>
       </dependency>
       <dependency>
         <groupId>com.eatthepath</groupId>
@@ -223,11 +267,6 @@
         <version>${lettuce.version}</version>
       </dependency>
       <dependency>
-        <groupId>net.logstash.logback</groupId>
-        <artifactId>logstash-logback-encoder</artifactId>
-        <version>${logstash.logback.version}</version>
-      </dependency>
-      <dependency>
         <groupId>org.apache.commons</groupId>
         <artifactId>commons-csv</artifactId>
         <version>${commons-csv.version}</version>
@@ -251,7 +290,7 @@
       <dependency>
         <groupId>commons-logging</groupId>
         <artifactId>commons-logging</artifactId>
-        <version>1.3.6</version>
+        <version>1.4.0</version>
       </dependency>
       <dependency>
         <groupId>com.stripe</groupId>
@@ -269,11 +308,6 @@
         <version>${jsr305.version}</version>
       </dependency>
       <dependency>
-        <groupId>com.google.code.gson</groupId>
-        <artifactId>gson</artifactId>
-        <version>${gson.version}</version>
-      </dependency>
-      <dependency>
         <groupId>com.google.guava</groupId>
         <artifactId>guava</artifactId>
         <version>${guava.version}</version>
@@ -281,13 +315,13 @@
       <dependency>
         <groupId>com.redis</groupId>
         <artifactId>testcontainers-redis</artifactId>
-        <version>2.2.4</version>
+        <version>3.0.1</version>
         <scope>test</scope>
       </dependency>
       <dependency>
         <groupId>org.signal</groupId>
         <artifactId>libsignal-server</artifactId>
-        <version>0.86.6</version>
+        <version>0.108.0</version>
       </dependency>
       <dependency>
         <groupId>org.signal</groupId>
@@ -300,11 +334,6 @@
         <version>${log4j-bom.version}</version>
         <type>pom</type>
         <scope>import</scope>
-      </dependency>
-      <dependency>
-        <groupId>org.apache.httpcomponents</groupId>
-        <artifactId>httpcore</artifactId>
-        <version>${httpcore.version}</version>
       </dependency>
       <dependency>
         <groupId>org.apache.httpcomponents</groupId>
@@ -356,7 +385,7 @@
     <dependency>
       <groupId>org.wiremock</groupId>
       <artifactId>wiremock-jetty12</artifactId>
-      <version>3.13.1</version>
+      <version>3.13.2</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -409,6 +438,46 @@
         </file>
       </activation>
     </profile>
+
+    <profile>
+      <!-- Starts pulling Testcontainers images in the background, reducing test blocks. This is primarily useful in CI,
+       where images are less likely to be cached.-->
+      <id>prepull-testcontainers-images</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <!-- Run once for the whole reactor, rather than once per module -->
+            <inherited>false</inherited>
+            <executions>
+              <execution>
+                <id>prepull-testcontainers-images</id>
+                <phase>initialize</phase>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <executable>sh</executable>
+                  <arguments>
+                    <argument>-c</argument>
+                    <!-- Images are pulled one at a time to limit contention with the build. If any fails, then exit status
+                     is non-zero, so failure is logged. -->
+                    <argument>status=0; for image in "$@"; do docker pull -q "$image" || status=1; done; exit $status</argument>
+                    <argument>sh</argument>
+                    <argument>${redis-cluster.image}</argument>
+                    <argument>${redis.image}</argument>
+                    <argument>${dynamodb.image}</argument>
+                    <argument>${localstack.image}</argument>
+                  </arguments>
+                  <async>true</async>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
   </profiles>
 
   <build>
@@ -424,42 +493,42 @@
         <plugin>
           <groupId>com.google.cloud.tools</groupId>
           <artifactId>jib-maven-plugin</artifactId>
-          <version>3.4.6</version>
+          <version>3.5.2</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>
-          <version>3.5.5</version>
-        </plugin>
-        <plugin>
-          <groupId>org.apache.maven.plugins</groupId>
-          <artifactId>maven-failsafe-plugin</artifactId>
-          <version>3.5.4</version>
-        </plugin>
-        <plugin>
-          <groupId>org.apache.maven.plugins</groupId>
-          <artifactId>maven-jar-plugin</artifactId>
-          <version>3.5.0</version>
-        </plugin>
-        <plugin>
-          <groupId>org.apache.maven.plugins</groupId>
-          <artifactId>maven-shade-plugin</artifactId>
           <version>3.6.1</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-failsafe-plugin</artifactId>
+          <version>3.6.1</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-jar-plugin</artifactId>
+          <version>3.5.1</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-shade-plugin</artifactId>
+          <version>3.6.2</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-assembly-plugin</artifactId>
-          <version>3.7.1</version>
+          <version>3.8.0</version>
         </plugin>
         <plugin>
           <groupId>org.codehaus.mojo</groupId>
           <artifactId>exec-maven-plugin</artifactId>
-          <version>3.6.3</version>
+          <version>3.7.0</version>
         </plugin>
         <plugin>
           <groupId>org.codehaus.mojo</groupId>
           <artifactId>properties-maven-plugin</artifactId>
-          <version>1.2.1</version>
+          <version>1.4.0</version>
         </plugin>
       </plugins>
     </pluginManagement>
@@ -471,7 +540,7 @@
         <version>0.6.1</version>
         <configuration>
           <checkStaleness>false</checkStaleness>
-          <protocArtifact>com.google.protobuf:protoc:${protoc.version}:exe:${os.detected.classifier}</protocArtifact>
+          <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
           <pluginId>grpc-java</pluginId>
           <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
 
@@ -500,16 +569,16 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.15.0</version>
+        <version>3.16.0</version>
         <configuration>
-          <release>25</release>
+          <release>27</release>
         </configuration>
       </plugin>
 
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-jar-plugin</artifactId>
-        <version>3.5.0</version>
+        <version>3.5.1</version>
         <configuration>
           <archive>
             <manifest>
@@ -522,7 +591,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
-        <version>3.10.0</version>
+        <version>3.11.0</version>
         <executions>
           <execution>
             <!--
@@ -542,7 +611,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-enforcer-plugin</artifactId>
-        <version>3.6.2</version>
+        <version>3.7.0</version>
         <executions>
           <execution>
             <goals>
@@ -563,7 +632,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-install-plugin</artifactId>
-        <version>3.1.4</version>
+        <version>3.2.0</version>
         <configuration>
           <skip>true</skip>
         </configuration>
@@ -572,7 +641,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-deploy-plugin</artifactId>
-        <version>3.1.4</version>
+        <version>3.2.0</version>
         <configuration>
           <skip>true</skip>
         </configuration>

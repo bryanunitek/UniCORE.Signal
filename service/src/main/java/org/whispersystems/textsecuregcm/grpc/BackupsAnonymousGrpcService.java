@@ -8,6 +8,8 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Empty;
 import java.util.Optional;
 import java.util.concurrent.Flow;
+import io.micrometer.core.instrument.Tag;
+import org.signal.chat.backup.BackupStreamClosed;
 import org.signal.chat.backup.CopyMediaRequest;
 import org.signal.chat.backup.CopyMediaResponse;
 import org.signal.chat.backup.DeleteAllRequest;
@@ -223,20 +225,21 @@ public class BackupsAnonymousGrpcService extends SimpleBackupsAnonymousGrpc.Back
       copyQuota = backupManager.getCopyQuota(backupUser,
           request.getItemsList().stream().map(item -> new CopyParameters(
               item.getSourceAttachmentCdn(), item.getSourceKey(),
-              // uint32 in proto, make sure it fits in a signed int
-              fromUnsignedExact(item.getObjectLength()),
+              item.getObjectLength(),
               new MediaEncryptionParameters(item.getEncryptionKey().toByteArray(), item.getHmacKey().toByteArray()),
               item.getMediaId().toByteArray())).toList(), maxAttachmentSize);
     } catch (BackupFailedZkAuthenticationException e) {
-      return JdkFlowAdapter.publisherToFlowPublisher(Mono.just(CopyMediaResponse
-          .newBuilder()
-          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()))
-          .build()));
+      return JdkFlowAdapter.publisherToFlowPublisher(
+          Mono.error(GrpcExceptions.streamClosed(BackupStreamClosed.newBuilder()
+              .setFailedAuthentication(FailedZkAuthentication.newBuilder()
+                  .setDescription(e.getMessage())
+                  .build())
+              .build())));
     }
+
+    final Tag platformTag = UserAgentTagUtil.getPlatformTag(RequestAttributesUtil.getUserAgent().orElse(null));
     return JdkFlowAdapter.publisherToFlowPublisher(backupManager.copyToBackup(copyQuota)
-        .doOnNext(result -> backupMetrics.updateCopyCounter(
-            result,
-            UserAgentTagUtil.getPlatformTag(RequestAttributesUtil.getUserAgent().orElse(null))))
+        .doOnNext(result -> backupMetrics.updateCopyCounter(result, platformTag))
         .map(copyResult -> {
           CopyMediaResponse.Builder builder = CopyMediaResponse
               .newBuilder()
@@ -262,7 +265,7 @@ public class BackupsAnonymousGrpcService extends SimpleBackupsAnonymousGrpc.Back
       final BackupManager.ListMediaResult listResult = backupManager.list(
           backupUser,
           request.hasCursor() ? Optional.of(request.getCursor()) : Optional.empty(),
-          request.getLimit());
+          request.hasLimit() ? Optional.of(request.getLimit()) : Optional.empty());
       final ListMediaResponse.ListResult.Builder builder = ListMediaResponse.ListResult.newBuilder();
       for (BackupManager.StorageDescriptorWithLength sd : listResult.media()) {
         builder.addPage(ListMediaResponse.ListEntry.newBuilder()
@@ -308,10 +311,12 @@ public class BackupsAnonymousGrpcService extends SimpleBackupsAnonymousGrpc.Back
           .map(item -> new BackupManager.StorageDescriptor(item.getCdn(), item.getMediaId().toByteArray()))
           .toList());
     } catch (BackupFailedZkAuthenticationException e) {
-      return JdkFlowAdapter.publisherToFlowPublisher(Mono.just(DeleteMediaResponse
-          .newBuilder()
-          .setFailedAuthentication(FailedZkAuthentication.newBuilder().setDescription(e.getMessage()))
-          .build()));
+      return JdkFlowAdapter.publisherToFlowPublisher(
+          Mono.error(GrpcExceptions.streamClosed(BackupStreamClosed.newBuilder()
+              .setFailedAuthentication(FailedZkAuthentication.newBuilder()
+                  .setDescription(e.getMessage())
+                  .build())
+              .build())));
     }
     return JdkFlowAdapter.publisherToFlowPublisher(deleteItems
         .map(storageDescriptor -> DeleteMediaResponse.newBuilder()
@@ -344,17 +349,6 @@ public class BackupsAnonymousGrpcService extends SimpleBackupsAnonymousGrpc.Back
     } catch (InvalidInputException e) {
       throw GrpcExceptions.badAuthentication("Could not deserialize presentation");
     }
-  }
-
-  /**
-   * Convert an int from a proto uint32 to a signed positive integer, throwing if the value exceeds
-   * {@link Integer#MAX_VALUE}. To convert to a long, see {@link Integer#toUnsignedLong(int)}
-   */
-  private static int fromUnsignedExact(final int i) {
-    if (i < 0) {
-      throw GrpcExceptions.invalidArguments("integer length too large");
-    }
-    return i;
   }
 
   private interface Deserializer<T> {

@@ -47,6 +47,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
+import org.glassfish.jersey.server.ManagedAsync;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.BasicAuthorizationHeader;
 import org.whispersystems.textsecuregcm.auth.ChangesLinkedDevices;
@@ -62,7 +63,6 @@ import org.whispersystems.textsecuregcm.entities.RemoteAttachment;
 import org.whispersystems.textsecuregcm.entities.RemoteAttachmentError;
 import org.whispersystems.textsecuregcm.entities.RestoreAccountRequest;
 import org.whispersystems.textsecuregcm.entities.TransferArchiveUploadedRequest;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.limits.RateLimitedByIp;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.metrics.DevicePlatformUtil;
@@ -72,6 +72,8 @@ import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
+import org.whispersystems.textsecuregcm.storage.DeviceIdentityInfo;
+import org.whispersystems.textsecuregcm.storage.DeviceLimitExceededException;
 import org.whispersystems.textsecuregcm.storage.DeviceSpec;
 import org.whispersystems.textsecuregcm.storage.LinkDeviceTokenAlreadyUsedException;
 import org.whispersystems.textsecuregcm.storage.PersistentTimer;
@@ -87,8 +89,6 @@ import org.whispersystems.textsecuregcm.util.ua.UserAgentUtil;
 @Path("/v1/devices")
 @Tag(name = "Devices")
 public class DeviceController {
-
-  static final int MAX_DEVICES = 6;
 
   private final AccountsManager accounts;
   private final RateLimiters rateLimiters;
@@ -136,6 +136,7 @@ public class DeviceController {
 
   @GET
   @Produces(MediaType.APPLICATION_JSON)
+  @ManagedAsync
   public DeviceInfoList getDevices(@Auth AuthenticatedDevice auth) {
     // Devices may change their own names (and primary devices may change the names of linked devices) and so the device
     // state associated with the authenticated account may be stale. Fetch a fresh copy to compensate.
@@ -150,6 +151,7 @@ public class DeviceController {
   @Produces(MediaType.APPLICATION_JSON)
   @Path("/{device_id}")
   @ChangesLinkedDevices
+  @ManagedAsync
   public void removeDevice(@Auth AuthenticatedDevice auth, @PathParam("device_id") byte deviceId) {
     if (auth.deviceId() != Device.PRIMARY_ID && auth.deviceId() != deviceId) {
       throw new WebApplicationException(Response.Status.UNAUTHORIZED);
@@ -190,23 +192,20 @@ public class DeviceController {
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+  @ManagedAsync
   public LinkDeviceToken createDeviceToken(@Auth AuthenticatedDevice auth)
       throws RateLimitExceededException, DeviceLimitExceededException {
 
     final Account account = accounts.getByAccountIdentifier(auth.accountIdentifier())
         .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
-    rateLimiters.getAllocateDeviceLimiter().validate(account.getUuid());
-
-    if (account.getDevices().size() >= MAX_DEVICES) {
-      throw new DeviceLimitExceededException(account.getDevices().size(), MAX_DEVICES);
-    }
+    rateLimiters.getAllocateDeviceLimiter().validate(account.getAccountIdentifier());
 
     if (auth.deviceId() != Device.PRIMARY_ID) {
       throw new WebApplicationException(Response.Status.UNAUTHORIZED);
     }
 
-    final String token = accounts.generateLinkDeviceToken(account.getUuid());
+    final String token = accounts.generateLinkDeviceToken(account);
 
     return new LinkDeviceToken(token, AccountsManager.getLinkDeviceTokenIdentifier(token));
   }
@@ -222,17 +221,17 @@ public class DeviceController {
           """)
   @ApiResponse(responseCode = "200", description = "The new device was linked to the calling account", useReturnTypeSchema = true)
   @ApiResponse(responseCode = "403", description = "The given account was not found or the given verification code was incorrect")
-  @ApiResponse(responseCode = "409", description = "The new device is missing a capability supported by all other devices on the account")
+  @ApiResponse(responseCode = "409", description = "The new device is missing a capability required for the account")
   @ApiResponse(responseCode = "411", description = "The given account already has its maximum number of linked devices")
   @ApiResponse(responseCode = "422", description = "The request did not pass validation")
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
       description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+  @ManagedAsync
   public LinkDeviceResponse linkDevice(@HeaderParam(HttpHeaders.AUTHORIZATION) @NotNull BasicAuthorizationHeader authorizationHeader,
       @HeaderParam(HttpHeaders.USER_AGENT) @Nullable String userAgent,
       @NotNull @Valid LinkDeviceRequest linkDeviceRequest)
       throws RateLimitExceededException, DeviceLimitExceededException {
-
     final Account account = accounts.checkDeviceLinkingToken(linkDeviceRequest.verificationCode())
         .flatMap(accounts::getByAccountIdentifier)
         .orElseThrow(ForbiddenException::new);
@@ -240,24 +239,36 @@ public class DeviceController {
     final DeviceActivationRequest deviceActivationRequest = linkDeviceRequest.deviceActivationRequest();
     final DeviceAttributes deviceAttributes = linkDeviceRequest.deviceAttributes();
 
-    rateLimiters.getVerifyDeviceLimiter().validate(account.getUuid());
+    rateLimiters.getVerifyDeviceLimiter().validate(account.getAccountIdentifier());
+
+    // Check the optional-phone-number capability before checking PNI keys, so we can give a better error code (since an
+    // older device will improperly supply PNI keys for a PNI-less account)
+    if (account.getPhoneNumberIdentifier().isEmpty() &&
+        !linkDeviceRequest.deviceAttributes().capabilities().contains(DeviceCapability.OPTIONAL_PHONE_NUMBER)) {
+      throw new WebApplicationException("Missing required device capability", 409);
+    }
 
     final boolean allKeysValid =
-        PreKeySignatureValidator.validatePreKeySignatures(account.getIdentityKey(IdentityType.ACI),
-            List.of(deviceActivationRequest.aciSignedPreKey(), deviceActivationRequest.aciPqLastResortPreKey()),
-            userAgent,
-            "link-device")
-            && PreKeySignatureValidator.validatePreKeySignatures(account.getIdentityKey(IdentityType.PNI),
-            List.of(deviceActivationRequest.pniSignedPreKey(), deviceActivationRequest.pniPqLastResortPreKey()),
-            userAgent,
-            "link-device");
+      PreKeySignatureValidator
+          .validatePreKeySignatures(account.getAccountIdentityKey(),
+              List.of(deviceActivationRequest.aciSignedPreKey(), deviceActivationRequest.aciPqLastResortPreKey()),
+              userAgent,
+              "link-device")
+          && account.getPhoneNumberIdentityKey()
+                .map(pniIdentityKey ->
+                  deviceActivationRequest.pniSignedPreKey().isPresent()
+                      && deviceActivationRequest.pniPqLastResortPreKey().isPresent()
+                      && PreKeySignatureValidator.validatePreKeySignatures(
+                          pniIdentityKey,
+                          List.of(deviceActivationRequest.pniSignedPreKey().get(), deviceActivationRequest.pniPqLastResortPreKey().get()),
+                          userAgent,
+                          "link-device"))
+              .orElse(
+                  deviceActivationRequest.pniSignedPreKey().isEmpty()
+                      && deviceActivationRequest.pniPqLastResortPreKey().isEmpty());
 
     if (!allKeysValid) {
       throw new WebApplicationException(Response.status(422).build());
-    }
-
-    if (account.getDevices().size() >= MAX_DEVICES) {
-      throw new DeviceLimitExceededException(account.getDevices().size(), MAX_DEVICES);
     }
 
     final Set<DeviceCapability> capabilities = deviceAttributes.capabilities();
@@ -279,25 +290,28 @@ public class DeviceController {
     }
 
     try {
-      final Pair<Account, Device> accountAndDevice = accounts.addDevice(account.getIdentifier(IdentityType.ACI),
+      final Pair<Account, Device> accountAndDevice = accounts.addDevice(account.getAccountIdentifier(),
           new DeviceSpec(deviceAttributes.name(),
               authorizationHeader.getPassword(),
               signalAgent,
               capabilities,
-              deviceAttributes.registrationId(),
-              deviceAttributes.phoneNumberIdentityRegistrationId(),
+              new DeviceIdentityInfo(
+                  deviceAttributes.registrationId(),
+                  deviceActivationRequest.aciSignedPreKey(),
+                  deviceActivationRequest.aciPqLastResortPreKey()),
+              account.getPhoneNumberIdentityKey().map(_ ->
+                  new DeviceIdentityInfo(
+                      deviceAttributes.phoneNumberIdentityRegistrationId(),
+                      deviceActivationRequest.pniSignedPreKey().get(),
+                      deviceActivationRequest.pniPqLastResortPreKey().get())),
               deviceAttributes.fetchesMessages(),
               deviceActivationRequest.apnToken(),
-              deviceActivationRequest.gcmToken(),
-              deviceActivationRequest.aciSignedPreKey(),
-              deviceActivationRequest.pniSignedPreKey(),
-              deviceActivationRequest.aciPqLastResortPreKey(),
-              deviceActivationRequest.pniPqLastResortPreKey()),
+              deviceActivationRequest.gcmToken()),
           linkDeviceRequest.verificationCode());
 
       return new LinkDeviceResponse(
-          accountAndDevice.first().getIdentifier(IdentityType.ACI),
-          accountAndDevice.first().getIdentifier(IdentityType.PNI),
+          accountAndDevice.first().getAccountIdentifier(),
+          accountAndDevice.first().getPhoneNumberIdentifier(),
           accountAndDevice.second().getId());
     } catch (final LinkDeviceTokenAlreadyUsedException e) {
       throw new ForbiddenException();
@@ -382,6 +396,7 @@ public class DeviceController {
   @PUT
   @Produces(MediaType.APPLICATION_JSON)
   @Path("/capabilities")
+  @ManagedAsync
   public void setCapabilities(@Auth final AuthenticatedDevice auth, @NotNull final Map<String, Boolean> capabilities) {
     accounts.updateDevice(auth.accountIdentifier(), auth.deviceId(),
         d -> d.setCapabilities(DeviceCapabilityAdapter.mapToSet(capabilities)));

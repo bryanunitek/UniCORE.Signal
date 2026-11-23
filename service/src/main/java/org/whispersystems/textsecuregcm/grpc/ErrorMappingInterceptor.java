@@ -5,6 +5,7 @@
 
 package org.whispersystems.textsecuregcm.grpc;
 
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.grpc.ForwardingServerCall;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
@@ -12,11 +13,14 @@ import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.whispersystems.textsecuregcm.util.ExceptionUtils;
+import io.lettuce.core.RedisException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.whispersystems.textsecuregcm.storage.AccountNotFoundException;
+import org.whispersystems.textsecuregcm.util.ExceptionUtils;
+import org.whispersystems.textsecuregcm.util.logging.ImpossibleEvents;
 
 /**
  * This interceptor observes responses from the service and if the response status is {@link Status#UNKNOWN}
@@ -51,13 +55,25 @@ public class ErrorMappingInterceptor implements ServerInterceptor {
 
         final StatusRuntimeException statusException = switch (cause) {
           case ConvertibleToGrpcStatus e -> e.toStatusRuntimeException();
+          case AccountNotFoundException _ -> GrpcExceptions.invalidCredentials("invalid credentials");
           case UncheckedIOException e -> {
             log.warn("RPC {} encountered UncheckedIOException", call.getMethodDescriptor().getFullMethodName(), e.getCause());
-            yield GrpcExceptions.unavailable(e.getCause().getMessage());
+            yield GrpcExceptions.unavailable();
           }
           case IOException e -> {
             log.warn("RPC {} encountered IOException", call.getMethodDescriptor().getFullMethodName(), e);
-            yield GrpcExceptions.unavailable(e.getMessage());
+            yield GrpcExceptions.unavailable();
+          }
+          case IllegalStateException e -> {
+            ImpossibleEvents.logImpossible(log, e.getMessage(), e);
+            yield GrpcExceptions.unavailable();
+          }
+          case CallNotPermittedException _ -> GrpcExceptions.unavailable();
+          case RedisException e -> {
+            if (!ExceptionUtils.isBreakerOpen(e)) {
+              log.warn("RPC {} encountered RedisException", call.getMethodDescriptor().getFullMethodName(), e);
+            }
+            yield GrpcExceptions.unavailable();
           }
           case null -> {
             log.error("RPC {} finished with status UNKNOWN: {}",
@@ -66,8 +82,8 @@ public class ErrorMappingInterceptor implements ServerInterceptor {
           }
           default -> {
             log.error("RPC {} finished with status UNKNOWN",
-                call.getMethodDescriptor().getFullMethodName(), status.getCause());
-            yield GrpcExceptions.unavailable(status.getCause().getMessage());
+                call.getMethodDescriptor().getFullMethodName(), cause);
+            yield GrpcExceptions.unavailable();
           }
         };
         super.close(statusException.getStatus(), statusException.getTrailers());

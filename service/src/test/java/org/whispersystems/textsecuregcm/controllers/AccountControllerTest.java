@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyByte;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
@@ -45,6 +46,8 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
 import java.util.stream.Stream;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.glassfish.jersey.server.ServerProperties;
 import org.glassfish.jersey.test.grizzly.GrizzlyWebTestContainerFactory;
 import org.junit.jupiter.api.AfterEach;
@@ -57,6 +60,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.signal.libsignal.usernames.BaseUsernameException;
+import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.SaltedTokenHash;
 import org.whispersystems.textsecuregcm.auth.StoredRegistrationLock;
@@ -88,7 +92,7 @@ import org.whispersystems.textsecuregcm.storage.AccountBadge;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.DeviceCapability;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.UsernameHashNotAvailableException;
 import org.whispersystems.textsecuregcm.storage.UsernameReservationNotFoundException;
 import org.whispersystems.textsecuregcm.tests.util.AccountsHelper;
@@ -98,6 +102,7 @@ import org.whispersystems.textsecuregcm.util.SystemMapper;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import org.whispersystems.textsecuregcm.util.TestRemoteAddressFilterProvider;
 import org.whispersystems.textsecuregcm.util.UsernameHashZkProofVerifier;
+import software.amazon.awssdk.services.dynamodb.model.TransactWriteItem;
 
 @ExtendWith(DropwizardExtensionsSupport.class)
 class AccountControllerTest {
@@ -133,8 +138,8 @@ class AccountControllerTest {
   private static final Account senderRegLockAccount = mock(Account.class);
   private static final Account senderHasStorage = mock(Account.class);
   private static final Account senderTransfer = mock(Account.class);
-  private static final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager =
-      mock(RegistrationRecoveryPasswordsManager.class);
+  private static final PhoneNumberRecoveryPasswordsManager PHONE_NUMBER_RECOVERY_PASSWORDS_MANAGER =
+      mock(PhoneNumberRecoveryPasswordsManager.class);
   private static final UsernameHashZkProofVerifier usernameZkProofVerifier = mock(UsernameHashZkProofVerifier.class);
 
   private final byte[] registration_lock_key = new byte[32];
@@ -157,7 +162,7 @@ class AccountControllerTest {
       .addResource(new AccountController(
               accountsManager,
           rateLimiters,
-          registrationRecoveryPasswordsManager,
+          PHONE_NUMBER_RECOVERY_PASSWORDS_MANAGER,
           usernameZkProofVerifier
       ))
       .build();
@@ -185,7 +190,7 @@ class AccountControllerTest {
     when(senderPinAccount.getRegistrationLock()).thenReturn(
         new StoredRegistrationLock(Optional.empty(), Optional.empty(), Instant.ofEpochMilli(System.currentTimeMillis())));
 
-    when(senderHasStorage.getUuid()).thenReturn(UUID.randomUUID());
+    when(senderHasStorage.getAccountIdentifier()).thenReturn(UUID.randomUUID());
     when(senderHasStorage.hasCapability(DeviceCapability.STORAGE)).thenReturn(true);
     when(senderHasStorage.getRegistrationLock()).thenReturn(
         new StoredRegistrationLock(Optional.empty(), Optional.empty(), Instant.ofEpochMilli(System.currentTimeMillis())));
@@ -194,13 +199,13 @@ class AccountControllerTest {
         new StoredRegistrationLock(Optional.of(registrationLockCredentials.hash()),
             Optional.of(registrationLockCredentials.salt()), Instant.ofEpochMilli(System.currentTimeMillis())));
     when(senderRegLockAccount.getLastSeen()).thenReturn(System.currentTimeMillis());
-    when(senderRegLockAccount.getUuid()).thenReturn(SENDER_REG_LOCK_UUID);
-    when(senderRegLockAccount.getNumber()).thenReturn(SENDER_REG_LOCK);
+    when(senderRegLockAccount.getAccountIdentifier()).thenReturn(SENDER_REG_LOCK_UUID);
+    when(senderRegLockAccount.getNumber()).thenReturn(Optional.of(SENDER_REG_LOCK));
 
     when(senderTransfer.getRegistrationLock()).thenReturn(
         new StoredRegistrationLock(Optional.empty(), Optional.empty(), Instant.ofEpochMilli(System.currentTimeMillis())));
-    when(senderTransfer.getUuid()).thenReturn(SENDER_TRANSFER_UUID);
-    when(senderTransfer.getNumber()).thenReturn(SENDER_TRANSFER);
+    when(senderTransfer.getAccountIdentifier()).thenReturn(SENDER_TRANSFER_UUID);
+    when(senderTransfer.getNumber()).thenReturn(Optional.of(SENDER_TRANSFER));
 
     when(accountsManager.getByE164(eq(SENDER_PIN))).thenReturn(Optional.of(senderPinAccount));
     when(accountsManager.getByE164(eq(SENDER_REG_LOCK))).thenReturn(Optional.of(senderRegLockAccount));
@@ -214,6 +219,7 @@ class AccountControllerTest {
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT));
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID_TWO)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT_TWO));
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID_3)).thenReturn(Optional.of(AuthHelper.VALID_ACCOUNT_3));
+    when(accountsManager.getByAccountIdentifier(AuthHelper.NUMBERLESS_UUID)).thenReturn(Optional.of(AuthHelper.NUMBERLESS_ACCOUNT));
     when(accountsManager.getByAccountIdentifier(AuthHelper.UNDISCOVERABLE_UUID)).thenReturn(Optional.of(AuthHelper.UNDISCOVERABLE_ACCOUNT));
 
     doAnswer(invocation -> {
@@ -226,6 +232,9 @@ class AccountControllerTest {
 
       return null;
     }).when(usernameZkProofVerifier).verifyProof(any(), any());
+
+    when(PHONE_NUMBER_RECOVERY_PASSWORDS_MANAGER.buildTransactWriteItemForStorePassword(any(), any(byte[].class)))
+        .thenReturn(TransactWriteItem.builder().build());
   }
 
   @AfterEach
@@ -265,6 +274,19 @@ class AccountControllerTest {
       assertThat(pinSaltCapture.getValue()).isNotEmpty();
 
       assertThat(pinCapture.getValue().length()).isEqualTo(66);
+    }
+  }
+
+  @Test
+  void testSetRegistrationLockAccountHasNoNumber() {
+    doThrow(new IllegalArgumentException()).when(AuthHelper.NUMBERLESS_ACCOUNT).setRegistrationLock(any(), any());
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/registration_lock/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.NUMBERLESS_UUID, AuthHelper.NUMBERLESS_PASSWORD))
+        .put(Entity.json(new RegistrationLock("1234567890123456789012345678901234567890123456789012345678901234")))) {
+
+      assertThat(response.getStatus()).isEqualTo(400);
     }
   }
 
@@ -310,6 +332,20 @@ class AccountControllerTest {
   }
 
   @Test
+  void testSetGcmIdExcessiveLength() {
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/gcm/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION,
+            AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_3, AuthHelper.VALID_PASSWORD_3_PRIMARY))
+        .put(Entity.json(new GcmRegistrationId(RandomStringUtils.insecure().nextAlphanumeric(2048))))) {
+
+      assertThat(response.getStatus()).isEqualTo(422);
+      verify(accountsManager, never()).updateDevice(any(), anyByte(), any());
+    }
+  }
+
+  @Test
   void testSetApnId() {
     try (final Response response = resources.getJerseyTest()
         .target("/v1/accounts/apn/")
@@ -322,6 +358,20 @@ class AccountControllerTest {
 
       verify(AuthHelper.VALID_DEVICE_3_PRIMARY, times(1)).setApnId(eq("first"));
       verify(accountsManager, times(1)).updateDevice(eq(AuthHelper.VALID_UUID_3), anyByte(), any());
+    }
+  }
+
+  @Test
+  void testSetApnIdExcessiveLength() {
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/apn/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION,
+            AuthHelper.getAuthHeader(AuthHelper.VALID_UUID_3, AuthHelper.VALID_PASSWORD_3_PRIMARY))
+        .put(Entity.json(new ApnRegistrationId(RandomStringUtils.insecure().nextAlphanumeric(2048))))) {
+
+      assertThat(response.getStatus()).isEqualTo(422);
+      verify(accountsManager, never()).updateDevice(any(), anyByte(), any());
     }
   }
 
@@ -356,6 +406,27 @@ class AccountControllerTest {
 
       assertThat(identityResponse.entitlements().backup().backupLevel()).isEqualTo(100);
       assertThat(identityResponse.entitlements().backup().expiration()).isEqualTo(truncatedExpiration);
+
+      assertThat(identityResponse.number()).hasValue(AuthHelper.VALID_NUMBER);
+      assertThat(identityResponse.pni()).hasValue(AuthHelper.VALID_PNI);
+    }
+  }
+
+  @Test
+  void testWhoAmINoPhoneNumber() {
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/whoami")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.NUMBERLESS_UUID, AuthHelper.NUMBERLESS_PASSWORD))
+        .get()) {
+
+      assertThat(response.getStatus()).isEqualTo(200);
+      final AccountIdentityResponse identityResponse = response.readEntity(AccountIdentityResponse.class);
+
+      assertThat(identityResponse.uuid()).isEqualTo(AuthHelper.NUMBERLESS_UUID);
+
+      assertThat(identityResponse.number()).isEmpty();
+      assertThat(identityResponse.pni()).isEmpty();
     }
   }
 
@@ -605,7 +676,7 @@ class AccountControllerTest {
 
   @Test
   void testConfirmUsernameHash()
-      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException {
+      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException, InvalidInputException {
     Account account = mock(Account.class);
     final UUID uuid = UUID.randomUUID();
     when(account.getUsernameHash()).thenReturn(Optional.of(USERNAME_HASH_1));
@@ -622,7 +693,7 @@ class AccountControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
 
       final UsernameHashResponse respEntity = response.readEntity(UsernameHashResponse.class);
-      assertArrayEquals(respEntity.usernameHash(), USERNAME_HASH_1);
+      assertArrayEquals(USERNAME_HASH_1, respEntity.usernameHash());
       assertEquals(respEntity.usernameLinkHandle(), uuid);
       verify(usernameZkProofVerifier).verifyProof(ZK_PROOF, USERNAME_HASH_1);
     }
@@ -643,7 +714,7 @@ class AccountControllerTest {
 
   @Test
   void testConfirmUsernameHashOld()
-      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException {
+      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException, InvalidInputException {
     Account account = mock(Account.class);
     when(account.getUsernameHash()).thenReturn(Optional.of(USERNAME_HASH_1));
     when(account.getUsernameLinkHandle()).thenReturn(null);
@@ -659,7 +730,7 @@ class AccountControllerTest {
       assertThat(response.getStatus()).isEqualTo(200);
 
       final UsernameHashResponse respEntity = response.readEntity(UsernameHashResponse.class);
-      assertArrayEquals(respEntity.usernameHash(), USERNAME_HASH_1);
+      assertArrayEquals(USERNAME_HASH_1, respEntity.usernameHash());
       assertNull(respEntity.usernameLinkHandle());
       verify(usernameZkProofVerifier).verifyProof(ZK_PROOF, USERNAME_HASH_1);
     }
@@ -667,7 +738,7 @@ class AccountControllerTest {
 
   @Test
   void testConfirmUnreservedUsernameHash()
-      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException {
+      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException, InvalidInputException {
     when(accountsManager.confirmReservedUsernameHash(any(), eq(USERNAME_HASH_1), any()))
         .thenThrow(new UsernameReservationNotFoundException());
 
@@ -684,7 +755,7 @@ class AccountControllerTest {
 
   @Test
   void testConfirmLapsedUsernameHash()
-      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException {
+      throws BaseUsernameException, UsernameHashNotAvailableException, UsernameReservationNotFoundException, InvalidInputException {
     when(accountsManager.confirmReservedUsernameHash(any(), eq(USERNAME_HASH_1), any()))
         .thenThrow(new UsernameHashNotAvailableException());
 
@@ -735,7 +806,7 @@ class AccountControllerTest {
   }
 
   @Test
-  void testCommitUsernameHashWithInvalidProof() throws BaseUsernameException {
+  void testCommitUsernameHashWithInvalidProof() throws BaseUsernameException, InvalidInputException {
     doThrow(new BaseUsernameException("invalid username")).when(usernameZkProofVerifier).verifyProof(eq(ZK_PROOF), eq(USERNAME_HASH_1));
 
     try (final Response response = resources.getJerseyTest()
@@ -785,7 +856,7 @@ class AccountControllerTest {
         .target("/v1/accounts/attributes/")
         .request()
         .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
-        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null)
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null, null)
             .setUnidentifiedAccessKey(unidentifiedAccessKey)
             .setUnrestrictedUnidentifiedAccess(unrestrictedUnidentifiedAccess)))) {
 
@@ -802,17 +873,42 @@ class AccountControllerTest {
     );
   }
 
-
   @Test
   void testSetAccountAttributesNoDiscoverabilityChange() {
     try (final Response response = resources.getJerseyTest()
         .target("/v1/accounts/attributes/")
         .request()
         .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
-        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null)
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null, null)
             .setUnidentifiedAccessKey(new byte[16])))) {
 
       assertThat(response.getStatus()).isEqualTo(204);
+    }
+  }
+
+  @Test
+  void testSetAccountAttributesDiscoverableWithNoNumber() {
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/attributes/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.NUMBERLESS_UUID, AuthHelper.NUMBERLESS_PASSWORD))
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null, null)
+            .setUnidentifiedAccessKey(new byte[16])))) {
+
+      assertThat(response.getStatus()).isEqualTo(400);
+    }
+  }
+
+  @Test
+  void testSetAccountAttributesRegistrationLockWithNoNumber() {
+    try (final Response response = resources.getJerseyTest()
+        .target("/v1/accounts/attributes/")
+        .request()
+        .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.NUMBERLESS_UUID, AuthHelper.NUMBERLESS_PASSWORD))
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, "1234", false, null, null)
+            .setUnidentifiedAccessKey(new byte[16])))) {
+
+      assertThat(response.getStatus()).isEqualTo(422);
     }
   }
 
@@ -822,27 +918,34 @@ class AccountControllerTest {
         .target("/v1/accounts/attributes/")
         .request()
         .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.UNDISCOVERABLE_UUID, AuthHelper.UNDISCOVERABLE_PASSWORD))
-        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null)
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null, null)
             .setUnidentifiedAccessKey(new byte[16])))) {
 
       assertThat(response.getStatus()).isEqualTo(204);
     }
   }
 
-  @Test
-  void testAccountsAttributesUpdateRecoveryPassword() {
-    final byte[] recoveryPassword = TestRandomUtil.nextBytes(32);
+  static Stream<byte[]> testAccountsAttributesUpdateRecoveryPassword() {
+    return Stream.of(null, new byte[]{}, TestRandomUtil.nextBytes(32));
+  }
 
+  @ParameterizedTest
+  @MethodSource
+  void testAccountsAttributesUpdateRecoveryPassword(final byte[] recoveryPassword) {
     try (final Response response = resources.getJerseyTest()
         .target("/v1/accounts/attributes/")
         .request()
         .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.UNDISCOVERABLE_UUID, AuthHelper.UNDISCOVERABLE_PASSWORD))
-        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null)
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, true, null, null)
             .setUnidentifiedAccessKey(new byte[16])
             .setRecoveryPassword(recoveryPassword)))) {
 
+      final int expectedRrpUpdates = ArrayUtils.isEmpty(recoveryPassword) ? 0 : 1;
+
       assertThat(response.getStatus()).isEqualTo(204);
-      verify(registrationRecoveryPasswordsManager).store(AuthHelper.UNDISCOVERABLE_PNI, recoveryPassword);
+      verify(accountsManager).update(eq(AuthHelper.UNDISCOVERABLE_UUID), any(), argThat(additionWriteItems -> additionWriteItems.size() == expectedRrpUpdates));
+
+      verify(AuthHelper.UNDISCOVERABLE_ACCOUNT, times(expectedRrpUpdates)).setAccountRecoveryPassword(recoveryPassword);
     }
   }
 
@@ -852,7 +955,7 @@ class AccountControllerTest {
         .target("/v1/accounts/attributes/")
         .request()
         .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
-        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, false, null)
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, false, null, null)
             .setUnidentifiedAccessKey(new byte[16])))) {
 
       assertThat(response.getStatus()).isEqualTo(204);
@@ -865,7 +968,7 @@ class AccountControllerTest {
         .target("/v1/accounts/attributes/")
         .request()
         .header(HttpHeaders.AUTHORIZATION, AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
-        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, false, null)
+        .put(Entity.json(new AccountAttributes(false, 2222, 3333, null, null, false, null, null)
             .setUnidentifiedAccessKey(new byte[7])))) {
 
       assertThat(response.getStatus()).isEqualTo(422);
@@ -975,7 +1078,7 @@ class AccountControllerTest {
   void testLookupUsername() {
     final Account account = mock(Account.class);
     final UUID uuid = UUID.randomUUID();
-    when(account.getUuid()).thenReturn(uuid);
+    when(account.getAccountIdentifier()).thenReturn(uuid);
 
     when(accountsManager.getByUsernameHash(any())).thenReturn(CompletableFuture.completedFuture(Optional.of(account)));
     Response response = resources.getJerseyTest()

@@ -6,19 +6,19 @@
 package org.whispersystems.textsecuregcm.grpc;
 
 import com.google.protobuf.ByteString;
+import com.google.protobuf.Empty;
 import java.time.Clock;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
-import com.google.protobuf.Empty;
-import io.grpc.Status;
 import org.signal.chat.errors.FailedUnidentifiedAuthorization;
 import org.signal.chat.errors.NotFound;
 import org.signal.chat.messages.IndividualRecipientMessageBundle;
-import org.signal.chat.messages.SendMessageType;
 import org.signal.chat.messages.MultiRecipientMismatchedDevices;
 import org.signal.chat.messages.MultiRecipientSuccess;
 import org.signal.chat.messages.SendMessageResponse;
+import org.signal.chat.messages.SendMessageType;
 import org.signal.chat.messages.SendMultiRecipientMessageRequest;
 import org.signal.chat.messages.SendMultiRecipientMessageResponse;
 import org.signal.chat.messages.SendMultiRecipientStoryRequest;
@@ -85,16 +85,17 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
       throws RateLimitExceededException {
 
     final ServiceIdentifier destinationServiceIdentifier =
-        ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getDestination());
+        GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getDestination());
+
+    if (destinationServiceIdentifier.identityType() == IdentityType.PNI
+        && request.getAuthorizationCase() != SendSealedSenderMessageRequest.AuthorizationCase.GROUP_SEND_TOKEN) {
+      throw GrpcExceptions.fieldViolation("authorization", "group send token is required for PNI destinations");
+    }
 
     final Optional<Account> maybeDestination = accountsManager.getByServiceIdentifier(destinationServiceIdentifier);
 
     final boolean authorized = switch (request.getAuthorizationCase()) {
       case UNIDENTIFIED_ACCESS_KEY -> {
-        if (destinationServiceIdentifier.identityType() == IdentityType.PNI) {
-          throw GrpcExceptions.fieldViolation("authorization",
-              "message for PNI cannot be authenticated with an unidentified access token");
-        }
         final byte[] uak = request.getUnidentifiedAccessKey().toByteArray();
         yield maybeDestination
             .map(account -> UnidentifiedAccessUtil.checkUnidentifiedAccess(account, uak))
@@ -105,7 +106,7 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
       case GROUP_SEND_TOKEN ->
           groupSendTokenUtil.checkGroupSendToken(request.getGroupSendToken(), destinationServiceIdentifier);
       case UNRESTRICTED_ACCESS ->
-        maybeDestination.map(account -> account.isUnrestrictedUnidentifiedAccess()).orElse(false);
+          maybeDestination.map(Account::isUnrestrictedUnidentifiedAccess).orElse(false);
       case AUTHORIZATION_NOT_SET ->
           throw GrpcExceptions.fieldViolation("authorization", "expected authorization token not provided");
     };
@@ -119,7 +120,7 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
     if (maybeDestination.isEmpty()) {
       return SendMessageResponse.newBuilder().setDestinationNotFound(NotFound.getDefaultInstance()).build();
     }
-    
+
     return sendIndividualMessage(maybeDestination.get(),
         destinationServiceIdentifier,
         request.getMessages(),
@@ -133,7 +134,7 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
       throws RateLimitExceededException {
 
     final ServiceIdentifier destinationServiceIdentifier =
-        ServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getDestination());
+        GrpcServiceIdentifierUtil.fromGrpcServiceIdentifier(request.getDestination());
 
     final Optional<Account> maybeDestination = accountsManager.getByServiceIdentifier(destinationServiceIdentifier);
 
@@ -144,7 +145,7 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
 
     final Account destination = maybeDestination.get();
 
-    rateLimiters.getStoriesLimiter().validate(destination.getIdentifier(IdentityType.ACI));
+    rateLimiters.getStoriesLimiter().validate(destination.getAccountIdentifier());
 
     return sendIndividualMessage(destination,
         destinationServiceIdentifier,
@@ -169,7 +170,7 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
             destinationServiceIdentifier);
 
     spamCheckResult.response().ifPresent(grpcResponse ->
-      grpcResponse.throwStatusOr(_ -> GrpcExceptions.rateLimitExceeded(null)));
+        grpcResponse.throwStatusOr(_ -> GrpcExceptions.rateLimitExceeded(null)));
 
     try {
       final int totalPayloadLength = messages.getMessagesMap().values().stream()
@@ -194,7 +195,7 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
                   .setType(MessageProtos.Envelope.Type.UNIDENTIFIED_SENDER)
                   .setClientTimestamp(messages.getTimestamp())
                   .setServerTimestamp(clock.millis())
-                  .setDestinationServiceId(destinationServiceIdentifier.toServiceIdentifierString())
+                  .setDestinationServiceId(destinationServiceIdentifier.toCompactByteString())
                   .setEphemeral(ephemeral)
                   .setUrgent(urgent)
                   .setContent(entry.getValue().getPayload());
@@ -298,6 +299,16 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
     final Map<SealedSenderMultiRecipientMessage.Recipient, Account> resolvedRecipients =
         MessageUtil.resolveRecipients(accountsManager, multiRecipientMessage);
 
+    if (story) {
+      CompletableFuture.allOf(resolvedRecipients.values()
+              .stream()
+              .map(Account::getAccountIdentifier)
+              .map(accountIdentifier ->
+                  rateLimiters.getStoriesLimiter().validateAsync(accountIdentifier).toCompletableFuture())
+              .toArray(CompletableFuture[]::new))
+          .join();
+    }
+
     try {
       if (!resolvedRecipients.isEmpty()) {
         messageSender.sendMultiRecipientMessage(multiRecipientMessage,
@@ -313,7 +324,7 @@ public class MessagesAnonymousGrpcService extends SimpleMessagesAnonymousGrpc.Me
       final MultiRecipientSuccess.Builder responseBuilder = MultiRecipientSuccess.newBuilder();
 
       MessageUtil.getUnresolvedRecipients(multiRecipientMessage, resolvedRecipients).stream()
-          .map(ServiceIdentifierUtil::toGrpcServiceIdentifier)
+          .map(GrpcServiceIdentifierUtil::toGrpcServiceIdentifier)
           .forEach(responseBuilder::addUnresolvedRecipients);
 
       return SendMultiRecipientMessageResponse.newBuilder().setSuccess(responseBuilder).build();

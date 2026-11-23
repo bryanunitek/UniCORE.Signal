@@ -8,10 +8,8 @@ package org.whispersystems.textsecuregcm.metrics;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import io.micrometer.core.instrument.Metrics;
-import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import net.logstash.logback.marker.Markers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
@@ -35,20 +33,24 @@ public class ReportedMessageMetricsListener implements ReportedMessageListener {
   }
 
   @Override
-  public void handleMessageReported(final String sourceNumber, final UUID messageGuid, final UUID reporterUuid,
-      final Optional<byte[]> reportSpamToken) {
+  public void handleMessageReported(final Optional<String> sourceNumber, final UUID messageGuid, final UUID reporterUuid,
+      final Optional<byte[]> reportSpamToken, final boolean sourceAccountDeleted) {
 
-    final String sourceCountryCode = Util.getCountryCode(sourceNumber);
+    if (sourceNumber.isEmpty() && sourceAccountDeleted) {
+      return;
+    }
+
+    final String sourceCountryCode = sourceNumber.map(Util::getCountryCode).orElse(Util.COUNTRY_CODE_NOT_APPLICABLE);
 
     Metrics.counter(REPORTED_COUNTER_NAME, COUNTRY_CODE_TAG_NAME, sourceCountryCode).increment();
 
     accountsManager.getByAccountIdentifier(reporterUuid).ifPresent(reporter -> {
-      final String destinationCountryCode = Util.getCountryCode(reporter.getNumber());
+      final String destinationCountryCode = Util.getCountryCode(reporter);
 
-      logger.info(Markers.appendEntries(Map.of(
-              "sourceCountry", sourceCountryCode,
-              "destinationCountry", destinationCountryCode)),
-          "Message reported");
+      logger.atInfo()
+          .addKeyValue("sourceCountry", sourceCountryCode)
+          .addKeyValue("destinationCountry", destinationCountryCode)
+          .log("Message reported");
 
       Metrics.counter(REPORTER_COUNTER_NAME, COUNTRY_CODE_TAG_NAME, destinationCountryCode).increment();
     });

@@ -39,6 +39,11 @@ public class GrpcExceptions {
       .setReason("BAD_AUTHENTICATION")
       .build());
 
+  private static final Any ERROR_INFO_STREAM_CLOSED = Any.pack(ErrorInfo.newBuilder()
+      .setDomain(DOMAIN)
+      .setReason("STREAM_CLOSED")
+      .build());
+
   private static final com.google.rpc.Status UPGRADE_REQUIRED = com.google.rpc.Status.newBuilder()
       .setCode(Status.Code.INVALID_ARGUMENT.value())
       .setMessage("Upgrade required")
@@ -86,20 +91,6 @@ public class GrpcExceptions {
   /// @param message   Additional context about the constraint violation
   /// @return A [StatusRuntimeException] encoding the error
   public static StatusRuntimeException invalidArguments(@Nullable final String message) {
-    return StatusProto.toStatusRuntimeException(com.google.rpc.Status.newBuilder()
-        .setCode(Status.Code.INVALID_ARGUMENT.value())
-        .setMessage(messageOrDefault(message, Status.Code.INVALID_ARGUMENT))
-        .addDetails(ERROR_INFO_CONSTRAINT_VIOLATED)
-        .build());
-  }
-
-  /// The RPC argument violated a constraint that was annotated or documented in the service definition. It is always
-  /// possible to check this constraint without communicating with the chat server. This always represents a client bug
-  /// or out of date client.
-  ///
-  /// @param message   Additional context about the constraint violation
-  /// @return A [StatusRuntimeException] encoding the error
-  public static StatusRuntimeException constraintViolation(@Nullable final String message) {
     return StatusProto.toStatusRuntimeException(com.google.rpc.Status.newBuilder()
         .setCode(Status.Code.INVALID_ARGUMENT.value())
         .setMessage(messageOrDefault(message, Status.Code.INVALID_ARGUMENT))
@@ -156,6 +147,20 @@ public class GrpcExceptions {
           .build()));
     }
     return StatusProto.toStatusRuntimeException(builder.build());
+  }
+
+  /// The server terminated the stream non-successfully for a reason specific to the RPC. The server must provide
+  /// additional information about the stream closure reason via the `streamClosedMessage`.
+  ///
+  /// @param streamClosedMessage The additional domain-specific proto message that indicates the closure reason
+  /// @return A [StatusRuntimeException] encoding the error
+  public static <T extends com.google.protobuf.Message> StatusRuntimeException streamClosed(
+      final T streamClosedMessage) {
+    return StatusProto.toStatusRuntimeException(com.google.rpc.Status.newBuilder()
+        .setCode(Status.Code.ABORTED.value())
+        .addDetails(ERROR_INFO_STREAM_CLOSED)
+        .addDetails(Any.pack(streamClosedMessage))
+        .build());
   }
 
   public static StatusRuntimeException unavailable() {

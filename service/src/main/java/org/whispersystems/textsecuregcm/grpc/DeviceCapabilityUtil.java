@@ -18,8 +18,11 @@ public class DeviceCapabilityUtil {
       case DEVICE_CAPABILITY_TRANSFER -> DeviceCapability.TRANSFER;
       case DEVICE_CAPABILITY_ATTACHMENT_BACKFILL -> DeviceCapability.ATTACHMENT_BACKFILL;
       case DEVICE_CAPABILITY_SPARSE_POST_QUANTUM_RATCHET -> DeviceCapability.SPARSE_POST_QUANTUM_RATCHET;
-      case DEVICE_CAPABILITY_PROFILES_V2 -> DeviceCapability.PROFILES_V2;
       case DEVICE_CAPABILITY_USERNAME_CHANGE_SYNC_MESSAGE ->  DeviceCapability.USERNAME_CHANGE_SYNC_MESSAGE;
+      case DEVICE_CAPABILITY_OPTIONAL_PHONE_NUMBER -> DeviceCapability.OPTIONAL_PHONE_NUMBER;
+      case DEVICE_CAPABILITY_REPLY_PRIVATELY -> DeviceCapability.REPLY_PRIVATELY;
+      case DEVICE_CAPABILITY_CONTACT_DELETE -> DeviceCapability.CONTACT_DELETE;
+      case DEVICE_CAPABILITY_ADMIN_REMOVE_AND_DELETE -> DeviceCapability.ADMIN_REMOVE_AND_DELETE;
       case DEVICE_CAPABILITY_UNSPECIFIED, UNRECOGNIZED ->
           throw GrpcExceptions.invalidArguments("unrecognized device capability");
     };
@@ -31,8 +34,11 @@ public class DeviceCapabilityUtil {
       case TRANSFER -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_TRANSFER;
       case ATTACHMENT_BACKFILL -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_ATTACHMENT_BACKFILL;
       case SPARSE_POST_QUANTUM_RATCHET -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_SPARSE_POST_QUANTUM_RATCHET;
-      case PROFILES_V2 -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_PROFILES_V2;
       case USERNAME_CHANGE_SYNC_MESSAGE -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_USERNAME_CHANGE_SYNC_MESSAGE;
+      case OPTIONAL_PHONE_NUMBER -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_OPTIONAL_PHONE_NUMBER;
+      case REPLY_PRIVATELY -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_REPLY_PRIVATELY;
+      case CONTACT_DELETE -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_CONTACT_DELETE;
+      case ADMIN_REMOVE_AND_DELETE -> org.signal.chat.common.DeviceCapability.DEVICE_CAPABILITY_ADMIN_REMOVE_AND_DELETE;
     };
   }
 }

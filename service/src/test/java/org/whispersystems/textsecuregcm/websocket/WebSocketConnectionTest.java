@@ -7,7 +7,9 @@ package org.whispersystems.textsecuregcm.websocket;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyByte;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.any;
@@ -18,6 +20,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 import static org.whispersystems.textsecuregcm.entities.MessageProtos.Envelope;
 
@@ -41,10 +44,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
-import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
-import org.whispersystems.textsecuregcm.identity.IdentityType;
-import org.whispersystems.textsecuregcm.limits.MessageDeliveryLoopMonitor;
+import org.whispersystems.textsecuregcm.identity.PniServiceIdentifier;
+import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
 import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
@@ -53,9 +55,11 @@ import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
 import org.whispersystems.textsecuregcm.storage.ConflictingMessageConsumerException;
 import org.whispersystems.textsecuregcm.storage.Device;
+import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.MessageStream;
 import org.whispersystems.textsecuregcm.storage.MessageStreamEntry;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import org.whispersystems.websocket.WebSocketClient;
 import org.whispersystems.websocket.messages.WebSocketResponseMessage;
 import reactor.adapter.JdkFlowAdapter;
@@ -93,6 +97,9 @@ class WebSocketConnectionTest {
     messageDeliveryScheduler = Schedulers.newBoundedElastic(10, 10_000, "messageDelivery");
     clientReleaseManager = mock(ClientReleaseManager.class);
 
+    when(messagesManager.hasSuspectedDeliveryLoop(any(), anyByte()))
+        .thenReturn(CompletableFuture.completedFuture(false));
+
     ON_ERROR_DROPPED_COUNTER.set(0);
   }
 
@@ -121,15 +128,14 @@ class WebSocketConnectionTest {
         client,
         Schedulers.immediate(),
         clientReleaseManager,
-        mock(MessageDeliveryLoopMonitor.class),
-        mock(ExperimentEnrollmentManager.class));
+        mock(DynamicConfigurationManager.class));
   }
 
   @Test
   void testSendMessages() {
 
     final UUID destinationAccountIdentifier = UUID.randomUUID();
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(destinationAccountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(destinationAccountIdentifier);
 
     final byte deviceId = 2;
     when(device.getId()).thenReturn(deviceId);
@@ -145,9 +151,9 @@ class WebSocketConnectionTest {
             new MessageStreamEntry.QueueEmpty(),
             new MessageStreamEntry.Envelope(secondSuccessfulMessage))));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
-    when(messagesManager.getMessages(account.getIdentifier(IdentityType.ACI), device))
+    when(messagesManager.getMessages(account.getAccountIdentifier(), device))
         .thenReturn(messageStream);
 
     when(messagesManager.mayHaveMessages(any(), any())).thenReturn(CompletableFuture.completedFuture(false));
@@ -171,19 +177,19 @@ class WebSocketConnectionTest {
     verify(client).sendRequest(eq("PUT"), eq("/api/v1/message"), anyList(), argThat(body ->
         body.isPresent() && Arrays.equals(body.get(), WebSocketConnection.serializeMessage(secondSuccessfulMessage))));
 
-    verify(messageStream).acknowledgeMessage(successfulMessage);
-    verify(messageStream).acknowledgeMessage(secondSuccessfulMessage);
+    verify(messageStream).acknowledgeMessage(UUIDUtil.fromByteString(successfulMessage.getServerGuid()), successfulMessage.getServerTimestamp());
+    verify(messageStream).acknowledgeMessage(UUIDUtil.fromByteString(secondSuccessfulMessage.getServerGuid()), secondSuccessfulMessage.getServerTimestamp());
 
     verify(receiptSender)
         .sendReceipt(new AciServiceIdentifier(destinationAccountIdentifier),
             deviceId,
-            AciServiceIdentifier.valueOf(successfulMessage.getSourceServiceId()),
+            AciServiceIdentifier.fromByteString(successfulMessage.getSourceServiceId()),
             successfulMessage.getClientTimestamp());
 
     verify(receiptSender)
         .sendReceipt(new AciServiceIdentifier(destinationAccountIdentifier),
             deviceId,
-            AciServiceIdentifier.valueOf(secondSuccessfulMessage.getSourceServiceId()),
+            AciServiceIdentifier.fromByteString(secondSuccessfulMessage.getSourceServiceId()),
             secondSuccessfulMessage.getClientTimestamp());
 
     webSocketConnection.stop();
@@ -196,7 +202,7 @@ class WebSocketConnectionTest {
   void testSendMessagesWithError() {
 
     final UUID destinationAccountIdentifier = UUID.randomUUID();
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(destinationAccountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(destinationAccountIdentifier);
 
     final byte deviceId = 2;
     when(device.getId()).thenReturn(deviceId);
@@ -214,9 +220,9 @@ class WebSocketConnectionTest {
             new MessageStreamEntry.QueueEmpty(),
             new MessageStreamEntry.Envelope(secondSuccessfulMessage))));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
-    when(messagesManager.getMessages(account.getIdentifier(IdentityType.ACI), device))
+    when(messagesManager.getMessages(account.getAccountIdentifier(), device))
         .thenReturn(messageStream);
 
     when(messagesManager.mayHaveMessages(any(), any())).thenReturn(CompletableFuture.completedFuture(false));
@@ -247,25 +253,25 @@ class WebSocketConnectionTest {
     verify(client, never()).sendRequest(eq("PUT"), eq("/api/v1/message"), anyList(), argThat(body ->
         body.isPresent() && Arrays.equals(body.get(), WebSocketConnection.serializeMessage(secondSuccessfulMessage))));
 
-    verify(messageStream).acknowledgeMessage(successfulMessage);
-    verify(messageStream, never()).acknowledgeMessage(secondSuccessfulMessage);
+    verify(messageStream).acknowledgeMessage(UUIDUtil.fromByteString(successfulMessage.getServerGuid()), successfulMessage.getServerTimestamp());
+    verify(messageStream, never()).acknowledgeMessage(UUIDUtil.fromByteString(secondSuccessfulMessage.getServerGuid()), secondSuccessfulMessage.getServerTimestamp());
 
     verify(receiptSender)
         .sendReceipt(new AciServiceIdentifier(destinationAccountIdentifier),
             deviceId,
-            AciServiceIdentifier.valueOf(successfulMessage.getSourceServiceId()),
+            AciServiceIdentifier.fromByteString(successfulMessage.getSourceServiceId()),
             successfulMessage.getClientTimestamp());
 
     verify(receiptSender, never())
         .sendReceipt(new AciServiceIdentifier(destinationAccountIdentifier),
             deviceId,
-            AciServiceIdentifier.valueOf(failedMessage.getSourceServiceId()),
+            AciServiceIdentifier.fromByteString(failedMessage.getSourceServiceId()),
             failedMessage.getClientTimestamp());
 
     verify(receiptSender, never())
         .sendReceipt(new AciServiceIdentifier(destinationAccountIdentifier),
             deviceId,
-            AciServiceIdentifier.valueOf(secondSuccessfulMessage.getSourceServiceId()),
+            AciServiceIdentifier.fromByteString(secondSuccessfulMessage.getSourceServiceId()),
             secondSuccessfulMessage.getClientTimestamp());
 
     verify(client, timeout(500)).close(eq(1011), anyString());
@@ -276,7 +282,7 @@ class WebSocketConnectionTest {
   void testQueueEmptySignalOrder() {
 
     final UUID destinationAccountIdentifier = UUID.randomUUID();
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(destinationAccountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(destinationAccountIdentifier);
 
     final byte deviceId = 2;
     when(device.getId()).thenReturn(deviceId);
@@ -292,9 +298,9 @@ class WebSocketConnectionTest {
             new MessageStreamEntry.QueueEmpty(),
             new MessageStreamEntry.Envelope(afterQueueDrainMessage))));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
-    when(messagesManager.getMessages(account.getIdentifier(IdentityType.ACI), device))
+    when(messagesManager.getMessages(account.getAccountIdentifier(), device))
         .thenReturn(messageStream);
 
     when(messagesManager.mayHaveMessages(any(), any())).thenReturn(CompletableFuture.completedFuture(false));
@@ -315,7 +321,7 @@ class WebSocketConnectionTest {
 
     // Sending the initial message will succeed after a delay, at which point we'll acknowledge the message. Make sure
     // we wait for that process to complete before sending the "queue empty" signal
-    inOrder.verify(messageStream, timeout(1_000)).acknowledgeMessage(initialMessage);
+    inOrder.verify(messageStream, timeout(1_000)).acknowledgeMessage(UUIDUtil.fromByteString(initialMessage.getServerGuid()), initialMessage.getServerTimestamp());
     inOrder.verify(client, timeout(1_000)).sendRequest(eq("PUT"), eq("/api/v1/queue/empty"), anyList(), eq(Optional.empty()));
 
     webSocketConnection.stop();
@@ -326,7 +332,7 @@ class WebSocketConnectionTest {
   void testConflictingConsumerSignalOrder() {
 
     final UUID destinationAccountIdentifier = UUID.randomUUID();
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(destinationAccountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(destinationAccountIdentifier);
 
     final byte deviceId = 2;
     when(device.getId()).thenReturn(deviceId);
@@ -339,9 +345,9 @@ class WebSocketConnectionTest {
     when(messageStream.getMessages())
         .thenReturn(JdkFlowAdapter.publisherToFlowPublisher(testPublisher));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
-    when(messagesManager.getMessages(account.getIdentifier(IdentityType.ACI), device))
+    when(messagesManager.getMessages(account.getAccountIdentifier(), device))
         .thenReturn(messageStream);
 
     when(messagesManager.mayHaveMessages(any(), any())).thenReturn(CompletableFuture.completedFuture(false));
@@ -374,7 +380,7 @@ class WebSocketConnectionTest {
   void testSendMessagesEmptyQueue() {
     final UUID accountUuid = UUID.randomUUID();
 
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountUuid);
+    when(account.getAccountIdentifier()).thenReturn(accountUuid);
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
 
     final MessageStream messageStream = mock(MessageStream.class);
@@ -382,7 +388,7 @@ class WebSocketConnectionTest {
     when(messageStream.getMessages())
         .thenReturn(JdkFlowAdapter.publisherToFlowPublisher(Flux.just(new MessageStreamEntry.QueueEmpty())));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
     when(messagesManager.getMessages(accountUuid, device)).thenReturn(messageStream);
 
@@ -403,7 +409,7 @@ class WebSocketConnectionTest {
   void testSendMessagesConflictingConsumer() {
     final UUID accountUuid = UUID.randomUUID();
 
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountUuid);
+    when(account.getAccountIdentifier()).thenReturn(accountUuid);
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
 
     final MessageStream messageStream = mock(MessageStream.class);
@@ -411,7 +417,7 @@ class WebSocketConnectionTest {
     when(messageStream.getMessages())
         .thenReturn(JdkFlowAdapter.publisherToFlowPublisher(Flux.error(new ConflictingMessageConsumerException())));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
     when(messagesManager.getMessages(accountUuid, device)).thenReturn(messageStream);
 
@@ -430,14 +436,14 @@ class WebSocketConnectionTest {
     final UUID accountUuid = UUID.randomUUID();
 
     when(device.getId()).thenReturn((byte) 2);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountUuid);
+    when(account.getAccountIdentifier()).thenReturn(accountUuid);
 
     final MessageStream messageStream = mock(MessageStream.class);
 
     when(messageStream.getMessages())
         .thenReturn(JdkFlowAdapter.publisherToFlowPublisher(Flux.error(new RedisException("OH NO"))));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
     when(messagesManager.getMessages(accountUuid, device)).thenReturn(messageStream);
 
@@ -461,7 +467,7 @@ class WebSocketConnectionTest {
     final byte deviceId = 2;
     when(device.getId()).thenReturn(deviceId);
 
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountUuid);
+    when(account.getAccountIdentifier()).thenReturn(accountUuid);
 
     final int totalMessages = 1000;
 
@@ -473,7 +479,7 @@ class WebSocketConnectionTest {
     when(messageStream.getMessages())
         .thenReturn(JdkFlowAdapter.publisherToFlowPublisher(flux));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
     when(messagesManager.getMessages(accountUuid, device)).thenReturn(messageStream);
 
@@ -513,7 +519,7 @@ class WebSocketConnectionTest {
     final byte deviceId = 2;
     when(device.getId()).thenReturn(deviceId);
 
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountUuid);
+    when(account.getAccountIdentifier()).thenReturn(accountUuid);
 
     final AtomicBoolean canceled = new AtomicBoolean();
 
@@ -533,7 +539,7 @@ class WebSocketConnectionTest {
     when(messageStream.getMessages())
         .thenReturn(JdkFlowAdapter.publisherToFlowPublisher(flux));
 
-    when(messageStream.acknowledgeMessage(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
 
     when(messagesManager.getMessages(accountUuid, device)).thenReturn(messageStream);
     when(messagesManager.mayHaveMessages(any(), any())).thenReturn(CompletableFuture.completedFuture(false));
@@ -566,20 +572,101 @@ class WebSocketConnectionTest {
         .verify();
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testSendDeliveryReceipt(final boolean deliveryReceiptFromPni) {
+
+    final UUID destinationAccountIdentifier = UUID.randomUUID();
+    when(account.getAccountIdentifier()).thenReturn(destinationAccountIdentifier);
+
+    final byte deviceId = 2;
+    when(device.getId()).thenReturn(deviceId);
+
+    final ServiceIdentifier deliveryReceiptSource = deliveryReceiptFromPni
+        ? new PniServiceIdentifier(UUID.randomUUID())
+        : new AciServiceIdentifier(UUID.randomUUID());
+    final Envelope successfulMessage = createMessage(UUID.randomUUID(), destinationAccountIdentifier, 1, "Success");
+    final Envelope deliveryReceipt = createDeliveryReceiptMessage(deliveryReceiptSource, UUID.randomUUID(), 2);
+
+    final MessageStream messageStream = mock(MessageStream.class);
+
+    when(messageStream.getMessages())
+        .thenReturn(JdkFlowAdapter.publisherToFlowPublisher(Flux.just(
+            new MessageStreamEntry.Envelope(successfulMessage),
+            new MessageStreamEntry.Envelope(deliveryReceipt),
+            new MessageStreamEntry.QueueEmpty())));
+
+    when(messageStream.acknowledgeMessage(any(), anyLong())).thenReturn(CompletableFuture.completedFuture(null));
+
+    when(messagesManager.getMessages(account.getAccountIdentifier(), device))
+        .thenReturn(messageStream);
+
+    when(messagesManager.mayHaveMessages(any(), any())).thenReturn(CompletableFuture.completedFuture(false));
+
+    final WebSocketClient client = mock(WebSocketClient.class);
+
+    final WebSocketResponseMessage successResponse = mock(WebSocketResponseMessage.class);
+    when(successResponse.getStatus()).thenReturn(200);
+
+    when(client.isOpen()).thenReturn(true);
+
+    when(client.sendRequest(eq("PUT"), eq("/api/v1/message"), any(), any()))
+        .thenReturn(CompletableFuture.completedFuture(successResponse));
+
+    final WebSocketConnection webSocketConnection = buildWebSocketConnection(client);
+    webSocketConnection.start();
+
+    verify(client).sendRequest(eq("PUT"), eq("/api/v1/message"), anyList(), argThat(body ->
+        body.isPresent() && Arrays.equals(body.get(), WebSocketConnection.serializeMessage(successfulMessage))));
+
+    verify(client).sendRequest(eq("PUT"), eq("/api/v1/message"), anyList(), argThat(body ->
+        body.isPresent() && Arrays.equals(body.get(), WebSocketConnection.serializeMessage(deliveryReceipt))));
+
+    verify(messageStream).acknowledgeMessage(UUIDUtil.fromByteString(successfulMessage.getServerGuid()), successfulMessage.getServerTimestamp());
+    verify(messageStream).acknowledgeMessage(UUIDUtil.fromByteString(deliveryReceipt.getServerGuid()), deliveryReceipt.getServerTimestamp());
+
+    verify(receiptSender)
+        .sendReceipt(new AciServiceIdentifier(destinationAccountIdentifier),
+            deviceId,
+            AciServiceIdentifier.fromByteString(successfulMessage.getSourceServiceId()),
+            successfulMessage.getClientTimestamp());
+    // No receipt should be sent for the delivered delivery receipt
+    verifyNoMoreInteractions(receiptSender);
+    webSocketConnection.stop();
+    verify(client).sendRequest(eq("PUT"), eq("/api/v1/queue/empty"), anyList(), eq(Optional.empty()));
+    verify(client).close(eq(1000), anyString());
+  }
+
   private static Envelope createMessage(final UUID senderUuid,
       final UUID destinationUuid,
       final long timestamp,
       final String content) {
 
     return Envelope.newBuilder()
-        .setServerGuid(UUID.randomUUID().toString())
+        .setServerGuid(UUIDUtil.toByteString(UUID.randomUUID()))
         .setType(Envelope.Type.CIPHERTEXT)
         .setClientTimestamp(timestamp)
         .setServerTimestamp(0)
-        .setSourceServiceId(senderUuid.toString())
+        .setSourceServiceId(new AciServiceIdentifier(senderUuid).toCompactByteString())
         .setSourceDevice(SOURCE_DEVICE_ID)
-        .setDestinationServiceId(destinationUuid.toString())
+        .setDestinationServiceId(new AciServiceIdentifier(destinationUuid).toCompactByteString())
         .setContent(ByteString.copyFrom(content.getBytes(StandardCharsets.UTF_8)))
+        .build();
+  }
+
+  private static Envelope createDeliveryReceiptMessage(
+      final ServiceIdentifier senderUuid,
+      final UUID destinationIdentifier,
+      final long timestamp) {
+
+    return Envelope.newBuilder()
+        .setServerGuid(UUIDUtil.toByteString(UUID.randomUUID()))
+        .setType(Envelope.Type.SERVER_DELIVERY_RECEIPT)
+        .setClientTimestamp(timestamp)
+        .setServerTimestamp(0)
+        .setSourceServiceId(senderUuid.toCompactByteString())
+        .setDestinationServiceId(new AciServiceIdentifier(destinationIdentifier).toCompactByteString())
+        .setSourceDevice(SOURCE_DEVICE_ID)
         .build();
   }
 

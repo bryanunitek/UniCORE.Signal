@@ -7,21 +7,21 @@ package org.whispersystems.textsecuregcm.grpc;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.util.Arrays;
 import java.util.HexFormat;
-import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
-import org.signal.chat.profile.Badge;
-import org.signal.chat.profile.BadgeSvg;
-import org.signal.chat.profile.DataEtag;
-import org.signal.chat.profile.GetExpiringProfileKeyCredentialResult;
-import org.signal.chat.profile.GetUnversionedProfileResult;
-import org.signal.chat.profile.GetVersionedProfileResult;
-import org.signal.chat.profile.GetVersionedProfileV1Response;
+import org.apache.commons.lang3.Strings;
+import org.bouncycastle.crypto.digests.TupleHash;
+import org.signal.chat.common.S3UploadForm;
+import org.signal.chat.profile.AccountInfo;
+import org.signal.chat.profile.GetProfileKeyCredentialResult;
+import org.signal.chat.profile.LegacyProfileResult;
+import org.signal.chat.profile.ProfileResult;
+import org.signal.chat.profile.ProfileResultOrBuilder;
 import org.signal.libsignal.protocol.ServiceId;
 import org.signal.libsignal.zkgroup.InvalidInputException;
 import org.signal.libsignal.zkgroup.VerificationFailedException;
@@ -31,205 +31,180 @@ import org.signal.libsignal.zkgroup.profiles.ProfileKeyCredentialRequest;
 import org.signal.libsignal.zkgroup.profiles.ServerZkProfileOperations;
 import org.whispersystems.textsecuregcm.auth.UnidentifiedAccessChecksum;
 import org.whispersystems.textsecuregcm.badges.ProfileBadgeConverter;
-import org.whispersystems.textsecuregcm.identity.ServiceIdentifier;
+import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.storage.Account;
-import org.whispersystems.textsecuregcm.storage.DeviceCapability;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.VersionedProfile;
 import org.whispersystems.textsecuregcm.storage.VersionedProfileV1;
 import org.whispersystems.textsecuregcm.util.ProfileHelper;
 
 public class ProfileGrpcHelper {
-  static Optional<GetVersionedProfileResult> getVersionedProfile(final Account account,
+
+  private static final byte[] ETAG_DOMAIN = "ProfileETag/v1".getBytes(StandardCharsets.UTF_8);
+  private static final int ETAG_LENGTH = 10;
+  private static final S3UploadForm PROTOTYPE_AVATAR_UPLOAD_FORM = S3UploadForm.newBuilder()
+      .setAcl(PostPolicyGenerator.ACL)
+      .setAlgorithm(PostPolicyGenerator.ALGORITHM)
+      .build();
+
+  static String cdnUrl(final String cdnBaseUrl, final String path) {
+    return Strings.CS.removeEnd(cdnBaseUrl, "/") + "/" + Strings.CS.removeStart(path, "/");
+  }
+
+  static Optional<LegacyProfileResult> getProfileV1(final Account account,
       final ProfilesManager profilesManager,
-      final byte[] requestVersion,
-      final byte[] requestDataEtag,
-      final byte[] requestPaymentAddressEtag) {
-
-    final Optional<VersionedProfile> profile;
-    if (account.hasCapability(DeviceCapability.PROFILES_V2)) {
-      profile = profilesManager.get(account.getUuid(), requestVersion);
-    } else {
-      profile = Optional.empty();
-    }
-
-    final Optional<VersionedProfileV1> v1Profile;
-    if (profile.isEmpty()) {
-      v1Profile = profilesManager.getV1(account.getUuid(), HexFormat.of().formatHex(requestVersion));
-    } else {
-      v1Profile = Optional.empty();
-    }
-
-    if (profile.isEmpty() && v1Profile.isEmpty()) {
+      final ProfileBadgeConverter profileBadgeConverter,
+      final String cdnBaseUrl,
+      final byte[] requestVersion) {
+    final Optional<VersionedProfileV1> maybeV1Profile =
+        profilesManager.getV1(account.getAccountIdentifier(), HexFormat.of().formatHex(requestVersion));
+    if (maybeV1Profile.isEmpty()) {
       return Optional.empty();
     }
+    final VersionedProfileV1 v1Profile = maybeV1Profile.get();
 
-    final GetVersionedProfileResult.Builder responseBuilder = GetVersionedProfileResult.newBuilder();
+    final LegacyProfileResult.Builder builder = LegacyProfileResult.newBuilder()
+        .setAccountInfo(buildAccountInfo(profileBadgeConverter, account));
 
-    profile.ifPresent(p -> {
-      if (requestDataEtag.length > 0 && Arrays.equals(requestDataEtag, p.dataHash())) {
-        responseBuilder.setDataEtagMatched(true);
-      } else {
-        responseBuilder.setDataEtag(DataEtag.newBuilder()
-            .setData(ByteString.copyFrom(p.data()))
-            .setEtagSha256(ByteString.copyFrom(p.dataHash()))
-            .build());
-      }
-    });
-
-    v1Profile.ifPresent(p -> {
-      final GetVersionedProfileV1Response.Builder v1ResponseBuilder = GetVersionedProfileV1Response.newBuilder();
-
-      v1ResponseBuilder
-          .setName(ByteString.copyFrom(p.name()))
-          .setAbout(ByteString.copyFrom(p.about()))
-          .setAboutEmoji(ByteString.copyFrom(p.aboutEmoji()))
-          .setPhoneNumberSharing(ByteString.copyFrom(p.phoneNumberSharing()));
-
-      if (p.avatar() != null) {
-        v1ResponseBuilder.setAvatar(p.avatar());
-      }
-
-      responseBuilder.setV1Response(v1ResponseBuilder);
-    });
-
-    // Include payment address if the version matches the latest version on Account or the latest version on Account
-    // is empty
-    if (account.getCurrentProfileVersion().map(v -> Arrays.equals(v, requestVersion)).orElse(true)) {
-      final Optional<byte []> paymentAddress = profile.map(VersionedProfile::paymentAddress).or(() -> v1Profile.map(VersionedProfileV1::paymentAddress));
-
-      if (paymentAddress.isPresent()) {
-
-        final boolean paymentAddressETagMatches = requestPaymentAddressEtag.length > 0 &&
-            profile.map(VersionedProfile::paymentAddressHash)
-                .map(h -> Arrays.equals(requestPaymentAddressEtag, h))
-                .orElse(false);
-
-        if (paymentAddressETagMatches) {
-          responseBuilder.setPaymentAddressEtagMatched(true);
-        } else {
-          responseBuilder.setPaymentAddressDataEtag(DataEtag.newBuilder()
-              .setData(ByteString.copyFrom(paymentAddress.get()))
-              .setEtagSha256(ByteString.copyFrom(
-                  profile.map(VersionedProfile::paymentAddressHash).orElseGet(() -> hash(paymentAddress.get()))))
-              .build());
-        }
-      }
+    if (v1Profile.name() != null) {
+      builder.setName(ByteString.copyFrom(v1Profile.name()));
+    }
+    if (v1Profile.about() != null) {
+      builder.setAbout(ByteString.copyFrom(v1Profile.about()));
+    }
+    if (v1Profile.aboutEmoji() != null) {
+      builder.setAboutEmoji(ByteString.copyFrom(v1Profile.aboutEmoji()));
+    }
+    if (v1Profile.phoneNumberSharing() != null) {
+      builder.setPhoneNumberSharing(ByteString.copyFrom(v1Profile.phoneNumberSharing()));
+    }
+    if (v1Profile.avatar() != null) {
+      builder.setAvatarUrl(cdnUrl(cdnBaseUrl, v1Profile.avatar()));
     }
 
-    return Optional.of(responseBuilder.build());
-  }
-
-  @VisibleForTesting
-  static List<Badge> buildBadges(final List<org.whispersystems.textsecuregcm.entities.Badge> badges) {
-    final ArrayList<Badge> grpcBadges = new ArrayList<>();
-    for (final org.whispersystems.textsecuregcm.entities.Badge badge : badges) {
-      grpcBadges.add(Badge.newBuilder()
-          .setId(badge.getId())
-          .setCategory(badge.getCategory())
-          .setName(badge.getName())
-          .setDescription(badge.getDescription())
-          .addAllSprites6(badge.getSprites6())
-          .setSvg(badge.getSvg())
-          .addAllSvgs(buildBadgeSvgs(badge.getSvgs()))
-          .build());
-    }
-    return grpcBadges;
-  }
-
-  @VisibleForTesting
-  static List<org.signal.chat.common.DeviceCapability> buildAccountCapabilities(final Account account) {
-    return Arrays.stream(DeviceCapability.values())
-        .filter(DeviceCapability::includeInProfile)
-        .filter(account::hasCapability)
-        .map(DeviceCapabilityUtil::toGrpcDeviceCapability)
-        .toList();
-  }
-
-  private static List<BadgeSvg> buildBadgeSvgs(final List<org.whispersystems.textsecuregcm.entities.BadgeSvg> badgeSvgs) {
-    ArrayList<BadgeSvg> grpcBadgeSvgs = new ArrayList<>();
-    for (final org.whispersystems.textsecuregcm.entities.BadgeSvg badgeSvg : badgeSvgs) {
-      grpcBadgeSvgs.add(BadgeSvg.newBuilder()
-          .setDark(badgeSvg.getDark())
-          .setLight(badgeSvg.getLight())
-          .build());
-    }
-    return grpcBadgeSvgs;
-  }
-
-  static GetUnversionedProfileResult buildUnversionedProfileResult(
-      final ServiceIdentifier targetIdentifier,
-      final UUID requesterUuid,
-      final Account targetAccount,
-      final ProfileBadgeConverter profileBadgeConverter) {
-    final GetUnversionedProfileResult.Builder resultBuilder = GetUnversionedProfileResult.newBuilder()
-        .setIdentityKey(ByteString.copyFrom(targetAccount.getIdentityKey(targetIdentifier.identityType()).serialize()))
-        .addAllCapabilities(buildAccountCapabilities(targetAccount));
-
-    switch (targetIdentifier.identityType()) {
-      case ACI -> {
-        resultBuilder.setUnrestrictedUnidentifiedAccess(targetAccount.isUnrestrictedUnidentifiedAccess())
-            .addAllBadges(
-                buildBadges(profileBadgeConverter.convert(RequestAttributesUtil.getAvailableAcceptedLocales(),
-                targetAccount.getBadges(),
-                ProfileHelper.isSelfProfileRequest(requesterUuid, targetIdentifier))));
-
-        targetAccount.getUnidentifiedAccessKey()
-            .map(UnidentifiedAccessChecksum::generateFor)
-            .map(ByteString::copyFrom)
-            .ifPresent(resultBuilder::setUnidentifiedAccess);
-      }
-      case PNI -> resultBuilder.setUnrestrictedUnidentifiedAccess(false);
+    // If present, include the payment address if the version matches the latest version on Account or the latest
+    // version on Account is empty
+    if (v1Profile.paymentAddress() != null && account.getCurrentProfileVersion().map(v -> Arrays.equals(v, requestVersion)).orElse(true)) {
+      builder.setPaymentAddress(ByteString.copyFrom(v1Profile.paymentAddress()));
     }
 
-    return resultBuilder.build();
+    return Optional.of(builder.build());
   }
 
-  static Optional<GetExpiringProfileKeyCredentialResult> getExpiringProfileKeyCredentialResult(
+  static Optional<ProfileResult> getProfile(final Account account,
+      final ProfilesManager profilesManager,
+      final ProfileBadgeConverter profileBadgeConverter,
+      final byte[] requestVersion) {
+
+    final Optional<VersionedProfile> maybeProfile = profilesManager.get(account.getAccountIdentifier(), requestVersion);
+    if (maybeProfile.isEmpty()) {
+      return Optional.empty();
+    }
+    final VersionedProfile profile = maybeProfile.get();
+
+    final ProfileResult.Builder builder = ProfileResult.newBuilder()
+        .setData(ByteString.copyFrom(profile.data()))
+        .setAccountInfo(buildAccountInfo(profileBadgeConverter, account));
+
+    // If present, include the payment address if the version matches the latest version on Account or the latest
+    // version on Account is empty
+    if (profile.paymentAddress() != null && account.getCurrentProfileVersion().map(v -> Arrays.equals(v, requestVersion)).orElse(true)) {
+      builder.setPaymentAddress(ByteString.copyFrom(profile.paymentAddress()));
+    }
+
+    builder.setEtag(ByteString.copyFrom(etag(builder)));
+    return Optional.of(builder.build());
+  }
+
+  private static AccountInfo buildAccountInfo(final ProfileBadgeConverter profileBadgeConverter,
+      final Account account) {
+    final AccountInfo.Builder accountInfoBuilder = AccountInfo.newBuilder()
+        .addAllBadgeIds(profileBadgeConverter.visibleBadgeIds(account.getBadges()))
+        .setIdentityKey(ByteString.copyFrom(account.getAccountIdentityKey().serialize()))
+        .setUnrestrictedUnidentifiedAccess(account.isUnrestrictedUnidentifiedAccess());
+
+    account.getUnidentifiedAccessKey()
+        .map(UnidentifiedAccessChecksum::generateFor)
+        .map(ByteString::copyFrom)
+        .ifPresent(accountInfoBuilder::setUnidentifiedAccessKeyFingerprint);
+
+    return accountInfoBuilder.build();
+  }
+
+  static Optional<GetProfileKeyCredentialResult> getProfileKeyCredentialResult(
       final Account account,
       final byte[] version,
       final byte[] encodedCredentialRequest,
       final ProfilesManager profilesManager,
       final ServerZkProfileOperations zkProfileOperations) {
 
-    final Optional<VersionedProfile> versionedProfile;
-    if (account.hasCapability(DeviceCapability.PROFILES_V2)) {
-      versionedProfile = profilesManager.get(account.getUuid(), version);
-    } else {
-      versionedProfile = Optional.empty();
-    }
-
-    return versionedProfile.map(VersionedProfile::commitment)
-        .or(() -> profilesManager.getV1(account.getUuid(), HexFormat.of().formatHex(version)).map(VersionedProfileV1::commitment))
+    return profilesManager.get(account.getAccountIdentifier(), version)
+        .map(VersionedProfile::commitment)
+        .or(() -> profilesManager.getV1(account.getAccountIdentifier(), HexFormat.of().formatHex(version))
+            .map(VersionedProfileV1::commitment))
         .map(commitment -> {
 
           final ExpiringProfileKeyCredentialResponse profileKeyCredentialResponse;
           try {
-            profileKeyCredentialResponse = ProfileHelper.getExpiringProfileKeyCredential(new ProfileKeyCredentialRequest(encodedCredentialRequest),
-                new ProfileKeyCommitment(commitment), new ServiceId.Aci(account.getUuid()), zkProfileOperations);
+            profileKeyCredentialResponse = ProfileHelper.getExpiringProfileKeyCredential(
+                new ProfileKeyCredentialRequest(encodedCredentialRequest),
+                new ProfileKeyCommitment(commitment), new ServiceId.Aci(account.getAccountIdentifier()),
+                zkProfileOperations);
           } catch (VerificationFailedException | InvalidInputException e) {
-            throw GrpcExceptions.constraintViolation("invalid credential request");
+            throw GrpcExceptions.invalidArguments("invalid credential request");
           }
 
-          return GetExpiringProfileKeyCredentialResult.newBuilder()
+          return GetProfileKeyCredentialResult.newBuilder()
               .setProfileKeyCredential(ByteString.copyFrom(profileKeyCredentialResponse.serialize()))
               .build();
         });
   }
 
-  /**
-   * Computes the SHA-256 hash of the given data.
-   * <p>
-   * Only needed during the v1 -> v2 migration. See also: VersionedProfile#hash(byte[])
-   */
+  public static S3UploadForm generateAvatarUploadForm(final String objectName, final int uploadLength,
+      final PostPolicyGenerator policyGenerator, final Clock clock) {
+    final PostPolicyGenerator.SignedPostPolicy policy =
+        policyGenerator.createFor(objectName, uploadLength, clock.instant());
+
+    return PROTOTYPE_AVATAR_UPLOAD_FORM.toBuilder()
+        .setKey(objectName)
+        .setCredential(policy.credential())
+        .setDate(policy.formattedTimestamp())
+        .setPolicy(policy.encodedPolicy())
+        .setSignature(policy.signature())
+        .build();
+  }
+
+  /// Compute the etag of a [ProfileResult]
+  ///
+  /// @implNote This uses the NIST-SP 800-185 TupleHash to provide a cryptographic hash over variable length fields.
+  /// Clients must be able to reproduce the same etag from the data, so hash must be stable.
   @VisibleForTesting
-  public static byte[] hash(final byte[] data) {
-    final MessageDigest sha256;
-    try {
-      sha256 = MessageDigest.getInstance("SHA-256");
-    } catch (NoSuchAlgorithmException e) {
-      throw new AssertionError(e);
-    }
-    return sha256.digest(data);
+  static byte[] etag(final ProfileResultOrBuilder profile) {
+    final TupleHash h = new TupleHash(256, ETAG_DOMAIN, ETAG_LENGTH * Byte.SIZE);
+    final AccountInfo accountInfo = profile.getAccountInfo();
+
+    addByteArray(h, profile.getData().toByteArray());
+    addByteArray(h, profile.getPaymentAddress().toByteArray());
+    addByteArray(h, accountInfo.getIdentityKey().toByteArray());
+    addByteArray(h, accountInfo.getUnidentifiedAccessKeyFingerprint().toByteArray());
+    h.update(accountInfo.getUnrestrictedUnidentifiedAccess() ? (byte) 1 : (byte) 0);
+
+    addInt(h, accountInfo.getBadgeIdsCount());
+    accountInfo.getBadgeIdsList().asByteStringList().stream()
+        .map(ByteString::toByteArray)
+        .sorted(Arrays::compareUnsigned)
+        .forEach(badgeId -> addByteArray(h, badgeId));
+
+    final byte[] out = new byte[ETAG_LENGTH];
+    h.doFinal(out, 0);
+    return out;
+  }
+
+  private static void addByteArray(final TupleHash hash, final byte[] bytes) {
+    hash.update(bytes, 0, bytes.length);
+  }
+
+  private static void addInt(final TupleHash hash, final int v) {
+    addByteArray(hash, ByteBuffer.allocate(Integer.BYTES).order(ByteOrder.BIG_ENDIAN).putInt(v).array());
   }
 }

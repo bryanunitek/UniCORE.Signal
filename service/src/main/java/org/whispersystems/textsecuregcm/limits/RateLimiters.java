@@ -28,6 +28,7 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     ALLOCATE_DEVICE("allocateDevice", new RateLimiterConfig(6, Duration.ofMinutes(2), false)),
     VERIFY_DEVICE("verifyDevice", new RateLimiterConfig(6, Duration.ofMinutes(2), false)),
     PROFILE("profile", new RateLimiterConfig(4320, Duration.ofSeconds(20), true)),
+    PROFILE_AVATAR_BYTES("profileAvatarBytes", new RateLimiterConfig(DataSize.mebibytes(100).toBytes(), Duration.ofNanos(10000), true)),
     STICKER_PACK("stickerPack", new RateLimiterConfig(50, Duration.ofMinutes(72), false)),
     USERNAME_LOOKUP("usernameLookup", new RateLimiterConfig(100, Duration.ofMinutes(15), true)),
     USERNAME_SET("usernameSet", new RateLimiterConfig(100, Duration.ofMinutes(15), false)),
@@ -61,6 +62,10 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     DEVICE_CHECK_CHALLENGE("deviceCheckChallenge", new RateLimiterConfig(10, Duration.ofMinutes(1), false)),
     SUBMIT_CALL_QUALITY_SURVEY("submitCallQualitySurvey", new RateLimiterConfig(100, Duration.ofMinutes(1), true)),
     BATCH_IDENTITY_CHECK("batchIdentityCheck", new RateLimiterConfig(100, Duration.ofMinutes(1), true)),
+    CREATE_DONATION_PERMIT("createDonationCredential", new RateLimiterConfig(30, Duration.ofHours(4), true)),
+    ONE_TIME_DONATION("oneTimeDonation", new RateLimiterConfig(5, Duration.ofMinutes(1), true)),
+    ADD_SUBSCRIPTION_PAYMENT_METHOD("addSubscriptionPaymentMethod", new RateLimiterConfig(10, Duration.ofMinutes(1), true)),
+    CHECK_MFA("checkMfa", new RateLimiterConfig(50, Duration.ofHours(12), false))
     ;
 
     private final String id;
@@ -123,12 +128,20 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     return forDescriptor(For.ATTACHMENT_BYTES);
   }
 
+  public RateLimiter getBackupAuthCheckLimiter() {
+    return forDescriptor(For.BACKUP_AUTH_CHECK);
+  }
+
   public RateLimiter getPinLimiter() {
     return forDescriptor(For.PIN);
   }
 
   public RateLimiter getProfileLimiter() {
     return forDescriptor(For.PROFILE);
+  }
+
+  public RateLimiter getProfileAvatarBytesLimiter() {
+    return forDescriptor(For.PROFILE_AVATAR_BYTES);
   }
 
   public RateLimiter getStickerPackLimiter() {
@@ -239,7 +252,11 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     return forDescriptor(For.SUBMIT_CALL_QUALITY_SURVEY);
   }
 
-  public RateLimiter getBatchIdentityCheckLimiter() {
-    return forDescriptor(For.BATCH_IDENTITY_CHECK);
+  public RateLimiter getCreateDonationPermitLimiter() {
+    return forDescriptor(For.CREATE_DONATION_PERMIT);
+  }
+
+  public RateLimiter getCheckMfaLimiter() {
+    return forDescriptor(For.CHECK_MFA);
   }
 }

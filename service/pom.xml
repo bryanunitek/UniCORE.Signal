@@ -11,19 +11,17 @@
   <artifactId>service</artifactId>
 
   <properties>
-    <apollo-api-jvm.version>3.8.5</apollo-api-jvm.version>
+    <apollo-api-jvm.version>3.8.6</apollo-api-jvm.version>
     <commons-compress.version>1.28.0</commons-compress.version>
-    <dynamodb-lock-client.version>1.4.0</dynamodb-lock-client.version>
-    <firebase-admin.version>9.7.0</firebase-admin.version>
-    <libphonenumber-geocoder.version>3.23</libphonenumber-geocoder.version>
+    <dynamodb-lock-client.version>1.5.0</dynamodb-lock-client.version>
+    <firebase-admin.version>9.12.0</firebase-admin.version>
+    <libphonenumber-geocoder.version>3.43</libphonenumber-geocoder.version>
     <google-androidpublisher.version>v3-rev20250904-2.0.0</google-androidpublisher.version>
-    <java-jwt.version>4.5.0</java-jwt.version>
+    <java-jwt.version>4.6.2</java-jwt.version>
     <java-uuid-generator.version>5.2.0</java-uuid-generator.version>
     <!-- *all* opentelemetry-logback-appender versions are "alpha" despite the advanced version number -->
-    <opentelemetry-logback-appender-1.0.version>2.22.0-alpha</opentelemetry-logback-appender-1.0.version>
-    <storekit.version>4.0.0</storekit.version>
-    <webauthn4j.version>0.30.2.RELEASE</webauthn4j.version>
-    <jetty.http2-client.version>12.1.5</jetty.http2-client.version>
+    <opentelemetry-logback-appender-1.0.version>${opentelemetry-instrumentation.version}-alpha</opentelemetry-logback-appender-1.0.version>
+    <storekit.version>5.2.0</storekit.version>
   </properties>
 
   <dependencies>
@@ -47,11 +45,21 @@
           <groupId>com.squareup.okio</groupId>
           <artifactId>okio-jvm</artifactId>
         </exclusion>
+        <!-- conflicts with our direct dependency -->
+        <exclusion>
+          <groupId>com.auth0</groupId>
+          <artifactId>java-jwt</artifactId>
+        </exclusion>
       </exclusions>
     </dependency>
     <dependency>
       <groupId>com.webauthn4j</groupId>
       <artifactId>webauthn4j-appattest</artifactId>
+      <version>${webauthn4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.webauthn4j</groupId>
+      <artifactId>webauthn4j-core</artifactId>
       <version>${webauthn4j.version}</version>
     </dependency>
     <dependency>
@@ -142,7 +150,6 @@
       <groupId>org.eclipse.jetty.http2</groupId>
       <artifactId>jetty-http2-client-transport</artifactId>
       <scope>test</scope>
-      <version>${jetty.http2-client.version}</version>
     </dependency>
     <dependency>
       <groupId>io.dropwizard</groupId>
@@ -170,11 +177,6 @@
       <groupId>ch.qos.logback</groupId>
       <artifactId>logback-classic</artifactId>
     </dependency>
-    <dependency>
-      <groupId>net.logstash.logback</groupId>
-      <artifactId>logstash-logback-encoder</artifactId>
-    </dependency>
-
     <dependency>
       <groupId>io.dropwizard.metrics</groupId>
       <artifactId>metrics-core</artifactId>
@@ -219,7 +221,7 @@
       <artifactId>opentelemetry-logback-appender-1.0</artifactId>
       <version>${opentelemetry-logback-appender-1.0.version}</version>
       <exclusions>
-        <!-- incubator packages aren't included in the opentelemetry BOM, and we don't use them -->
+        <!-- conflicts with google-cloud-firestore; incubator packages aren't included in the opentelemetry BOM, and we don't use them -->
         <exclusion>
           <groupId>io.opentelemetry.instrumentation</groupId>
           <artifactId>opentelemetry-instrumentation-api-incubator</artifactId>
@@ -284,18 +286,20 @@
       <groupId>com.google.firebase</groupId>
       <artifactId>firebase-admin</artifactId>
       <version>${firebase-admin.version}</version>
+      <exclusions>
+        <exclusion>
+          <!-- google-cloud-storage pins 4.2.2, but jackson-dataformat-xml 2.22.x wants 4.3.0 -->
+          <groupId>org.codehaus.woodstox</groupId>
+          <artifactId>stax2-api</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
 
     <dependency>
-      <groupId>com.google.cloud</groupId>
-      <artifactId>google-cloud-firestore</artifactId>
-      <exclusions>
-        <!-- incubator packages aren't included in the opentelemetry BOM, and we don't use them -->
-        <exclusion>
-          <groupId>io.opentelemetry.instrumentation</groupId>
-          <artifactId>opentelemetry-instrumentation-api-incubator</artifactId>
-        </exclusion>
-      </exclusions>
+      <!-- jackson-dataformat-xml (via firebase-admin), wants >= 4.3.0 -->
+      <groupId>org.codehaus.woodstox</groupId>
+      <artifactId>stax2-api</artifactId>
+      <version>4.3.2</version>
     </dependency>
 
     <dependency>
@@ -303,6 +307,10 @@
       <artifactId>jsr305</artifactId>
     </dependency>
 
+    <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-bulkhead</artifactId>
+    </dependency>
     <dependency>
       <groupId>io.github.resilience4j</groupId>
       <artifactId>resilience4j-circuitbreaker</artifactId>
@@ -406,6 +414,11 @@
 
     <dependency>
       <groupId>com.eatthepath</groupId>
+      <artifactId>java-otp</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>com.eatthepath</groupId>
       <artifactId>pushy</artifactId>
     </dependency>
     <dependency>
@@ -483,6 +496,11 @@
 
     <dependency>
       <groupId>io.netty</groupId>
+      <artifactId>netty-tcnative-boringssl-static</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
       <artifactId>netty-transport</artifactId>
     </dependency>
 
@@ -490,6 +508,12 @@
       <groupId>io.netty</groupId>
       <artifactId>netty-transport-native-epoll</artifactId>
       <classifier>linux-x86_64</classifier>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-pkitesting</artifactId>
+      <scope>test</scope>
     </dependency>
 
     <dependency>
@@ -543,6 +567,13 @@
     </dependency>
 
     <dependency>
+      <groupId>com.webauthn4j</groupId>
+      <artifactId>webauthn4j-test</artifactId>
+      <version>${webauthn4j.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
       <groupId>com.fasterxml.uuid</groupId>
       <artifactId>java-uuid-generator</artifactId>
       <version>${java-uuid-generator.version}</version>
@@ -573,6 +604,12 @@
     </dependency>
 
     <dependency>
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcprov-jdk18on</artifactId>
+      <scope>compile</scope>
+    </dependency>
+
+    <dependency>
       <groupId>com.stripe</groupId>
       <artifactId>stripe-java</artifactId>
     </dependency>
@@ -588,6 +625,7 @@
       <version>${apollo-api-jvm.version}</version>
 
       <exclusions>
+        <!-- conflicts with kotlin-stdlib -->
         <exclusion>
           <groupId>org.jetbrains</groupId>
           <artifactId>annotations</artifactId>
@@ -604,7 +642,8 @@
     <dependency>
       <groupId>com.squareup.okio</groupId>
       <artifactId>okio-jvm</artifactId>
-      <version>3.16.4</version>
+      <!-- update dependabot.yml when this dependency is removed -->
+      <version>3.18.1</version>
     </dependency>
 
   </dependencies>
@@ -617,7 +656,7 @@
           <plugin>
             <groupId>io.github.download-maven-plugin</groupId>
             <artifactId>download-maven-plugin</artifactId>
-            <version>2.0.0</version>
+            <version>2.1.0</version>
 
             <executions>
               <execution>
@@ -632,6 +671,7 @@
             <configuration>
               <url>https://github.com/apple/foundationdb/releases/download/${foundationdb.version}/libfdb_c.x86_64.so</url>
               <outputDirectory>${project.build.directory}/jib-extra/usr/lib</outputDirectory>
+              <outputFileName>libfdb_c.so</outputFileName>
               <sha256>${foundationdb.client-library-sha256}</sha256>
             </configuration>
           </plugin>
@@ -719,7 +759,7 @@
             </executions>
             <configuration>
               <from>
-                <image>eclipse-temurin@sha256:${docker.image.sha256}</image>
+                <image>${docker.image}</image>
                 <platforms>
                   <platform>
                     <architecture>amd64</architecture>
@@ -742,12 +782,10 @@
                   <jvmFlag>-Djdk.nio.maxCachedBufferSize=262144</jvmFlag>
                   <jvmFlag>-Dlog4j2.formatMsgNoLookups=true</jvmFlag>
                   <jvmFlag>-Djdk.tls.server.newSessionTicketCount=0</jvmFlag>
+                  <jvmFlag>-Djdk.tls.server.enableSessionTicketExtension=false</jvmFlag>
                   <jvmFlag>-XX:MaxRAMPercentage=75</jvmFlag>
                   <jvmFlag>-XX:+HeapDumpOnOutOfMemoryError</jvmFlag>
                   <jvmFlag>-XX:HeapDumpPath=/tmp/heapdump.bin</jvmFlag>
-                  <!-- This will likely become the default in a future version of Java, and we can remove this flag when
-                  that happens. Please see https://openjdk.org/jeps/534 for details. -->
-                  <jvmFlag>-XX:+UseCompactObjectHeaders</jvmFlag>
                 </jvmFlags>
                 <ports>
                   <port>8080</port>
@@ -818,7 +856,7 @@
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>templating-maven-plugin</artifactId>
-        <version>3.0.0</version>
+        <version>3.2.0</version>
         <executions>
           <execution>
             <id>filter-src</id>

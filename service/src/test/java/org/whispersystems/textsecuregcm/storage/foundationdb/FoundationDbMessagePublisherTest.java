@@ -6,7 +6,9 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.apple.foundationdb.Database;
@@ -16,26 +18,37 @@ import com.apple.foundationdb.Range;
 import com.apple.foundationdb.StreamingMode;
 import com.apple.foundationdb.Transaction;
 import com.apple.foundationdb.async.AsyncIterable;
-import java.nio.ByteBuffer;
-import java.security.SecureRandom;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
-import java.util.function.Function;
-import java.util.function.Supplier;
 import com.apple.foundationdb.tuple.Tuple;
 import com.apple.foundationdb.tuple.Versionstamp;
 import com.google.protobuf.InvalidProtocolBufferException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.security.SecureRandom;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.stubbing.Answer;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
+import org.whispersystems.textsecuregcm.storage.ConflictingMessageConsumerException;
 import org.whispersystems.textsecuregcm.storage.Device;
 import org.whispersystems.textsecuregcm.storage.MessageStreamEntry;
+import reactor.core.Disposable;
 import reactor.test.StepVerifier;
 
 /// NOTE: most of the happy-path test cases are already covered in {@link FoundationDbMessageStoreTest}, this test
@@ -43,7 +56,10 @@ import reactor.test.StepVerifier;
 class FoundationDbMessagePublisherTest {
 
   private Database database;
+  private FaultTolerantDatabase ftDatabase;
   private List<FoundationDbMessagePublisher.State> stateTransitions;
+
+  private static ScheduledExecutorService presenceRenewalExecutorService;
 
   private static final AciServiceIdentifier SERVICE_IDENTIFIER = new AciServiceIdentifier(UUID.randomUUID());
 
@@ -53,19 +69,34 @@ class FoundationDbMessagePublisherTest {
   private static final byte[] MESSAGES_AVAILABLE_WATCH_KEY =
       FoundationDbMessageStore.getMessagesAvailableWatchKey(SERVICE_IDENTIFIER);
 
-  private static final Supplier<Consumer<Transaction>> NOOP_ON_PAGE_FETCH = () -> _ -> {};
+  private static final Clock CLOCK = Clock.systemUTC();
+
+  private static final int STREAM_ID = ThreadLocalRandom.current().nextInt();
+
+  @BeforeAll
+  static void setUpBeforeAll() {
+    presenceRenewalExecutorService = Executors.newSingleThreadScheduledExecutor();
+  }
 
   @BeforeEach
   void setUp() {
     database = mock(Database.class);
+    ftDatabase = new FaultTolerantDatabase(database, getClass().getSimpleName() + "-testCircuitBreaker", null, null);
     stateTransitions = new ArrayList<>();
 
     final byte[] messageGuidCodecKey = new byte[16];
     new SecureRandom().nextBytes(messageGuidCodecKey);
   }
 
+  @AfterAll
+  static void tearDownAfterAll() throws InterruptedException {
+    presenceRenewalExecutorService.shutdown();
+    //noinspection ResultOfMethodCallIgnored
+    presenceRenewalExecutorService.awaitTermination(1, TimeUnit.SECONDS);
+  }
+
   @Test
-  void finitePublisherMultipleBatches() throws InvalidProtocolBufferException {
+  void finitePublisherMultipleBatches() {
     final MessageProtos.Envelope message1 = FoundationDbMessageStoreTest.generateRandomMessage(false);
     final MessageProtos.Envelope message2 = FoundationDbMessageStoreTest.generateRandomMessage(false);
     final MessageProtos.Envelope message3 = FoundationDbMessageStoreTest.generateRandomMessage(false);
@@ -94,16 +125,20 @@ class FoundationDbMessagePublisherTest {
         });
 
     final FoundationDbMessagePublisher finitePublisher = new FoundationDbMessagePublisher(
+        ftDatabase,
+        CLOCK,
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.end),
-        database,
-        2, // With 3 messages and batch size set to 2, we'll need to grab 2 batches.
+        STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
         null,
-        (_, newState) -> stateTransitions.add(newState),
-        NOOP_ON_PAGE_FETCH
+        null,
+        null,
+        (_, newState) -> stateTransitions.add(newState)
     );
 
-    StepVerifier.create(finitePublisher.getMessages())
+    // With 3 messages and batch size set to 2, we'll need to grab 2 batches.
+    StepVerifier.create(finitePublisher.getMessages().limitRate(2))
         .expectNext(getExpectedMessageStreamEntry(keyValue1))
         .expectNext(getExpectedMessageStreamEntry(keyValue2))
         .expectNext(getExpectedMessageStreamEntry(keyValue3))
@@ -164,11 +199,18 @@ class FoundationDbMessagePublisherTest {
         .thenReturn(watchFuture2)
         .thenReturn(watchFuture3);
 
+    when(transaction.get(FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID)))
+        .thenReturn(CompletableFuture.completedFuture(FoundationDbMessageStore.getPresenceValue(CLOCK.instant(), STREAM_ID)));
+
     final FoundationDbMessagePublisher infinitePublisher = new FoundationDbMessagePublisher(
+        ftDatabase,
+        CLOCK,
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(new byte[]{(byte) 10}),
-        database,
-        2,
+        STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        presenceRenewalExecutorService,
         MESSAGES_AVAILABLE_WATCH_KEY,
         (oldState, newState) -> {
           stateTransitions.add(newState);
@@ -184,15 +226,14 @@ class FoundationDbMessagePublisherTest {
               watchFuture2.complete(null);
             }
           }
-        },
-        NOOP_ON_PAGE_FETCH
+        }
     );
 
     StepVerifier.create(infinitePublisher.getMessages())
         .expectNext(getExpectedMessageStreamEntry(keyValue1))
         .expectNext(getExpectedMessageStreamEntry(keyValue2))
         .expectNext(getExpectedMessageStreamEntry(keyValue3))
-        .verifyTimeout(Duration.ofSeconds(1));
+        .verifyTimeout(Duration.ofMillis(100));
 
     assertEquals(List.of(
             FoundationDbMessagePublisher.State.FETCHING_MESSAGES, // Batch 1
@@ -214,7 +255,65 @@ class FoundationDbMessagePublisherTest {
   }
 
   @Test
-  void messageAvailableWatchSignalBuffered() throws InvalidProtocolBufferException {
+  @SuppressWarnings({"unchecked", "resource"})
+  void infinitePublisherConflictingConsumer() {
+    final MessageProtos.Envelope message1 = FoundationDbMessageStoreTest.generateRandomMessage(false);
+    final MessageProtos.Envelope message2 = FoundationDbMessageStoreTest.generateRandomMessage(false);
+
+    final KeyValue keyValue1 = mockKeyValue((byte) 5, message1);
+    final KeyValue keyValue2 = mockKeyValue((byte) 6, message2);
+
+    final AsyncIterable<KeyValue> batch1 = mock(AsyncIterable.class);
+    when(batch1.asList()).thenReturn(CompletableFuture.completedFuture(List.of(keyValue1)));
+
+    final AsyncIterable<KeyValue> batch2 = mock(AsyncIterable.class);
+    when(batch2.asList()).thenReturn(CompletableFuture.completedFuture(List.of(keyValue2)));
+
+    final AsyncIterable<KeyValue> empty = mock(AsyncIterable.class);
+    when(empty.asList()).thenReturn(CompletableFuture.completedFuture(List.of()));
+
+    final Transaction transaction = mock(Transaction.class);
+    when(transaction.getRange(any(KeySelector.class), any(KeySelector.class), anyInt(), anyBoolean(), any(
+        StreamingMode.class)))
+        .thenReturn(batch1)
+        .thenReturn(batch2)
+        .thenReturn(empty);
+
+    when(database.runAsync(any(Function.class))).thenAnswer(
+        (Answer<CompletableFuture<List<? extends MessageStreamEntry>>>) invocationOnMock -> {
+          final Function<Transaction, CompletableFuture<List<? extends MessageStreamEntry>>> f = invocationOnMock.getArgument(
+              0);
+          return f.apply(transaction);
+        });
+
+    when(transaction.watch(MESSAGES_AVAILABLE_WATCH_KEY)).thenReturn(new CompletableFuture<>());
+
+    when(transaction.get(FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID)))
+        .thenReturn(CompletableFuture.completedFuture(FoundationDbMessageStore.getPresenceValue(CLOCK.instant(), STREAM_ID)))
+        // Return presence values from a different stream to simulate a conflicting reader
+        .thenReturn(CompletableFuture.completedFuture(FoundationDbMessageStore.getPresenceValue(CLOCK.instant(), STREAM_ID + 1)));
+
+    final FoundationDbMessagePublisher infinitePublisher = new FoundationDbMessagePublisher(
+        ftDatabase,
+        CLOCK,
+        KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
+        KeySelector.firstGreaterOrEqual(new byte[]{(byte) 10}),
+        STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        presenceRenewalExecutorService,
+        MESSAGES_AVAILABLE_WATCH_KEY,
+        (_, _) -> {}
+    );
+
+    StepVerifier.create(infinitePublisher.getMessages().limitRate(1))
+        .expectNext(getExpectedMessageStreamEntry(keyValue1))
+        .expectError(ConflictingMessageConsumerException.class)
+        .verify();
+  }
+
+  @Test
+  void messageAvailableWatchSignalBuffered() {
     final MessageProtos.Envelope message1 = FoundationDbMessageStoreTest.generateRandomMessage(false);
     final MessageProtos.Envelope message2 = FoundationDbMessageStoreTest.generateRandomMessage(false);
 
@@ -246,11 +345,18 @@ class FoundationDbMessagePublisherTest {
         .thenReturn(watchFuture1)
         .thenReturn(watchFuture2);
 
+    when(transaction.get(FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID)))
+        .thenReturn(CompletableFuture.completedFuture(FoundationDbMessageStore.getPresenceValue(CLOCK.instant(), STREAM_ID)));
+
     final FoundationDbMessagePublisher infinitePublisher = new FoundationDbMessagePublisher(
+        ftDatabase,
+        CLOCK,
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterOrEqual(new byte[]{(byte) 10}),
-        database,
-        2,
+        STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        presenceRenewalExecutorService,
         MESSAGES_AVAILABLE_WATCH_KEY,
         (oldState, newState) -> {
           stateTransitions.add(newState);
@@ -264,14 +370,13 @@ class FoundationDbMessagePublisherTest {
                   .count() == 1) {
             watchFuture1.complete(null);
           }
-        },
-        NOOP_ON_PAGE_FETCH
+        }
     );
 
     StepVerifier.create(infinitePublisher.getMessages())
         .expectNext(getExpectedMessageStreamEntry(keyValue1))
         .expectNext(getExpectedMessageStreamEntry(keyValue2))
-        .verifyTimeout(Duration.ofSeconds(1));
+        .verifyTimeout(Duration.ofMillis(100));
 
     assertEquals(List.of(
             FoundationDbMessagePublisher.State.FETCHING_MESSAGES, // Batch 1
@@ -291,14 +396,17 @@ class FoundationDbMessagePublisherTest {
 
   @Test
   @SuppressWarnings({"unchecked", "resource"})
-  void watchCanceledOnSubscriptionCancel() throws InvalidProtocolBufferException {
+  void watchCanceledOnSubscriptionCancel() {
     final FoundationDbMessagePublisher infinitePublisher = FoundationDbMessagePublisher.createInfinitePublisher(
+        ftDatabase,
+        CLOCK,
         KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
         KeySelector.firstGreaterThan(SUBSPACE_RANGE.end),
-        database,
-        100,
-        MESSAGES_AVAILABLE_WATCH_KEY,
-        () -> _ -> {});
+        STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        presenceRenewalExecutorService,
+        MESSAGES_AVAILABLE_WATCH_KEY);
     final MessageProtos.Envelope message = FoundationDbMessageStoreTest.generateRandomMessage(false);
     final Transaction transaction = mock(Transaction.class);
     final KeyValue keyValue = mockKeyValue((byte) 5, message);
@@ -309,6 +417,9 @@ class FoundationDbMessagePublisherTest {
         .thenReturn(asyncIterable);
     final CompletableFuture<Void> watchFuture = mock(CompletableFuture.class);
     when(transaction.watch(MESSAGES_AVAILABLE_WATCH_KEY)).thenReturn(watchFuture);
+
+    when(transaction.get(FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID)))
+        .thenReturn(CompletableFuture.completedFuture(FoundationDbMessageStore.getPresenceValue(CLOCK.instant(), STREAM_ID)));
 
     when(database.runAsync(any(Function.class))).thenAnswer(
         (Answer<CompletableFuture<List<? extends MessageStreamEntry>>>) invocationOnMock -> {
@@ -324,8 +435,198 @@ class FoundationDbMessagePublisherTest {
     verify(watchFuture).cancel(true);
   }
 
+  @Test
+  @SuppressWarnings({"unchecked", "resource"})
+  void terminateWithError() {
+    final MessageProtos.Envelope message = FoundationDbMessageStoreTest.generateRandomMessage(false);
+
+    final KeyValue keyValue = mockKeyValue((byte) 5, message);
+
+    final AsyncIterable<KeyValue> keyValues = mock(AsyncIterable.class);
+    when(keyValues.asList()).thenReturn(CompletableFuture.completedFuture(List.of(keyValue)));
+
+    final Transaction transaction = mock(Transaction.class);
+    when(transaction.getRange(any(KeySelector.class), any(KeySelector.class), anyInt(), anyBoolean(), any(StreamingMode.class)))
+        .thenReturn(keyValues);
+    when(transaction.get(FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID)))
+        .thenAnswer(_ -> CompletableFuture.completedFuture(FoundationDbMessageStore.getPresenceValue(CLOCK.instant(), STREAM_ID)));
+    when(transaction.watch(any()))
+        .thenReturn(new CompletableFuture<>());
+
+    when(database.runAsync(any(Function.class))).thenAnswer(
+        (Answer<CompletableFuture<List<? extends MessageStreamEntry>>>) invocationOnMock -> {
+          final Function<Transaction, CompletableFuture<List<? extends MessageStreamEntry>>> f = invocationOnMock.getArgument(
+              0);
+          return f.apply(transaction);
+        });
+
+    final FoundationDbMessagePublisher infinitePublisher = new FoundationDbMessagePublisher(
+        ftDatabase,
+        CLOCK,
+        KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
+        KeySelector.firstGreaterOrEqual(new byte[]{(byte) 10}),
+        STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        presenceRenewalExecutorService,
+        MESSAGES_AVAILABLE_WATCH_KEY,
+        (_, newState) -> stateTransitions.add(newState)
+    );
+
+    final RuntimeException streamTerminationException = new RuntimeException("Stream terminated");
+
+    StepVerifier.create(infinitePublisher.getMessages())
+        .expectNext(getExpectedMessageStreamEntry(keyValue))
+        .then(() -> infinitePublisher.terminateWithError(streamTerminationException))
+        .verifyErrorMatches(throwable -> throwable.equals(streamTerminationException));
+
+    assertEquals(List.of(
+            FoundationDbMessagePublisher.State.FETCHING_MESSAGES,
+            FoundationDbMessagePublisher.State.QUEUE_EMPTY,
+            FoundationDbMessagePublisher.State.AWAITING_NEW_MESSAGES,
+            FoundationDbMessagePublisher.State.ERROR
+        ),
+        stateTransitions
+    );
+  }
+
+  @Test
+  void onRequestFlowControl() {
+    final MessageProtos.Envelope message1 = FoundationDbMessageStoreTest.generateRandomMessage(false);
+    final MessageProtos.Envelope message2 = FoundationDbMessageStoreTest.generateRandomMessage(false);
+    final MessageProtos.Envelope message3 = FoundationDbMessageStoreTest.generateRandomMessage(false);
+
+    final KeyValue keyValue1 = mockKeyValue((byte) 5, message1);
+    final KeyValue keyValue2 = mockKeyValue((byte) 6, message2);
+    final KeyValue keyValue3 = mockKeyValue((byte) 7, message3);
+
+    final Deque<KeyValue> keyValues = new ArrayDeque<>(List.of(keyValue1, keyValue2, keyValue3));
+
+    final Transaction transaction = mock(Transaction.class);
+    when(transaction.getRange(any(KeySelector.class), any(), anyInt(), anyBoolean(), any(StreamingMode.class)))
+        .thenAnswer(invocation -> {
+          final int limit = invocation.getArgument(2);
+          final List<KeyValue> results = new ArrayList<>();
+
+          for (int i = 0; i < limit && !keyValues.isEmpty(); i++) {
+            results.add(keyValues.removeFirst());
+          }
+
+          final AsyncIterable<KeyValue> asyncIterable = mock(AsyncIterable.class);
+          when(asyncIterable.asList()).thenReturn(CompletableFuture.completedFuture(results));
+
+          return asyncIterable;
+        });
+
+    when(database.runAsync(any(Function.class))).thenAnswer(
+        (Answer<CompletableFuture<List<? extends MessageStreamEntry>>>) invocation -> {
+          final Function<Transaction, CompletableFuture<List<? extends MessageStreamEntry>>> retryable =
+              invocation.getArgument(0);
+
+          return retryable.apply(transaction);
+        });
+
+    final CountDownLatch latch = new CountDownLatch(1);
+    final FoundationDbMessagePublisher finitePublisher = new FoundationDbMessagePublisher(
+        ftDatabase,
+        CLOCK,
+        KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
+        KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.end),
+        STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        null,
+        null,
+        null,
+        (oldState, newState) -> {
+          if (oldState == FoundationDbMessagePublisher.State.FETCHING_MESSAGES
+              && newState == FoundationDbMessagePublisher.State.MESSAGES_AVAILABLE) {
+            latch.countDown();
+          }
+        }
+    );
+
+    StepVerifier.create(finitePublisher.getMessages(), 2)
+        .expectNext(getExpectedMessageStreamEntry(keyValue1))
+        .expectNext(getExpectedMessageStreamEntry(keyValue2))
+        .thenRequest(1)
+        .expectNext(getExpectedMessageStreamEntry(keyValue3))
+        .thenRequest(1)
+        .verifyComplete();
+
+    // We expect three invocations:
+    //
+    // 1. The first batch of 2 messages
+    // 2. The second batch of a single message
+    // 3. The third request for a single message that returns nothing and causes the stream to complete
+    verify(transaction, times(3))
+        .getRange(any(KeySelector.class), any(KeySelector.class), anyInt(), anyBoolean(), any());
+  }
+
+  @Test
+  @SuppressWarnings({"unchecked"})
+  void watchSetAfterTerminationIsCancelled() {
+    final Transaction transaction = mock(Transaction.class);
+
+    final CompletableFuture<List<KeyValue>> batchFuture = new CompletableFuture<>();
+    final AsyncIterable<KeyValue> batch = mock(AsyncIterable.class);
+    when(batch.asList()).thenReturn(batchFuture);
+    when(transaction.getRange(any(KeySelector.class), any(KeySelector.class), anyInt(), anyBoolean(),
+        any(StreamingMode.class)))
+        .thenReturn(batch);
+
+    final CompletableFuture<Void> watchFuture = mock(CompletableFuture.class);
+    when(transaction.watch(MESSAGES_AVAILABLE_WATCH_KEY)).thenReturn(watchFuture);
+    when(transaction.get(FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID)))
+        .thenReturn(CompletableFuture.completedFuture(null));
+
+    when(database.runAsync(any(Function.class))).thenAnswer(
+        (Answer<CompletableFuture<List<? extends MessageStreamEntry>>>) invocationOnMock -> {
+          final Function<Transaction, CompletableFuture<List<? extends MessageStreamEntry>>> f =
+              invocationOnMock.getArgument(0);
+          return f.apply(transaction);
+        });
+
+    final FoundationDbMessagePublisher infinitePublisher = new FoundationDbMessagePublisher(
+        ftDatabase,
+        CLOCK,
+        KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.begin),
+        KeySelector.firstGreaterOrEqual(SUBSPACE_RANGE.end),
+        STREAM_ID,
+        FoundationDbMessageStore.getReadsSinceLastAcknowledgedMessageKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        FoundationDbMessageStore.getPresenceKey(SERVICE_IDENTIFIER, Device.PRIMARY_ID),
+        presenceRenewalExecutorService,
+        MESSAGES_AVAILABLE_WATCH_KEY,
+        (_, newState) -> stateTransitions.add(newState)
+    );
+
+    // Subscribe requests demand synchronously, and the publisher begins fetching messages; however we control the fetch
+    // result future, so the state here should be FETCHING_MESSAGES
+    final Disposable subscription = infinitePublisher.getMessages().subscribe(_ -> {}, _ -> {});
+    verify(transaction, times(1)).getRange(any(KeySelector.class), any(KeySelector.class), anyInt(), anyBoolean(),
+        any(StreamingMode.class));
+
+    // Dispose the subscription while the fetch is still in flight
+    subscription.dispose();
+
+    // Complete the fetch result now, which should normally set the watch
+    batchFuture.complete(List.of());
+
+    // Verify that the watch was never set
+    verify(transaction, times(0)).watch(MESSAGES_AVAILABLE_WATCH_KEY);
+    verifyNoInteractions(watchFuture);
+    assertEquals(List.of(
+        FoundationDbMessagePublisher.State.FETCHING_MESSAGES,
+        FoundationDbMessagePublisher.State.TERMINATED
+    ), stateTransitions);
+  }
+
   private FoundationDbMessageStreamEntry.Message getExpectedMessageStreamEntry(final KeyValue keyValue) {
-    return new FoundationDbMessageStreamEntry.Message(FoundationDbMessageStore.getVersionstamp(keyValue.getKey()), keyValue.getValue());
+    try {
+      return new FoundationDbMessageStreamEntry.Message(FoundationDbMessageStore.getVersionstamp(keyValue.getKey()),
+          MessageProtos.Envelope.parseFrom(keyValue.getValue()));
+    } catch (final InvalidProtocolBufferException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   private static KeyValue mockKeyValue(final byte key, final MessageProtos.Envelope message) {

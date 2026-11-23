@@ -157,7 +157,7 @@ class PushNotificationManagerTest {
     final Device device = mock(Device.class);
 
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
 
     AccountsHelper.setupMockGet(accountsManager, account);
@@ -190,7 +190,7 @@ class PushNotificationManagerTest {
 
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
-    when(account.getUuid()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
 
     final PushNotification pushNotification = new PushNotification(
         "token", tokenType, PushNotification.NotificationType.NOTIFICATION, null, account, device, urgent, null);
@@ -226,8 +226,8 @@ class PushNotificationManagerTest {
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
     when(device.getGcmId()).thenReturn("token");
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
-    when(account.getUuid()).thenReturn(aci);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
     when(accountsManager.getByAccountIdentifier(aci)).thenReturn(Optional.of(account));
 
     final PushNotification pushNotification = new PushNotification(
@@ -252,8 +252,8 @@ class PushNotificationManagerTest {
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
     when(device.getApnId()).thenReturn("apns-token");
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
-    when(account.getUuid()).thenReturn(aci);
-    when(account.getIdentifier(IdentityType.ACI)).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
     when(accountsManager.getByAccountIdentifier(aci)).thenReturn(Optional.of(account));
 
     final PushNotification pushNotification = new PushNotification(
@@ -284,7 +284,7 @@ class PushNotificationManagerTest {
     when(device.getApnId()).thenReturn("apns-token");
     when(device.getPushTimestamp()).thenReturn(tokenTimestamp.toEpochMilli());
     when(account.getDevice(Device.PRIMARY_ID)).thenReturn(Optional.of(device));
-    when(account.getUuid()).thenReturn(aci);
+    when(account.getAccountIdentifier()).thenReturn(aci);
     when(accountsManager.getByAccountIdentifier(aci)).thenReturn(Optional.of(account));
 
     final PushNotification pushNotification = new PushNotification(
@@ -311,7 +311,7 @@ class PushNotificationManagerTest {
     final Device device = mock(Device.class);
     final String userAgent = HttpHeaders.USER_AGENT;
 
-    when(account.getUuid()).thenReturn(accountIdentifier);
+    when(account.getAccountIdentifier()).thenReturn(accountIdentifier);
     when(device.getId()).thenReturn(Device.PRIMARY_ID);
 
     when(pushNotificationScheduler.cancelScheduledNotifications(account, device))

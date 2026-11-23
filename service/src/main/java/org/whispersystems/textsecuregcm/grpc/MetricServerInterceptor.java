@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.LongAdder;
 import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,6 +59,7 @@ public class MetricServerInterceptor implements ServerInterceptor {
   static final String REQUEST_BYTES_COUNTER_NAME = MetricsUtil.name(MetricServerInterceptor.class, "requestBytes");
   @VisibleForTesting
   static final String RESPONSE_COUNTER_NAME = MetricsUtil.name(MetricServerInterceptor.class, "responseMessage");
+  /// Response bytes as written to the wire (i.e. after compression), as reported by [MetricServerStreamTracer]
   @VisibleForTesting
   static final String RESPONSE_BYTES_COUNTER_NAME = MetricsUtil.name(MetricServerInterceptor.class, "responseBytes");
   @VisibleForTesting
@@ -65,12 +67,19 @@ public class MetricServerInterceptor implements ServerInterceptor {
   @VisibleForTesting
   static final String DURATION_TIMER_NAME = MetricsUtil.name(MetricServerInterceptor.class, "processingDuration");
 
+  private static final String ACTIVE_REQUESTS_GAUGE_NAME =
+      MetricsUtil.name(MetricServerInterceptor.class, "activeRequests");
+
   private final MeterRegistry meterRegistry;
   private final ClientReleaseManager clientReleaseManager;
+
+  private final LongAdder activeRequests;
 
   public MetricServerInterceptor(final MeterRegistry meterRegistry, final ClientReleaseManager clientReleaseManager) {
     this.meterRegistry = meterRegistry;
     this.clientReleaseManager = clientReleaseManager;
+
+    this.activeRequests = meterRegistry.gauge(ACTIVE_REQUESTS_GAUGE_NAME, new LongAdder());
   }
 
   @Override
@@ -105,21 +114,22 @@ public class MetricServerInterceptor implements ServerInterceptor {
   private class MetricServerCall<ReqT, RespT> extends ForwardingServerCall.SimpleForwardingServerCall<ReqT, RespT> {
 
     private final Counter responseMessageCounter;
-    private final Counter responseBytesCounter;
     private final Tags tags;
     private @Nullable String reason = null;
 
     MetricServerCall(final ServerCall<ReqT, RespT> delegate, final Tags tags) {
       super(delegate);
       this.responseMessageCounter = meterRegistry.counter(RESPONSE_COUNTER_NAME, tags);
-      this.responseBytesCounter = meterRegistry.counter(RESPONSE_BYTES_COUNTER_NAME, tags);
       this.tags = tags;
+
+      MetricServerStreamTracer.current().ifPresent(tracer ->
+          tracer.setResponseBytesCounter(meterRegistry.counter(RESPONSE_BYTES_COUNTER_NAME, tags)));
     }
 
     @Override
     public void close(final Status status, final Metadata responseHeaders) {
       if (!status.isOk()) {
-        reason = errorInfo(StatusProto.fromStatusAndTrailers(status, responseHeaders))
+        reason = ErrorUtil.errorInfo(StatusProto.fromStatusAndTrailers(status, responseHeaders))
             .map(ErrorInfo::getReason)
             .orElse(DEFAULT_ERROR_REASON);
       }
@@ -134,10 +144,6 @@ public class MetricServerInterceptor implements ServerInterceptor {
     @Override
     public void sendMessage(final RespT responseMessage) {
       this.responseMessageCounter.increment();
-
-      if (responseMessage instanceof GeneratedMessage generatedMessage) {
-        this.responseBytesCounter.increment(generatedMessage.getSerializedSize());
-      }
 
       // Extract the annotated reason (if any) from the message
       final String messageReason = MetricServerCall.reason(responseMessage);
@@ -194,6 +200,8 @@ public class MetricServerInterceptor implements ServerInterceptor {
       this.requestBytesCounter = meterRegistry.counter(REQUEST_BYTES_COUNTER_NAME, tags);
       this.responseTimer = meterRegistry.timer(DURATION_TIMER_NAME, tags);
       this.sample = Timer.start(meterRegistry);
+
+      activeRequests.increment();
     }
 
     @Override
@@ -210,26 +218,16 @@ public class MetricServerInterceptor implements ServerInterceptor {
     @Override
     public void onComplete() {
       this.sample.stop(responseTimer);
+      activeRequests.decrement();
       super.onComplete();
     }
 
     @Override
     public void onCancel() {
       this.sample.stop(responseTimer);
+      activeRequests.decrement();
       super.onCancel();
     }
   }
 
-  private static Optional<ErrorInfo> errorInfo(final com.google.rpc.Status statusProto) {
-    return statusProto.getDetailsList().stream()
-        .filter(any -> any.is(ErrorInfo.class))
-        .map(errorInfo -> {
-          try {
-            return errorInfo.unpack(ErrorInfo.class);
-          } catch (final InvalidProtocolBufferException e) {
-            throw new UncheckedIOException(e);
-          }
-        })
-        .findFirst();
-  }
 }

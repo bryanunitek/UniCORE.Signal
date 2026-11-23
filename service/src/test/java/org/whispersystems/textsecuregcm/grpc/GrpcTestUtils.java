@@ -7,9 +7,11 @@ package org.whispersystems.textsecuregcm.grpc;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.protobuf.Message;
 import com.google.rpc.ErrorInfo;
 import com.google.rpc.RetryInfo;
@@ -19,6 +21,7 @@ import java.time.Duration;
 import io.grpc.protobuf.StatusProto;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.function.Executable;
+import org.junit.jupiter.api.function.ThrowingSupplier;
 
 public final class GrpcTestUtils {
 
@@ -26,29 +29,29 @@ public final class GrpcTestUtils {
     // noop
   }
 
-  public static StatusRuntimeException assertStatusException(final Status expected, final Executable serviceCall) {
-    final StatusRuntimeException exception = Assertions.assertThrows(StatusRuntimeException.class, serviceCall);
+  @CanIgnoreReturnValue
+  public static StatusRuntimeException assertStatusException(final Status expected, final ThrowingSupplier<?> serviceCall) {
+    final StatusRuntimeException exception = Assertions.assertThrows(StatusRuntimeException.class, serviceCall::get);
     assertEquals(expected.getCode(), exception.getStatus().getCode());
 
     return exception;
   }
 
-  public static void assertStatusException(final Status expected, final String expectedReason, final Executable serviceCall) {
-    final StatusRuntimeException exception = Assertions.assertThrows(StatusRuntimeException.class, serviceCall);
+  public static void assertStatusException(final Status expected, final String expectedReason, final Throwable throwable) {
+    final StatusRuntimeException exception = Assertions.assertInstanceOf(StatusRuntimeException.class, throwable);
     assertEquals(expected.getCode(), exception.getStatus().getCode());
     assertEquals(expectedReason, extractErrorInfo(exception).getReason());
   }
 
-  public static StatusRuntimeException assertStatusInvalidArgument(final Executable serviceCall) {
+  public static void assertStatusException(final Status expected, final String expectedReason, final ThrowingSupplier<?> serviceCall) {
+    final StatusRuntimeException exception = Assertions.assertThrows(StatusRuntimeException.class, serviceCall::get);
+    assertEquals(expected.getCode(), exception.getStatus().getCode());
+    assertEquals(expectedReason, extractErrorInfo(exception).getReason());
+  }
+
+  @CanIgnoreReturnValue
+  public static StatusRuntimeException assertStatusInvalidArgument(final ThrowingSupplier<?> serviceCall) {
     return assertStatusException(Status.INVALID_ARGUMENT, serviceCall);
-  }
-
-  public static StatusRuntimeException assertStatusUnauthenticated(final Executable serviceCall) {
-    return assertStatusException(Status.UNAUTHENTICATED, serviceCall);
-  }
-
-  public static StatusRuntimeException assertStatusPermissionDenied(final Executable serviceCall) {
-    return assertStatusException(Status.PERMISSION_DENIED, serviceCall);
   }
 
   public static void assertRateLimitExceeded(
@@ -69,6 +72,13 @@ public final class GrpcTestUtils {
     for (final Object mock: mocksToCheckForNoInteraction) {
       verifyNoInteractions(mock);
     }
+  }
+
+  public static <T extends Message> T assertStreamClosed(final Class<T> streamClosedMessageClass, final Throwable exception) {
+    final StatusRuntimeException statusRuntimeException = assertInstanceOf(StatusRuntimeException.class, exception);
+    final ErrorInfo errorInfo = extractErrorInfo(statusRuntimeException);
+    assertEquals("STREAM_CLOSED", errorInfo.getReason());
+    return extractDetail(streamClosedMessageClass, statusRuntimeException);
   }
 
   public static ErrorInfo extractErrorInfo(final StatusRuntimeException exception) {

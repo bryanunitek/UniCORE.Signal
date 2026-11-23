@@ -18,6 +18,7 @@ import "org/signal/chat/tag.proto";
 
 // Provides methods for working with pre-keys.
 service Keys {
+  option (require.auth) = AUTH_ONLY_AUTHENTICATED;
 
   // Retrieves an approximate count of the number of the various kinds of
   // pre-keys stored for the authenticated device.
@@ -57,6 +58,7 @@ service Keys {
 // Provides methods for working with pre-keys using "unidentified access"
 // credentials.
 service KeysAnonymous {
+  option (require.auth) = AUTH_ONLY_ANONYMOUS;
 
   // Retrieves a set of pre-keys for establishing a session with the targeted
   // device or devices. Callers must not submit any self-identifying credentials
@@ -86,11 +88,13 @@ message GetPreKeyCountResponse {
   uint32 aci_kem_pre_key_count = 2;
 
   // The approximate number of one-time EC pre-keys stored for the
-  // authenticated device and associated with the caller's PNI.
+  // authenticated device and associated with the caller's PNI. 0 if
+  // the account does not possess a phone number.
   uint32 pni_ec_pre_key_count = 3;
 
   // The approximate number of one-time KEM pre-keys stored for the
-  // authenticated device and associated with the caller's PNI.
+  // authenticated device and associated with the caller's PNI. 0 if
+  // the account does not possess a phone number.
   uint32 pni_kem_pre_key_count = 4;
 }
 
@@ -106,6 +110,7 @@ message GetPreKeysRequest {
 
 message GetPreKeysAnonymousRequest {
   // The request to retrieve pre-keys for a specific account/device(s).
+  // If `request.target_identifier` is a PNI, `authorization` must be a group send token.
   GetPreKeysRequest request = 1;
 
   // A means to authorize the request.
@@ -132,7 +137,7 @@ message DevicePreKeyBundle {
 
   // A one-time KEM pre-key (or a last-resort KEM pre-key) for the targeted
   // account/device/identity.
-  common.KemSignedPreKey kem_one_time_pre_key = 3;
+  common.KemSignedPreKey kem_pre_key = 3;
 
   // The registration ID for the targeted account/device/identity.
   uint32 registration_id = 4;
@@ -144,6 +149,15 @@ message AccountPreKeyBundles {
 
   // A map of device IDs to pre-key "bundles" for the targeted account.
   map<uint32, DevicePreKeyBundle> device_pre_keys = 2;
+
+  // Whether the account has enabled sealed sender from anyone. Always false
+  // if the request was for a PNI, which does not allow any unidentified access.
+  bool unrestricted_unidentified_access = 3;
+
+  // If the target supports unidentified access and has an unidentified access
+  // key, a fingerprint of the target's UAK. This may be used to detect a change
+  // in the UAK that the sender has for the target before actually sending a message. Otherwise, empty.
+  bytes unidentified_access_key_fingerprint = 4;
 }
 
 message GetPreKeysResponse {
@@ -216,8 +230,16 @@ message CheckIdentityKeyRequest {
 }
 
 message CheckIdentityKeyResponse {
-  // The service identifier of the account for which there is a mismatch between the client and server identity key fingerprints.
-  common.ServiceIdentifier target_identifier = 1;
-  // The identity key that is stored by the server for the target account/identity type.
-  bytes identity_key = 2;
+
+  oneof response {
+    // The key for the target account/identity type matched.
+    google.protobuf.Empty matched = 1;
+
+    // The identity key that is stored by the server for the target account/identity type.
+    bytes identity_key = 2;
+
+    // Either the target account was not found, or it has no identity key for
+    // the requested identity type.
+    errors.NotFound target_not_found = 3 [(tag.reason) = "not_found"];
+  }
 }

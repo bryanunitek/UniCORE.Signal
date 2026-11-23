@@ -7,6 +7,8 @@ package org.whispersystems.textsecuregcm;
 import static java.util.Objects.requireNonNull;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
+import com.apple.foundationdb.Database;
+import com.apple.foundationdb.FDB;
 import com.google.common.collect.Lists;
 import com.webauthn4j.appattest.DeviceCheckManager;
 import io.dropwizard.auth.AuthDynamicFeature;
@@ -31,10 +33,11 @@ import io.lettuce.core.metrics.MicrometerOptions;
 import io.lettuce.core.resource.ClientResources;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.binder.jvm.ExecutorServiceMetrics;
-import io.netty.channel.DefaultEventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.local.LocalAddress;
+import io.netty.channel.local.LocalIoHandler;
 import io.netty.channel.local.LocalServerChannel;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
@@ -44,6 +47,8 @@ import io.netty.resolver.dns.DnsNameResolverBuilder;
 import io.netty.util.Mapping;
 import jakarta.servlet.DispatcherType;
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.net.http.HttpClient;
@@ -53,6 +58,7 @@ import java.time.Duration;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceLoader;
 import java.util.Set;
@@ -63,11 +69,14 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import javax.annotation.Nullable;
 import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.eclipse.jetty.websocket.core.WebSocketExtensionRegistry;
 import org.eclipse.jetty.websocket.core.server.WebSocketServerComponents;
 import org.glassfish.jersey.server.ServerProperties;
+import org.signal.chat.require.Auth;
 import org.signal.i18n.HeaderControlledResourceBundleLookup;
 import org.signal.libsignal.zkgroup.GenericServerSecretParams;
 import org.signal.libsignal.zkgroup.ServerSecretParams;
@@ -90,6 +99,7 @@ import org.whispersystems.textsecuregcm.auth.ExternalServiceCredentialsGenerator
 import org.whispersystems.textsecuregcm.auth.IdlePrimaryDeviceAuthenticatedWebSocketUpgradeFilter;
 import org.whispersystems.textsecuregcm.auth.PhoneVerificationTokenManager;
 import org.whispersystems.textsecuregcm.auth.RegistrationLockVerificationManager;
+import org.whispersystems.textsecuregcm.auth.webauthn.WebAuthnCeremonyManager;
 import org.whispersystems.textsecuregcm.auth.grpc.ProhibitAuthenticationInterceptor;
 import org.whispersystems.textsecuregcm.auth.grpc.RequireAuthenticationInterceptor;
 import org.whispersystems.textsecuregcm.backup.BackupAuthManager;
@@ -103,6 +113,8 @@ import org.whispersystems.textsecuregcm.captcha.CaptchaChecker;
 import org.whispersystems.textsecuregcm.captcha.CaptchaClient;
 import org.whispersystems.textsecuregcm.captcha.RegistrationCaptchaManager;
 import org.whispersystems.textsecuregcm.captcha.ShortCodeExpander;
+import org.whispersystems.textsecuregcm.configuration.BadgeConfiguration;
+import org.whispersystems.textsecuregcm.configuration.FoundationDbExternalClientConfiguration;
 import org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
 import org.whispersystems.textsecuregcm.configuration.secrets.SecretStore;
 import org.whispersystems.textsecuregcm.configuration.secrets.SecretsModule;
@@ -122,6 +134,7 @@ import org.whispersystems.textsecuregcm.controllers.DonationController;
 import org.whispersystems.textsecuregcm.controllers.KeepAliveController;
 import org.whispersystems.textsecuregcm.controllers.KeyTransparencyController;
 import org.whispersystems.textsecuregcm.controllers.KeysController;
+import org.whispersystems.textsecuregcm.controllers.LoginPurchaseController;
 import org.whispersystems.textsecuregcm.controllers.MessageController;
 import org.whispersystems.textsecuregcm.controllers.OneTimeDonationController;
 import org.whispersystems.textsecuregcm.controllers.PaymentsController;
@@ -152,53 +165,70 @@ import org.whispersystems.textsecuregcm.grpc.AttachmentsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.BackupsAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.BackupsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.CallQualitySurveyGrpcService;
+import org.whispersystems.textsecuregcm.grpc.CallingGrpcService;
 import org.whispersystems.textsecuregcm.grpc.ChallengeGrpcService;
+import org.whispersystems.textsecuregcm.grpc.CredentialsAnonymousGrpcService;
+import org.whispersystems.textsecuregcm.grpc.CredentialsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.DevicesGrpcService;
+import org.whispersystems.textsecuregcm.grpc.DonationsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.ErrorConformanceInterceptor;
+import org.whispersystems.textsecuregcm.grpc.ConcurrentCallLimitingInterceptor;
 import org.whispersystems.textsecuregcm.grpc.ErrorMappingInterceptor;
-import org.whispersystems.textsecuregcm.grpc.ExternalServiceCredentialsAnonymousGrpcService;
-import org.whispersystems.textsecuregcm.grpc.ExternalServiceCredentialsGrpcService;
+import org.whispersystems.textsecuregcm.grpc.ExternalServiceDefinitions;
 import org.whispersystems.textsecuregcm.grpc.GroupSendTokenUtil;
 import org.whispersystems.textsecuregcm.grpc.GrpcAllowListInterceptor;
+import org.whispersystems.textsecuregcm.grpc.GrpcCompressionInterceptor;
+import org.whispersystems.textsecuregcm.grpc.KeyTransparencyGrpcService;
 import org.whispersystems.textsecuregcm.grpc.KeysAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.KeysGrpcService;
+import org.whispersystems.textsecuregcm.grpc.LoginPurchaseGrpcService;
+import org.whispersystems.textsecuregcm.grpc.MessageDispatcher;
 import org.whispersystems.textsecuregcm.grpc.MessagesAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.MessagesGrpcService;
 import org.whispersystems.textsecuregcm.grpc.MetricServerInterceptor;
+import org.whispersystems.textsecuregcm.grpc.MetricServerStreamTracer;
+import org.whispersystems.textsecuregcm.grpc.OneTimeDonationsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.PaymentsGrpcService;
+import org.whispersystems.textsecuregcm.grpc.ProductConfigurationGrpcService;
 import org.whispersystems.textsecuregcm.grpc.ProfileAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.ProfileGrpcService;
+import org.whispersystems.textsecuregcm.grpc.RemoteConfigurationGrpcService;
 import org.whispersystems.textsecuregcm.grpc.RequestAttributesInterceptor;
+import org.whispersystems.textsecuregcm.grpc.SubscriptionsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.ValidatingInterceptor;
-import org.whispersystems.textsecuregcm.grpc.net.ManagedGrpcServer;
+import org.whispersystems.textsecuregcm.grpc.net.H2ConnectionFactory;
 import org.whispersystems.textsecuregcm.grpc.net.ManagedEventLoopGroup;
+import org.whispersystems.textsecuregcm.grpc.net.ManagedGrpcServer;
 import org.whispersystems.textsecuregcm.grpc.net.OmnibusH2Server;
 import org.whispersystems.textsecuregcm.grpc.net.OmnibusRouter;
+import org.whispersystems.textsecuregcm.grpc.net.PooledH2ConnectionFactory;
 import org.whispersystems.textsecuregcm.grpc.net.SniMapper;
+import org.whispersystems.textsecuregcm.grpc.net.UnpooledH2ConnectionFactory;
+import org.whispersystems.textsecuregcm.grpc.validators.ValidatorUtils;
 import org.whispersystems.textsecuregcm.jetty.JettyHttpConfigurationCustomizer;
 import org.whispersystems.textsecuregcm.keytransparency.KeyTransparencyServiceClient;
 import org.whispersystems.textsecuregcm.limits.CardinalityEstimator;
-import org.whispersystems.textsecuregcm.limits.MessageDeliveryLoopMonitor;
-import org.whispersystems.textsecuregcm.limits.NoopMessageDeliveryLoopMonitor;
 import org.whispersystems.textsecuregcm.limits.PushChallengeManager;
 import org.whispersystems.textsecuregcm.limits.RateLimitByIpFilter;
 import org.whispersystems.textsecuregcm.limits.RateLimitChallengeManager;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
-import org.whispersystems.textsecuregcm.limits.RedisMessageDeliveryLoopMonitor;
 import org.whispersystems.textsecuregcm.mappers.BackupExceptionMapper;
+import org.whispersystems.textsecuregcm.mappers.CallNotPermittedExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.CompletionExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.DeviceLimitExceededExceptionMapper;
-import org.whispersystems.textsecuregcm.mappers.GrpcStatusRuntimeExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.IOExceptionMapper;
+import org.whispersystems.textsecuregcm.mappers.IllegalStateExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.ImpossiblePhoneNumberExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.InvalidWebsocketAddressExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.JsonMappingExceptionMapper;
+import org.whispersystems.textsecuregcm.mappers.MfaFailureExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.NonNormalizedPhoneNumberExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.ObsoletePhoneNumberFormatExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.RateLimitExceededExceptionMapper;
+import org.whispersystems.textsecuregcm.mappers.RegistrationLockFailureExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.RegistrationServiceSenderExceptionMapper;
 import org.whispersystems.textsecuregcm.mappers.ServerRejectedExceptionMapper;
-import org.whispersystems.textsecuregcm.mappers.SubscriptionExceptionMapper;
+import org.whispersystems.textsecuregcm.mappers.PurchaseExceptionMapper;
 import org.whispersystems.textsecuregcm.metrics.BackupMetrics;
 import org.whispersystems.textsecuregcm.metrics.CallQualitySurveyManager;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
@@ -217,12 +247,10 @@ import org.whispersystems.textsecuregcm.push.ProvisioningManager;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
 import org.whispersystems.textsecuregcm.push.PushNotificationScheduler;
 import org.whispersystems.textsecuregcm.push.ReceiptSender;
-import org.whispersystems.textsecuregcm.push.RedisMessageAvailabilityManager;
 import org.whispersystems.textsecuregcm.redis.ConnectionEventLogger;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClient;
 import org.whispersystems.textsecuregcm.redis.FaultTolerantRedisClusterClient;
 import org.whispersystems.textsecuregcm.registration.RegistrationServiceClient;
-import org.whispersystems.textsecuregcm.s3.PolicySigner;
 import org.whispersystems.textsecuregcm.s3.PostPolicyGenerator;
 import org.whispersystems.textsecuregcm.s3.S3MonitoringSupplier;
 import org.whispersystems.textsecuregcm.securestorage.SecureStorageClient;
@@ -240,44 +268,55 @@ import org.whispersystems.textsecuregcm.storage.ChangeNumberWaitingPeriodManager
 import org.whispersystems.textsecuregcm.storage.ChangeNumberWaitingPeriods;
 import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
 import org.whispersystems.textsecuregcm.storage.ClientReleases;
+import org.whispersystems.textsecuregcm.storage.DonationPermits;
+import org.whispersystems.textsecuregcm.storage.DonationPermitsManager;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
+import org.whispersystems.textsecuregcm.storage.FoundationDbVersion;
 import org.whispersystems.textsecuregcm.storage.IssuedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.KeysManager;
-import org.whispersystems.textsecuregcm.storage.MessagesCache;
 import org.whispersystems.textsecuregcm.storage.MessagesDynamoDb;
 import org.whispersystems.textsecuregcm.storage.MessagesManager;
 import org.whispersystems.textsecuregcm.storage.OneTimeDonationsManager;
 import org.whispersystems.textsecuregcm.storage.PagedSingleUseKEMPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.PersistentTimer;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswords;
+import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
+import org.whispersystems.textsecuregcm.storage.ProfileAvatars;
 import org.whispersystems.textsecuregcm.storage.Profiles;
 import org.whispersystems.textsecuregcm.storage.ProfilesManager;
 import org.whispersystems.textsecuregcm.storage.ProfilesV2;
 import org.whispersystems.textsecuregcm.storage.PushChallengeDynamoDb;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswords;
-import org.whispersystems.textsecuregcm.storage.RegistrationRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.RemoteConfigs;
 import org.whispersystems.textsecuregcm.storage.RemoteConfigsManager;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseECSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseKEMSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.ReportMessageDynamoDb;
 import org.whispersystems.textsecuregcm.storage.ReportMessageManager;
+import org.whispersystems.textsecuregcm.storage.SandboxAccounts;
 import org.whispersystems.textsecuregcm.storage.SingleUseECPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.SubscriptionManager;
 import org.whispersystems.textsecuregcm.storage.Subscriptions;
+import org.whispersystems.textsecuregcm.storage.TotpManager;
 import org.whispersystems.textsecuregcm.storage.VerificationSessionManager;
 import org.whispersystems.textsecuregcm.storage.VerificationSessions;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceCheckManager;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceCheckTrustAnchor;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceChecks;
-import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreClient;
-import org.whispersystems.textsecuregcm.subscriptions.AppleAppStoreManager;
-import org.whispersystems.textsecuregcm.subscriptions.BankMandateTranslator;
-import org.whispersystems.textsecuregcm.subscriptions.BraintreeManager;
-import org.whispersystems.textsecuregcm.subscriptions.GooglePlayBillingManager;
-import org.whispersystems.textsecuregcm.subscriptions.PayPalDonationsTranslator;
-import org.whispersystems.textsecuregcm.subscriptions.StripeManager;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
+import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDBWarmup;
+import org.whispersystems.textsecuregcm.storage.foundationdb.VersionstampUUIDCipher;
+import org.whispersystems.textsecuregcm.purchases.AppleAppStoreClient;
+import org.whispersystems.textsecuregcm.purchases.AppleAppStoreManager;
+import org.whispersystems.textsecuregcm.purchases.BankMandateTranslator;
+import org.whispersystems.textsecuregcm.purchases.BraintreeManager;
+import org.whispersystems.textsecuregcm.purchases.GooglePlayBillingManager;
+import org.whispersystems.textsecuregcm.purchases.LoginPurchaseManager;
+import org.whispersystems.textsecuregcm.purchases.PayPalDonationsTranslator;
+import org.whispersystems.textsecuregcm.purchases.PaymentProvider;
+import org.whispersystems.textsecuregcm.purchases.StripeManager;
 import org.whispersystems.textsecuregcm.telephony.CarrierDataProvider;
 import org.whispersystems.textsecuregcm.telephony.hlrlookup.HlrLookupCarrierDataProvider;
 import org.whispersystems.textsecuregcm.util.BufferingInterceptor;
@@ -294,27 +333,32 @@ import org.whispersystems.textsecuregcm.websocket.AuthenticatedConnectListener;
 import org.whispersystems.textsecuregcm.websocket.NoContextTakeoverPerMessageDeflateExtension;
 import org.whispersystems.textsecuregcm.websocket.ProvisioningConnectListener;
 import org.whispersystems.textsecuregcm.websocket.WebSocketAccountAuthenticator;
+import org.whispersystems.textsecuregcm.websocket.WebSocketConnection;
 import org.whispersystems.textsecuregcm.workers.BackupMetricsCommand;
 import org.whispersystems.textsecuregcm.workers.BackupUsageRecalculationCommand;
 import org.whispersystems.textsecuregcm.workers.CertificateCommand;
 import org.whispersystems.textsecuregcm.workers.CheckDynamicConfigurationCommand;
+import org.whispersystems.textsecuregcm.workers.ClearExpiredFoundationDbMessagesCommand;
 import org.whispersystems.textsecuregcm.workers.ClearIssuedReceiptRedemptionsCommand;
+import org.whispersystems.textsecuregcm.workers.ClearOrphanedFoundationDbQueuesCommand;
 import org.whispersystems.textsecuregcm.workers.CopyToS3Command;
 import org.whispersystems.textsecuregcm.workers.DeleteUserCommand;
 import org.whispersystems.textsecuregcm.workers.IdleDeviceNotificationSchedulerFactory;
-import org.whispersystems.textsecuregcm.workers.MessagePersisterServiceCommand;
 import org.whispersystems.textsecuregcm.workers.NotifyIdleDevicesCommand;
 import org.whispersystems.textsecuregcm.workers.ProcessScheduledJobsServiceCommand;
 import org.whispersystems.textsecuregcm.workers.RegenerateSecondaryDynamoDbTableDataCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveExpiredAccountsCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveExpiredBackupsCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveExpiredLinkedDevicesCommand;
+import org.whispersystems.textsecuregcm.workers.RemoveExpiredSandboxAccountsCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveExpiredUsernameHoldsCommand;
 import org.whispersystems.textsecuregcm.workers.RemoveOrphanedPreKeyPagesCommand;
+import org.whispersystems.textsecuregcm.workers.SandboxAccountPoolCommand;
 import org.whispersystems.textsecuregcm.workers.ScheduledApnPushNotificationSenderServiceCommand;
 import org.whispersystems.textsecuregcm.workers.ServerVersionCommand;
 import org.whispersystems.textsecuregcm.workers.SetRequestLoggingEnabledTask;
 import org.whispersystems.textsecuregcm.workers.SetUserDiscoverabilityCommand;
+import org.whispersystems.textsecuregcm.workers.TrimOversizedFoundationDbMessageQueuesCommand;
 import org.whispersystems.textsecuregcm.workers.UnlinkDeviceCommand;
 import org.whispersystems.textsecuregcm.workers.UnlinkDevicesWithIdlePrimaryCommand;
 import org.whispersystems.textsecuregcm.workers.ZkParamsCommand;
@@ -327,7 +371,6 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
-import javax.annotation.Nullable;
 
 public class WhisperServerService extends Application<WhisperServerConfiguration> {
 
@@ -362,8 +405,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     bootstrap.addCommand(new SetUserDiscoverabilityCommand());
     bootstrap.addCommand(new UnlinkDeviceCommand());
     bootstrap.addCommand(new ScheduledApnPushNotificationSenderServiceCommand());
-    bootstrap.addCommand(new MessagePersisterServiceCommand());
     bootstrap.addCommand(new RemoveExpiredAccountsCommand(Clock.systemUTC()));
+    bootstrap.addCommand(new RemoveExpiredSandboxAccountsCommand(Clock.systemUTC()));
+    bootstrap.addCommand(new SandboxAccountPoolCommand());
     bootstrap.addCommand(new RemoveExpiredUsernameHoldsCommand(Clock.systemUTC()));
     bootstrap.addCommand(new RemoveExpiredBackupsCommand(Clock.systemUTC()));
     bootstrap.addCommand(new RemoveOrphanedPreKeyPagesCommand(Clock.systemUTC()));
@@ -374,6 +418,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     bootstrap.addCommand(new NotifyIdleDevicesCommand());
     bootstrap.addCommand(new ClearIssuedReceiptRedemptionsCommand());
     bootstrap.addCommand(new CopyToS3Command());
+    bootstrap.addCommand(new ClearExpiredFoundationDbMessagesCommand(Clock.systemUTC()));
+    bootstrap.addCommand(new TrimOversizedFoundationDbMessageQueuesCommand());
+    bootstrap.addCommand(new ClearOrphanedFoundationDbQueuesCommand());
 
     bootstrap.addCommand(new ProcessScheduledJobsServiceCommand("process-idle-device-notification-jobs",
         "Processes scheduled jobs to send notifications to idle devices",
@@ -396,7 +443,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
   @Override
   public void run(WhisperServerConfiguration config, Environment environment) throws Exception {
     final Clock clock = Clock.systemUTC();
-    final int availableProcessors = Runtime.getRuntime().availableProcessors();
 
     final AwsCredentialsProvider awsCredentialsProvider = config.getAwsCredentialsConfiguration().build();
 
@@ -407,6 +453,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
 
     config.getRetryConfigurations().forEach((name, configuration) ->
         ResilienceUtil.getRetryRegistry().addConfiguration(name, configuration.toRetryConfigBuilder().build()));
+
+    config.getBulkheadConfigurations().forEach((name, configuration) ->
+        ResilienceUtil.getBulkheadRegistry().addConfiguration(name, configuration.toBulkheadConfig().build()));
 
     ResilienceUtil.setGeneralRedisRetryConfiguration(config.getGeneralRedisRetryConfiguration());
 
@@ -457,6 +506,58 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final DynamoDbClient dynamoDbClient = config.getDynamoDbClientConfiguration()
         .buildSyncClient(awsCredentialsProvider, new MicrometerAwsSdkMetricPublisher(awsSdkMetricsExecutor, "dynamoDbSync"));
 
+    final FDB fdb = FDB.selectAPIVersion(FoundationDbVersion.getFoundationDbApiVersion());
+
+    // Jetty and the FoundationDB client both register shutdown hooks to begin shutdown/cleanup operations. There isn't
+    // a good way to coordinate or enforce ordering between shutdown hooks, and so the two processes will race.
+    // Generally, FoundationDB will shut down before Jetty does, meaning we'll still be trying to serve requests that
+    // require talking to FoundationDB even though FoundationDB has shut down. To avoid that scenario, we disabled
+    // FoundationDB's shutdown hook and let the JVM terminate its (daemon) threads at exit. This isn't as graceful as
+    // we'd like, but is the least bad option given current constraints.
+    fdb.disableShutdownHook();
+
+    final FoundationDbExternalClientConfiguration externalClientConfiguration = config.getFoundationDbMessagesConfiguration()
+        .externalClientConfiguration();
+    if (externalClientConfiguration != null) {
+      // If threadsPerClient is not specified, we default to the cluster size so that there is 1:1 correspondence between
+      // Database objects and threads.
+      final int clientThreadsPerVersion = externalClientConfiguration.threadsPerClient()
+          .orElseGet(() -> config.getFoundationDbMessagesConfiguration().clusters().size());
+      externalClientConfiguration.clientLibraryPaths().forEach(path -> fdb.options().setExternalClientLibrary(path));
+      fdb.options().setClientThreadsPerVersion(clientThreadsPerVersion);
+    }
+
+    final Map<Integer, List<FaultTolerantDatabase>> messageDatabasesByEpoch;
+    {
+      final Map<String, FaultTolerantDatabase> faultTolerantDatabasesByName =
+          config.getFoundationDbMessagesConfiguration().clusters().entrySet().stream()
+              .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
+                  entry -> {
+                    try {
+                      final Database database = entry.getValue().build(fdb);
+                      database.options().setMaxWatches(config.getFoundationDbMessagesConfiguration().maxWatchesPerClient());
+                      database.options().setTransactionTimeout(
+                          config.getFoundationDbMessagesConfiguration().transactionTimeout().toMillis());
+                      database.options().setTransactionRetryLimit(
+                          config.getFoundationDbMessagesConfiguration().transactionRetryLimit());
+
+                      return new FaultTolerantDatabase(database, entry.getKey(),
+                          config.getFoundationDbMessagesConfiguration().circuitBreakerConfigurationName(),
+                          config.getFoundationDbMessagesConfiguration().bulkheadConfigurationName());
+                    } catch (final IOException e) {
+                      throw new UncheckedIOException(e);
+                    }
+                  }));
+
+      messageDatabasesByEpoch = config.getFoundationDbMessagesConfiguration().epochs().entrySet().stream()
+          .collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
+              entry -> entry.getValue().stream()
+                  .map(faultTolerantDatabasesByName::get)
+                  .toList()));
+
+      environment.lifecycle().manage(new FoundationDBWarmup(faultTolerantDatabasesByName));
+    }
+
     final AwsCredentialsProvider cdnCredentialsProvider = config.getCdnConfiguration().credentials().build();
     final S3AsyncClient asyncCdnS3Client = S3AsyncClient.builder()
         .credentialsProvider(cdnCredentialsProvider)
@@ -467,16 +568,21 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     BlockingQueue<Runnable> messageDeletionQueue = new LinkedBlockingQueue<>();
     Metrics.gaugeCollectionSize(name(getClass(), "messageDeletionQueueSize"), Collections.emptyList(),
         messageDeletionQueue);
-    ExecutorService messageDeletionAsyncExecutor = ExecutorServiceBuilder.of(environment, "messageDeletionAsyncExecutor")
+    final ExecutorService messageDeletionAsyncExecutor = ExecutorServiceBuilder.of(environment, "messageDeletionAsyncExecutor")
         .minThreads(2)
         .maxThreads(2)
         .allowCoreThreadTimeOut(true)
         .workQueue(messageDeletionQueue).build();
 
+    RedeemedReceiptsManager redeemedReceiptsManager = new RedeemedReceiptsManager(clock,
+        config.getDynamoDbTables().getRedeemedReceipts().getTableName(),
+        dynamoDbClient);
+
     Accounts accounts = new Accounts(
         clock,
         dynamoDbClient,
         dynamoDbAsyncClient,
+        redeemedReceiptsManager,
         config.getDynamoDbTables().getAccounts().getTableName(),
         config.getDynamoDbTables().getAccounts().getPhoneNumberTableName(),
         config.getDynamoDbTables().getAccounts().getPhoneNumberIdentifierTableName(),
@@ -490,6 +596,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     Profiles profilesV1 = new Profiles(dynamoDbClient, dynamoDbAsyncClient,
         config.getDynamoDbTables().getProfilesV1().getTableName());
     ProfilesV2 profiles = new ProfilesV2(dynamoDbClient, dynamoDbAsyncClient, config.getDynamoDbTables().getProfilesV2().getTableName());
+    ProfileAvatars profileAvatars = new ProfileAvatars(dynamoDbClient,
+        config.getDynamoDbTables().getProfileAvatars().getTableName(), RemoveExpiredAccountsCommand.MAX_IDLE_DURATION, clock);
 
     S3AsyncClient asyncKeysS3Client = S3AsyncClient.builder()
         .credentialsProvider(awsCredentialsProvider)
@@ -508,7 +616,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     MessagesDynamoDb messagesDynamoDb = new MessagesDynamoDb(dynamoDbClient, dynamoDbAsyncClient,
         config.getDynamoDbTables().getMessages().getTableName(),
         config.getDynamoDbTables().getMessages().getExpiration(),
-        messageDeletionAsyncExecutor, experimentEnrollmentManager);
+        messageDeletionAsyncExecutor);
     RemoteConfigs remoteConfigs = new RemoteConfigs(dynamoDbClient,
         config.getDynamoDbTables().getRemoteConfig().getTableName());
     PushChallengeDynamoDb pushChallengeDynamoDb = new PushChallengeDynamoDb(dynamoDbClient,
@@ -516,7 +624,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     ReportMessageDynamoDb reportMessageDynamoDb = new ReportMessageDynamoDb(dynamoDbClient, dynamoDbAsyncClient,
         config.getDynamoDbTables().getReportMessage().getTableName(),
         config.getReportMessageConfiguration().getReportTtl());
-    RegistrationRecoveryPasswords registrationRecoveryPasswords = new RegistrationRecoveryPasswords(
+    PhoneNumberRecoveryPasswords phoneNumberRecoveryPasswords = new PhoneNumberRecoveryPasswords(
         config.getDynamoDbTables().getRegistrationRecovery().getTableName(),
         config.getDynamoDbTables().getRegistrationRecovery().getExpiration(),
         dynamoDbClient,
@@ -533,9 +641,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
 
     FaultTolerantRedisClusterClient cacheCluster = config.getCacheClusterConfiguration()
         .build("main_cache", sharedClientResources.mutate());
-    FaultTolerantRedisClusterClient messagesCluster =
-        config.getMessageCacheConfiguration().getRedisClusterConfiguration()
-            .build("messages", sharedClientResources.mutate());
     FaultTolerantRedisClusterClient pushSchedulerCluster = config.getPushSchedulerCluster().build("push_scheduler",
         sharedClientResources.mutate());
     FaultTolerantRedisClusterClient rateLimitersCluster = config.getRateLimitersCluster().build("rate_limiters",
@@ -569,7 +674,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final ScheduledExecutorService retryExecutor = ScheduledExecutorServiceBuilder.of(environment, "retry")
         .threads(16).build();
     final ScheduledExecutorService registrationIdentityTokenRefreshExecutor =
-      ScheduledExecutorServiceBuilder.of(environment, "registrationIdentityTokenRefresh").threads(1).build();
+        ScheduledExecutorServiceBuilder.of(environment, "registrationIdentityTokenRefresh").threads(1).build();
+    final ScheduledExecutorService presenceRenewalExecutor =
+        ScheduledExecutorServiceBuilder.of(environment, "presenceRenewal").threads(4).build();
 
     Scheduler messageDeliveryScheduler = Schedulers.fromExecutorService(
         ExecutorServiceBuilder.of(environment, "messageDelivery")
@@ -587,14 +694,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         .minThreads(2)
         .workQueue(receiptSenderQueue)
         .rejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy())
-        .build();
-    ExecutorService registrationCallbackExecutor = ExecutorServiceBuilder.of(environment, "registration")
-        .maxThreads(2)
-        .minThreads(2)
-        .build();
-    ExecutorService accountLockExecutor = ExecutorServiceBuilder.of(environment, "accountLock")
-        .minThreads(8)
-        .maxThreads(8)
         .build();
     // unbounded executor (same as cachedThreadPool)
     ExecutorService remoteStorageHttpExecutor = ExecutorServiceBuilder.of(environment, "remoteStorage")
@@ -633,13 +732,14 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     ScheduledExecutorService messagePollExecutor = ScheduledExecutorServiceBuilder.of(environment, "messagePollExecutor").threads(1).build();
     ScheduledExecutorService provisioningWebsocketTimeoutExecutor = ScheduledExecutorServiceBuilder.of(environment, "provisioningWebsocketTimeout").threads(1).build();
 
-    final ManagedEventLoopGroup<NioEventLoopGroup> dnsResolutionEventLoopGroup = new ManagedEventLoopGroup<>(new NioEventLoopGroup());
+    final ManagedEventLoopGroup<MultiThreadIoEventLoopGroup> dnsResolutionEventLoopGroup =
+        new ManagedEventLoopGroup<>(new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory()));
     final DnsNameResolver cloudflareDnsResolver = new DnsNameResolverBuilder(dnsResolutionEventLoopGroup.getEventLoopGroup().next())
-            .resolvedAddressTypes(ResolvedAddressTypes.IPV6_PREFERRED)
-            .completeOncePreferredResolved(false)
-            .channelType(NioDatagramChannel.class)
-            .socketChannelType(NioSocketChannel.class)
-            .build();
+        .resolvedAddressTypes(ResolvedAddressTypes.IPV6_PREFERRED)
+        .completeOncePreferredResolved(false)
+        .channelType(NioDatagramChannel.class)
+        .socketChannelType(NioSocketChannel.class)
+        .build();
 
     ExternalServiceCredentialsGenerator directoryV2CredentialsGenerator = DirectoryV2Controller.credentialsGenerator(
         config.getDirectoryV2Configuration().getDirectoryV2ClientConfiguration());
@@ -660,8 +760,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         AsnInfoProvider.EMPTY,
         "AsnManager");
 
-    RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager =
-        new RegistrationRecoveryPasswordsManager(registrationRecoveryPasswords);
+    PhoneNumberRecoveryPasswordsManager phoneNumberRecoveryPasswordsManager =
+        new PhoneNumberRecoveryPasswordsManager(phoneNumberRecoveryPasswords);
     UsernameHashZkProofVerifier usernameHashZkProofVerifier = new UsernameHashZkProofVerifier();
 
     final CarrierDataProvider carrierDataProvider =
@@ -673,7 +773,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             retryExecutor);
 
     RegistrationServiceClient registrationServiceClient = config.getRegistrationServiceConfiguration()
-        .build(environment, registrationCallbackExecutor, registrationIdentityTokenRefreshExecutor);
+        .build(environment, registrationIdentityTokenRefreshExecutor);
     KeyTransparencyServiceClient keyTransparencyServiceClient = new KeyTransparencyServiceClient(
         config.getKeyTransparencyServiceConfiguration().host(),
         config.getKeyTransparencyServiceConfiguration().port(),
@@ -696,32 +796,47 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         storageServiceExecutor, retryExecutor, config.getSecureStorageServiceConfiguration());
     DisconnectionRequestManager disconnectionRequestManager = new DisconnectionRequestManager(pubsubClient,
         disconnectionRequestListenerExecutor, retryExecutor);
-    ProfilesManager profilesManager = new ProfilesManager(profilesV1, profiles, cacheCluster, retryExecutor, asyncCdnS3Client,
+    ProfilesManager profilesManager = new ProfilesManager(profilesV1, profiles, profileAvatars, cacheCluster, retryExecutor, asyncCdnS3Client,
         config.getCdnConfiguration().bucket());
-    MessagesCache messagesCache = new MessagesCache(messagesCluster, messageDeliveryScheduler,
-        messageDeletionAsyncExecutor, retryExecutor, clock, experimentEnrollmentManager);
+    final FoundationDbMessageStore foundationDbMessageStore = new FoundationDbMessageStore(messageDatabasesByEpoch,
+        config.getFoundationDbMessagesConfiguration().activeEpoch(),
+        new VersionstampUUIDCipher(config.getFoundationDbMessagesConfiguration().currentVersionstampCipherKey(),
+            config.getFoundationDbMessagesConfiguration().versionstampCipherKeys().get(config.getFoundationDbMessagesConfiguration().currentVersionstampCipherKey()).value()),
+        presenceRenewalExecutor,
+        Clock.systemUTC(),
+        config.getFoundationDbMessagesConfiguration().batchPriorityTransactionTimeout(),
+        config.getFoundationDbMessagesConfiguration().batchPriorityTransactionRetryLimit());
     ClientReleaseManager clientReleaseManager = new ClientReleaseManager(clientReleases,
         recurringJobExecutor,
         config.getClientReleaseConfiguration().refreshInterval(),
         Clock.systemUTC());
     ReportMessageManager reportMessageManager = new ReportMessageManager(reportMessageDynamoDb, rateLimitersCluster,
         config.getReportMessageConfiguration().getCounterTtl());
-    RedisMessageAvailabilityManager redisMessageAvailabilityManager =
-        new RedisMessageAvailabilityManager(messagesCluster, clientEventExecutor, asyncOperationQueueingExecutor);
-    MessagesManager messagesManager = new MessagesManager(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager,
-        reportMessageManager, messageDeletionAsyncExecutor, Clock.systemUTC());
+    final MessagesManager messagesManager =
+        new MessagesManager(messagesDynamoDb, foundationDbMessageStore,
+            reportMessageManager, messageDeletionAsyncExecutor, Clock.systemUTC());
     final ChangeNumberWaitingPeriods changeNumberWaitingPeriods = new ChangeNumberWaitingPeriods(
         config.getDynamoDbTables().getChangeNumberWaitingPeriods().getTableName(), dynamoDbClient);
     final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager = new ChangeNumberWaitingPeriodManager(
         changeNumberWaitingPeriods, config.getChangeNumber().postRegistrationWaitingPeriod(), clock);
     AccountLockManager accountLockManager = new AccountLockManager(dynamoDbClient,
         config.getDynamoDbTables().getDeletedAccountsLock().getTableName());
-    AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
+    final TotpManager totpManager = new TotpManager(rateLimitersCluster, config.getRegistrationTotpConfiguration().maxValidationDelay());
+    final WebAuthnCeremonyManager webAuthnCeremonyManager = new WebAuthnCeremonyManager(
+        config.getRegistrationWebAuthnConfiguration().relyingPartyId(),
+        config.getRegistrationWebAuthnConfiguration().origins(),
+        config.getRegistrationWebAuthnConfiguration().challengeTtl(),
+        config.getRegistrationWebAuthnConfiguration().userHandleBlindingSecret().value(),
+        rateLimitersCluster);
+    final SandboxAccounts sandboxAccounts = new SandboxAccounts(
+        config.getDynamoDbTables().getSandboxAccounts().getTableName(), dynamoDbClient);
+    final AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keysManager, messagesManager, profilesManager,
         changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
-        registrationRecoveryPasswordsManager, accountLockExecutor, messagePollExecutor,
-        retryExecutor, clock, config.getLinkDeviceSecretConfiguration().secret().value());
-    RemoteConfigsManager remoteConfigsManager = new RemoteConfigsManager(remoteConfigs);
+        phoneNumberRecoveryPasswordsManager, sandboxAccounts, messagePollExecutor,
+        retryExecutor, clock, config.getLinkDeviceSecretConfiguration().secret().value(),
+        webAuthnCeremonyManager, totpManager);
+    RemoteConfigsManager remoteConfigsManager = new RemoteConfigsManager(remoteConfigs, config.getRemoteConfigConfiguration().globalConfig());
     APNSender apnSender = new APNSender(apnSenderExecutor, Clock.systemUTC(), config.getApnConfiguration());
     FcmSender fcmSender = new FcmSender(fcmSenderExecutor, config.getFcmConfiguration().credentials().value());
     PushNotificationScheduler pushNotificationScheduler = new PushNotificationScheduler(pushSchedulerCluster,
@@ -732,27 +847,22 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     ProvisioningManager provisioningManager = new ProvisioningManager(pubsubClient);
     IssuedReceiptsManager issuedReceiptsManager = new IssuedReceiptsManager(
         config.getDynamoDbTables().getIssuedReceipts().getTableName(),
-        config.getDynamoDbTables().getIssuedReceipts().getExpiration(),
-        dynamoDbAsyncClient,
-        config.getDynamoDbTables().getIssuedReceipts().getGenerator(),
-        config.getDynamoDbTables().getIssuedReceipts().getmaxIssuedReceiptsPerPaymentId());
-    OneTimeDonationsManager oneTimeDonationsManager = new OneTimeDonationsManager(
-        config.getDynamoDbTables().getOnetimeDonations().getTableName(), config.getDynamoDbTables().getOnetimeDonations().getExpiration(), dynamoDbAsyncClient);
-    RedeemedReceiptsManager redeemedReceiptsManager = new RedeemedReceiptsManager(clock,
-        config.getDynamoDbTables().getRedeemedReceipts().getTableName(),
         dynamoDbClient,
-        config.getDynamoDbTables().getRedeemedReceipts().getExpiration());
+        config.getDynamoDbTables().getIssuedReceipts().getGenerator(),
+        config.getDynamoDbTables().getIssuedReceipts().getMaxReceiptsPerSubscriptionPayment());
+    OneTimeDonationsManager oneTimeDonationsManager = new OneTimeDonationsManager(
+        config.getDynamoDbTables().getOnetimeDonations().getTableName(), config.getDynamoDbTables().getOnetimeDonations().getExpiration(), dynamoDbClient);
+    DonationPermits donationPermits = new DonationPermits(
+        config.getDynamoDbTables().getDonationPermits().getTableName(), config.getDynamoDbTables().getDonationPermits().getExpiration(), dynamoDbClient);
     Subscriptions subscriptions = new Subscriptions(
         config.getDynamoDbTables().getSubscriptions().getTableName(), dynamoDbClient);
-    MessageDeliveryLoopMonitor messageDeliveryLoopMonitor =
-        config.logMessageDeliveryLoops() ? new RedisMessageDeliveryLoopMonitor(rateLimitersCluster) : new NoopMessageDeliveryLoopMonitor();
     CallQualitySurveyManager callQualitySurveyManager = new CallQualitySurveyManager(asnInfoProviderSupplier,
         config.getCallQualitySurveyConfiguration().pubSubPublisher().build(),
         Clock.systemUTC(),
         callQualitySurveyPubSubExecutor);
 
     final RegistrationLockVerificationManager registrationLockVerificationManager = new RegistrationLockVerificationManager(
-        accountsManager, disconnectionRequestManager, svr2CredentialsGenerator, registrationRecoveryPasswordsManager,
+        accountsManager, disconnectionRequestManager, svr2CredentialsGenerator, phoneNumberRecoveryPasswordsManager,
         pushNotificationManager, rateLimiters);
 
     final ReportedMessageMetricsListener reportedMessageMetricsListener = new ReportedMessageMetricsListener(
@@ -832,7 +942,6 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     environment.lifecycle().manage(pushNotificationScheduler);
     environment.lifecycle().manage(provisioningManager);
     environment.lifecycle().manage(disconnectionRequestManager);
-    environment.lifecycle().manage(redisMessageAvailabilityManager);
     environment.lifecycle().manage(currencyManager);
     environment.lifecycle().manage(registrationServiceClient);
     environment.lifecycle().manage(keyTransparencyServiceClient);
@@ -846,23 +955,29 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         config.getGcpAttachmentsConfiguration().pathPrefix(),
         config.getGcpAttachmentsConfiguration().rsaSigningKey().value());
 
-    PostPolicyGenerator profileCdnPolicyGenerator = new PostPolicyGenerator(config.getCdnConfiguration().region(),
-        config.getCdnConfiguration().bucket(), config.getCdnConfiguration().credentials().accessKeyId().value());
-    PolicySigner profileCdnPolicySigner = new PolicySigner(
-        config.getCdnConfiguration().credentials().secretAccessKey().value(),
-        config.getCdnConfiguration().region());
+    final PostPolicyGenerator profileCdnPolicyGenerator = new PostPolicyGenerator(config.getCdnConfiguration().region(),
+        config.getCdnConfiguration().bucket(),
+        config.getCdnConfiguration().credentials().accessKeyId().value(),
+        config.getCdnConfiguration().credentials().secretAccessKey().value());
 
-    ServerSecretParams zkSecretParams = new ServerSecretParams(config.getZkConfig().serverSecret().value());
+    final PostPolicyGenerator stickerPolicyGenerator = new PostPolicyGenerator(config.getCdnConfiguration().region(),
+        config.getCdnConfiguration().bucket(),
+        config.getCdnConfiguration().credentials().accessKeyId().value(),
+        config.getCdnConfiguration().credentials().secretAccessKey().value());
+
+    ServerSecretParams groupZkSecretParams = new ServerSecretParams(config.getGroupsZkConfig().serverSecret().value());
+    GenericServerSecretParams callingPreV101GenericZkSecretParams = new GenericServerSecretParams(config.getCallingZkConfigPreV101().serverSecret().value());
     GenericServerSecretParams callingGenericZkSecretParams = new GenericServerSecretParams(config.getCallingZkConfig().serverSecret().value());
-    GenericServerSecretParams backupsGenericZkSecretParams = new GenericServerSecretParams(config.getBackupsZkConfig().serverSecret().value());
-    ServerZkProfileOperations zkProfileOperations = new ServerZkProfileOperations(zkSecretParams);
-    ServerZkAuthOperations zkAuthOperations = new ServerZkAuthOperations(zkSecretParams);
-    ServerZkReceiptOperations zkReceiptOperations = new ServerZkReceiptOperations(zkSecretParams);
+    GenericServerSecretParams chatGenericZkSecretParams = new GenericServerSecretParams(config.getChatZkConfig().serverSecret().value());
+    ServerZkProfileOperations zkProfileOperations = new ServerZkProfileOperations(groupZkSecretParams);
+    ServerZkAuthOperations zkAuthOperations = new ServerZkAuthOperations(groupZkSecretParams);
+    // ZK receipts are not actually shared with ZK groups, but use the same extensible parameters object for legacy reasons
+    ServerZkReceiptOperations zkReceiptOperations = new ServerZkReceiptOperations(groupZkSecretParams);
 
     TusAttachmentGenerator tusAttachmentGenerator = new TusAttachmentGenerator(config.getTus());
     Cdn3BackupCredentialGenerator cdn3BackupCredentialGenerator = new Cdn3BackupCredentialGenerator(config.getTus());
     BackupAuthManager backupAuthManager = new BackupAuthManager(experimentEnrollmentManager, rateLimiters,
-        accountsManager, zkReceiptOperations, redeemedReceiptsManager, backupsGenericZkSecretParams, clock);
+        accountsManager, zkReceiptOperations, redeemedReceiptsManager, chatGenericZkSecretParams, clock);
     BackupsDb backupsDb = new BackupsDb(
         dynamoDbAsyncClient,
         config.getDynamoDbTables().getBackups().getTableName(),
@@ -873,7 +988,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         config.getCdn3StorageManagerConfiguration());
     BackupManager backupManager = new BackupManager(
         backupsDb,
-        backupsGenericZkSecretParams,
+        chatGenericZkSecretParams,
         rateLimiters,
         tusAttachmentGenerator,
         cdn3BackupCredentialGenerator,
@@ -881,7 +996,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         svrbCredentialsGenerator,
         secureValueRecoveryBClient,
         clock,
-        dynamicConfigurationManager);
+        config.getBackupConfiguration());
     final BackupMetrics backupMetrics = new BackupMetrics();
 
     final AppleDeviceChecks appleDeviceChecks = new AppleDeviceChecks(
@@ -897,6 +1012,20 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         deviceCheckManager,
         config.getAppleDeviceCheck().teamId(),
         config.getAppleDeviceCheck().bundleId());
+
+    final DonationPermitsManager donationPermitsManager = new DonationPermitsManager(donationPermits, groupZkSecretParams,
+        clock);
+
+    final SubscriptionManager subscriptionManager = new SubscriptionManager(subscriptions,
+        List.of(stripeManager, braintreeManager, googlePlayBillingManager, appleAppStoreManager),
+        zkReceiptOperations, issuedReceiptsManager);
+
+    final LoginPurchaseManager loginPurchaseManager = new LoginPurchaseManager(
+        Map.of(
+            PaymentProvider.APPLE_APP_STORE, appleAppStoreManager,
+            PaymentProvider.GOOGLE_PLAY_BILLING, googlePlayBillingManager),
+        issuedReceiptsManager,
+        zkReceiptOperations);
 
     final List<SpamFilter> spamFilters = ServiceLoader.load(SpamFilter.class)
         .stream()
@@ -955,7 +1084,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final HttpClient shortCodeRetrieverHttpClient = HttpClient.newBuilder().version(HttpClient.Version.HTTP_2)
         .connectTimeout(Duration.ofSeconds(10)).build();
     final ShortCodeExpander shortCodeRetriever = new ShortCodeExpander(shortCodeRetrieverHttpClient, config.getShortCodeRetrieverConfiguration().baseUrl());
-    final CaptchaChecker captchaChecker = new CaptchaChecker(shortCodeRetriever, captchaClientSupplier);
+    final CaptchaChecker captchaChecker = new CaptchaChecker(shortCodeRetriever, captchaClientSupplier, dynamicConfigurationManager);
 
     final RegistrationCaptchaManager registrationCaptchaManager = new RegistrationCaptchaManager(captchaChecker);
 
@@ -975,49 +1104,91 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final ErrorMappingInterceptor errorMappingInterceptor = new ErrorMappingInterceptor();
     final ErrorConformanceInterceptor errorConformanceInterceptor = new ErrorConformanceInterceptor();
     final GrpcAllowListInterceptor grpcAllowListInterceptor = new GrpcAllowListInterceptor(dynamicConfigurationManager);
+    final GrpcCompressionInterceptor grpcCompressionInterceptor = new GrpcCompressionInterceptor(dynamicConfigurationManager);
     final RequestAttributesInterceptor requestAttributesInterceptor = new RequestAttributesInterceptor();
 
     final ValidatingInterceptor validatingInterceptor = new ValidatingInterceptor();
+
+    final ConcurrentCallLimitingInterceptor concurrentCallLimitingInterceptor =
+        new ConcurrentCallLimitingInterceptor(config.getVirtualThreadConfiguration().maxConcurrentThreadsPerExecutor());
 
     final ExternalRequestFilter grpcExternalRequestFilter = new ExternalRequestFilter(
         config.getExternalRequestFilterConfiguration().permittedInternalRanges(),
         config.getExternalRequestFilterConfiguration().grpcMethods());
     final RequireAuthenticationInterceptor requireAuthenticationInterceptor = new RequireAuthenticationInterceptor(accountAuthenticator);
     final ProhibitAuthenticationInterceptor prohibitAuthenticationInterceptor = new ProhibitAuthenticationInterceptor();
-    final GroupSendTokenUtil groupSendTokenUtil = new GroupSendTokenUtil(zkSecretParams, Clock.systemUTC());
+    final GroupSendTokenUtil groupSendTokenUtil = new GroupSendTokenUtil(groupZkSecretParams, Clock.systemUTC());
+    final MessageMetrics messageMetrics = new MessageMetrics();
+    final MessageDispatcher messageDispatcher = new MessageDispatcher(receiptSender, messagesManager, messageMetrics,
+        pushNotificationManager, pushNotificationScheduler, disconnectionRequestManager, clientReleaseManager, Clock.systemUTC());
+
+    final CertificateGenerator certificateGenerator =
+        new CertificateGenerator(config.getDeliveryCertificate().certificate(),
+            config.getDeliveryCertificate().ecPrivateKey(),
+            config.getDeliveryCertificate().expiresDays(),
+            config.getDeliveryCertificate().embedSigner());
+
+    final PhoneVerificationTokenManager phoneVerificationTokenManager = new PhoneVerificationTokenManager(
+        phoneNumberIdentifiers, registrationServiceClient, phoneNumberRecoveryPasswordsManager, registrationRecoveryChecker);
+
+    final ChangeNumberManager changeNumberManager = new ChangeNumberManager(messageSender, accountsManager,
+        phoneVerificationTokenManager, registrationLockVerificationManager, rateLimiters,
+        changeNumberWaitingPeriodManager, Clock.systemUTC());
 
     final List<ServerServiceDefinition> authenticatedServices = Stream.of(
-            new AccountsGrpcService(accountsManager, rateLimiters, usernameHashZkProofVerifier, registrationRecoveryPasswordsManager),
-            ExternalServiceCredentialsGrpcService.createForAllExternalServices(config, rateLimiters),
+            new AccountsGrpcService(accountsManager, rateLimiters, usernameHashZkProofVerifier,
+                phoneNumberRecoveryPasswordsManager, Clock.systemUTC(), changeNumberManager),
+            new CallingGrpcService(cloudflareTurnCredentialsManager, rateLimiters),
+            new CredentialsGrpcService(accountsManager, certificateGenerator, zkAuthOperations, callingGenericZkSecretParams, rateLimiters, Clock.systemUTC(), ExternalServiceDefinitions.createExternalServiceList(config, Clock.systemUTC())),
             new KeysGrpcService(accountsManager, keysManager, rateLimiters),
-            new ProfileGrpcService(clock, accountsManager, profilesManager, dynamicConfigurationManager, config.getBadges(), profileCdnPolicyGenerator, profileCdnPolicySigner, profileBadgeConverter, rateLimiters),
-            new MessagesGrpcService(accountsManager, rateLimiters, messageSender, messageByteLimitCardinalityEstimator, spamChecker, Clock.systemUTC()),
+            new ProfileGrpcService(clock, accountsManager, profilesManager, asnInfoProviderSupplier, dynamicConfigurationManager, config.getBadges(), profileCdnPolicyGenerator,
+                config.getCdnConfiguration().baseUrl(), chatGenericZkSecretParams, profileBadgeConverter, rateLimiters),
+            new MessagesGrpcService(accountsManager, reportMessageManager, phoneNumberIdentifiers, rateLimiters, messageSender, messageByteLimitCardinalityEstimator, spamChecker, messageDispatcher, Clock.systemUTC()),
             new BackupsGrpcService(accountsManager, backupAuthManager, backupMetrics),
             new DevicesGrpcService(accountsManager),
-            new AttachmentsGrpcService(experimentEnrollmentManager, rateLimiters,
-                gcsAttachmentGenerator, tusAttachmentGenerator, config.getAttachments().maxAttachmentUploadSizeInBytes()),
+            new AttachmentsGrpcService(experimentEnrollmentManager, rateLimiters, gcsAttachmentGenerator,
+                tusAttachmentGenerator, stickerPolicyGenerator,
+                config.getAttachments().maxAttachmentUploadSizeInBytes(), Clock.systemUTC()),
             new PaymentsGrpcService(currencyManager),
-            new ChallengeGrpcService(accountsManager, rateLimitChallengeManager, challengeConstraintChecker))
+            new ChallengeGrpcService(accountsManager, rateLimitChallengeManager, challengeConstraintChecker),
+            new DonationsGrpcService(clock, zkReceiptOperations, redeemedReceiptsManager, accountsManager, config.getBadges(), ReceiptCredentialPresentation::new, donationPermitsManager, rateLimiters),
+            new RemoteConfigurationGrpcService(remoteConfigsManager, profileBadgeConverter,
+                config.getBadges().getBadges().stream()
+                    .map(BadgeConfiguration::getId)
+                    .toList()))
         .map(bindableService -> ServerInterceptors.intercept(bindableService,
             // Note: interceptors run in the reverse order they are added; the remote deprecation filter
             // depends on the user-agent context so it has to come first here!
             validatingInterceptor,
             errorMappingInterceptor,
             errorConformanceInterceptor,
+            grpcCompressionInterceptor,
             grpcAllowListInterceptor,
             remoteDeprecationFilter,
             metricServerInterceptor,
             requestAttributesInterceptor,
-            requireAuthenticationInterceptor))
+            requireAuthenticationInterceptor,
+            concurrentCallLimitingInterceptor))
         .toList();
     final List<ServerServiceDefinition> unauthenticatedServices = Stream.of(
-            new AccountsAnonymousGrpcService(accountsManager, rateLimiters),
+            new AccountsAnonymousGrpcService(accountsManager, rateLimiters, groupSendTokenUtil),
             new CallQualitySurveyGrpcService(callQualitySurveyManager, rateLimiters),
-            new KeysAnonymousGrpcService(accountsManager, keysManager, zkSecretParams, Clock.systemUTC()),
-            new ProfileAnonymousGrpcService(accountsManager, profilesManager, profileBadgeConverter, zkSecretParams),
+            new KeysAnonymousGrpcService(accountsManager, keysManager, groupZkSecretParams, Clock.systemUTC()),
+            new KeyTransparencyGrpcService(rateLimiters, keyTransparencyServiceClient),
+            new LoginPurchaseGrpcService(loginPurchaseManager, dynamicConfigurationManager),
+            new ProfileAnonymousGrpcService(accountsManager, profilesManager, profileBadgeConverter, profileCdnPolicyGenerator,
+                config.getCdnConfiguration().baseUrl(), chatGenericZkSecretParams, groupZkSecretParams, rateLimiters, clock),
             new MessagesAnonymousGrpcService(accountsManager, rateLimiters, messageSender, groupSendTokenUtil, messageByteLimitCardinalityEstimator, spamChecker, Clock.systemUTC()),
             new BackupsAnonymousGrpcService(backupManager, backupMetrics, config.getAttachments().maxAttachmentUploadSizeInBytes(), config.getAttachments().maxMessageBackupUploadSizeInBytes()),
-            ExternalServiceCredentialsAnonymousGrpcService.create(accountsManager, config))
+            new CredentialsAnonymousGrpcService(accountsManager, ExternalServiceDefinitions.SVR.generatorFactory().apply(config, Clock.systemUTC()), rateLimiters),
+            new SubscriptionsGrpcService(clock, config.getSubscription(), subscriptionManager, donationPermitsManager,
+                stripeManager, braintreeManager, googlePlayBillingManager, appleAppStoreManager, bankMandateTranslator),
+            new ProductConfigurationGrpcService(config.getSubscription(), config.getOneTimeDonations(),
+                config.getLoginPurchase(), List.of(stripeManager, braintreeManager),
+                config.getBackupConfiguration().maxTotalMediaSize()),
+            new OneTimeDonationsGrpcService(config.getOneTimeDonations(), stripeManager, braintreeManager,
+                payPalDonationsTranslator, oneTimeDonationsManager, issuedReceiptsManager,
+                zkReceiptOperations, clock, rateLimiters, donationPermitsManager))
         .map(bindableService -> ServerInterceptors.intercept(bindableService,
             // Note: interceptors run in the reverse order they are added; the remote deprecation filter
             // depends on the user-agent context so it has to come first here!
@@ -1025,39 +1196,56 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             validatingInterceptor,
             errorMappingInterceptor,
             errorConformanceInterceptor,
+            grpcCompressionInterceptor,
             grpcAllowListInterceptor,
             remoteDeprecationFilter,
             metricServerInterceptor,
             requestAttributesInterceptor,
-            prohibitAuthenticationInterceptor))
+            prohibitAuthenticationInterceptor,
+            concurrentCallLimitingInterceptor))
         .toList();
 
-    final ManagedEventLoopGroup<DefaultEventLoopGroup> omnibusLocalEventLoopGroup = new ManagedEventLoopGroup<>(new DefaultEventLoopGroup());
-    final ManagedEventLoopGroup<NioEventLoopGroup> omnibusNioEventLoopGroup = new ManagedEventLoopGroup<>(new NioEventLoopGroup());
+    verifyServiceAuth(authenticatedServices, Auth.AUTH_ONLY_AUTHENTICATED);
+    verifyServiceAuth(unauthenticatedServices, Auth.AUTH_ONLY_ANONYMOUS);
+
+    final ManagedEventLoopGroup<MultiThreadIoEventLoopGroup> omnibusLocalEventLoopGroup =
+        new ManagedEventLoopGroup<>(new MultiThreadIoEventLoopGroup(LocalIoHandler.newFactory()));
+    final ManagedEventLoopGroup<MultiThreadIoEventLoopGroup> omnibusNioEventLoopGroup =
+        new ManagedEventLoopGroup<>(new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory()));
     final LocalAddress grpcLocalAddress = new LocalAddress("grpc");
     final ServerBuilder<?> serverBuilder = NettyServerBuilder
         .forAddress(grpcLocalAddress)
         .channelType(LocalServerChannel.class)
         .bossEventLoopGroup(omnibusLocalEventLoopGroup.getEventLoopGroup())
-        .workerEventLoopGroup(omnibusLocalEventLoopGroup.getEventLoopGroup());
+        .workerEventLoopGroup(omnibusLocalEventLoopGroup.getEventLoopGroup())
+        .executor(ManagedExecutors.newVirtualThreadPerTaskExecutor("managed-grpc-virtual-thread", environment))
+        .addStreamTracerFactory(new MetricServerStreamTracer.Factory());
     authenticatedServices.forEach(serverBuilder::addService);
     unauthenticatedServices.forEach(serverBuilder::addService);
     final ManagedGrpcServer localGrpcServer = new ManagedGrpcServer(serverBuilder.build());
 
+    final String websocketServletPath = "/v1/websocket/";
+    final String provisioningWebsocketServletPath = "/v1/websocket/provisioning/";
+
     final SocketAddress websocketAddress =
         new InetSocketAddress(config.getGrpc().websocketAddress(), config.getGrpc().websocketPort());
-    final OmnibusRouter omnibusRouter = new OmnibusRouter(List.of(
-        new OmnibusRouter.OmnibusRoute("/v1/websocket", websocketAddress),
-        new OmnibusRouter.OmnibusRoute("/v1/provisioning", websocketAddress)),
-        grpcLocalAddress);
+    final H2ConnectionFactory grpcH2ConnectionFactory = new PooledH2ConnectionFactory(grpcLocalAddress,
+        omnibusLocalEventLoopGroup.getEventLoopGroup());
+    final H2ConnectionFactory websocketH2ConnectionFactory = new UnpooledH2ConnectionFactory(websocketAddress, omnibusNioEventLoopGroup.getEventLoopGroup());
+    final OmnibusRouter omnibusRouter = new OmnibusRouter(Map.of(
+        websocketServletPath, websocketH2ConnectionFactory,
+        provisioningWebsocketServletPath, websocketH2ConnectionFactory),
+        grpcH2ConnectionFactory);
     @Nullable final Mapping<String, SslContext> sniMapping = config.getGrpc().h2c()
         ? null
-        : SniMapper.buildSniMapping(config.getTlsKeyStoreConfiguration().path(), config.getTlsKeyStoreConfiguration().password().value());
+        : SniMapper.buildSniMapping(config.getTlsKeyStoreConfiguration().path(),
+            config.getTlsKeyStoreConfiguration().password().value(),
+            config.getGrpc().sslProvider());
     final OmnibusH2Server omnibusH2Server = new OmnibusH2Server(
         sniMapping,
         omnibusNioEventLoopGroup.getEventLoopGroup(),
-        omnibusLocalEventLoopGroup.getEventLoopGroup(),
         new InetSocketAddress(config.getGrpc().bindAddress(), config.getGrpc().port()), omnibusRouter,
+        () -> dynamicConfigurationManager.getConfiguration().getOmnibus(),
         config.getGrpc().idleTimeout());
 
     environment.lifecycle().manage(omnibusLocalEventLoopGroup);
@@ -1078,11 +1266,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             .setAuthenticator(accountAuthenticator)
             .buildAuthFilter();
 
-    final String websocketServletPath = "/v1/websocket/";
-    final String provisioningWebsocketServletPath = "/v1/websocket/provisioning/";
-
     MetricsHttpEventHandler.configure(environment, Metrics.globalRegistry, clientReleaseManager, Set.of(websocketServletPath, provisioningWebsocketServletPath, "/health-check"));
-    final MessageMetrics messageMetrics = new MessageMetrics();
 
     // BufferingInterceptor is needed on the base environment but not the WebSocketEnvironment,
     // because we handle serialization of http responses on the websocket on our own and can
@@ -1112,77 +1296,64 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     webSocketEnvironment.setConnectListener(
         new AuthenticatedConnectListener(accountsManager, receiptSender, messagesManager, messageMetrics, pushNotificationManager,
             pushNotificationScheduler, disconnectionRequestManager,
-            messageDeliveryScheduler, asnInfoProviderSupplier, clientReleaseManager, messageDeliveryLoopMonitor, experimentEnrollmentManager
+            messageDeliveryScheduler, asnInfoProviderSupplier, clientReleaseManager, dynamicConfigurationManager
         ));
     webSocketEnvironment.jersey().register(new RateLimitByIpFilter(rateLimiters));
     webSocketEnvironment.jersey().register(new RequestStatisticsFilter(TrafficSource.WEBSOCKET));
     webSocketEnvironment.jersey().register(MultiRecipientMessageProvider.class);
     webSocketEnvironment.jersey().register(new MetricsApplicationEventListener(TrafficSource.WEBSOCKET, clientReleaseManager));
-    webSocketEnvironment.jersey().register(new KeepAliveController(redisMessageAvailabilityManager));
+    webSocketEnvironment.jersey().register(new KeepAliveController());
     webSocketEnvironment.jersey().register(new TimestampResponseFilter());
 
     final PersistentTimer persistentTimer = new PersistentTimer(rateLimitersCluster, clock);
 
-    final PhoneVerificationTokenManager phoneVerificationTokenManager = new PhoneVerificationTokenManager(
-        phoneNumberIdentifiers, registrationServiceClient, registrationRecoveryPasswordsManager, registrationRecoveryChecker);
-
-    final ChangeNumberManager changeNumberManager = new ChangeNumberManager(messageSender, accountsManager,
-        phoneVerificationTokenManager, registrationLockVerificationManager, rateLimiters,
-        changeNumberWaitingPeriodManager, Clock.systemUTC());
-
     final List<Object> commonControllers = Lists.newArrayList(
-        new AccountController(accountsManager, rateLimiters, registrationRecoveryPasswordsManager,
+        new AccountController(accountsManager, rateLimiters, phoneNumberRecoveryPasswordsManager,
             usernameHashZkProofVerifier),
         new AccountControllerV2(accountsManager, changeNumberManager),
         new AttachmentControllerV4(rateLimiters, gcsAttachmentGenerator, tusAttachmentGenerator,
             experimentEnrollmentManager, config.getAttachments().maxAttachmentUploadSizeInBytes()),
         new ArchiveController(accountsManager, backupAuthManager, backupManager, backupMetrics, config.getAttachments().maxAttachmentUploadSizeInBytes(), config.getAttachments().maxMessageBackupUploadSizeInBytes()),
         new CallRoutingControllerV2(rateLimiters, cloudflareTurnCredentialsManager),
-        new CallLinkController(rateLimiters, callingGenericZkSecretParams),
+        new CallLinkController(rateLimiters, callingGenericZkSecretParams, callingPreV101GenericZkSecretParams),
         new CallQualitySurveyController(callQualitySurveyManager),
-        new CertificateController(accountsManager, new CertificateGenerator(config.getDeliveryCertificate().certificate(),
-            config.getDeliveryCertificate().ecPrivateKey(), config.getDeliveryCertificate().expiresDays(), config.getDeliveryCertificate().embedSigner()),
-            zkAuthOperations, callingGenericZkSecretParams, clock),
+        new CertificateController(accountsManager, certificateGenerator, zkAuthOperations, callingGenericZkSecretParams, callingPreV101GenericZkSecretParams, clock),
         new ChallengeController(accountsManager, rateLimitChallengeManager, challengeConstraintChecker),
         new DeviceController(accountsManager, rateLimiters, persistentTimer),
         new DeviceCheckController(clock, accountsManager, backupAuthManager, appleDeviceCheckManager, rateLimiters,
-            config.getDeviceCheck().backupRedemptionLevel(),
             config.getDeviceCheck().backupRedemptionDuration()),
         new DirectoryV2Controller(directoryV2CredentialsGenerator),
         new DonationController(clock, zkReceiptOperations, redeemedReceiptsManager, accountsManager, config.getBadges(),
-            ReceiptCredentialPresentation::new),
-        new KeysController(rateLimiters, keysManager, accountsManager, zkSecretParams, Clock.systemUTC()),
+            ReceiptCredentialPresentation::new, donationPermitsManager, rateLimiters),
+        new KeysController(rateLimiters, keysManager, accountsManager, groupZkSecretParams, Clock.systemUTC()),
         new KeyTransparencyController(keyTransparencyServiceClient),
         new MessageController(rateLimiters, messageByteLimitCardinalityEstimator, messageSender, accountsManager,
-            phoneNumberIdentifiers, reportMessageManager, zkSecretParams, spamChecker, Clock.systemUTC()),
+            phoneNumberIdentifiers, reportMessageManager, groupZkSecretParams, spamChecker, Clock.systemUTC()),
         new PaymentsController(currencyManager, paymentsCredentialsGenerator),
-        new ProfileController(clock, rateLimiters, accountsManager, profilesManager, dynamicConfigurationManager,
-            profileBadgeConverter, config.getBadges(), profileCdnPolicyGenerator, profileCdnPolicySigner,
-            zkSecretParams, zkProfileOperations, batchIdentityCheckExecutor),
+        new ProfileController(clock, rateLimiters, accountsManager, profilesManager, asnInfoProviderSupplier,
+            dynamicConfigurationManager, profileBadgeConverter, config.getBadges(), profileCdnPolicyGenerator,
+            groupZkSecretParams, zkProfileOperations, batchIdentityCheckExecutor),
         new ProvisioningController(rateLimiters, provisioningManager),
         new RegistrationController(accountsManager, phoneVerificationTokenManager, registrationLockVerificationManager,
-            rateLimiters, registrationFraudChecker),
-        new RemoteConfigController(remoteConfigsManager, config.getRemoteConfigConfiguration().globalConfig()),
+            rateLimiters, registrationFraudChecker, ReceiptCredentialPresentation::new, zkReceiptOperations, clock, dynamicConfigurationManager),
+        new RemoteConfigController(remoteConfigsManager),
         new SecureStorageController(storageCredentialsGenerator),
         new SecureValueRecovery2Controller(svr2CredentialsGenerator, accountsManager),
-        new StickerController(rateLimiters, config.getCdnConfiguration().credentials().accessKeyId().value(),
-            config.getCdnConfiguration().credentials().secretAccessKey().value(), config.getCdnConfiguration().region(),
-            config.getCdnConfiguration().bucket()),
+        new StickerController(rateLimiters, stickerPolicyGenerator, Clock.systemUTC()),
         new VerificationController(registrationServiceClient, new VerificationSessionManager(verificationSessions),
-            pushNotificationManager, registrationCaptchaManager, registrationRecoveryPasswordsManager,
+            pushNotificationManager, registrationCaptchaManager, phoneNumberRecoveryPasswordsManager,
             phoneNumberIdentifiers, rateLimiters, accountsManager, carrierDataProvider, registrationFraudChecker,
-            dynamicConfigurationManager, experimentEnrollmentManager, clock)
+            dynamicConfigurationManager, clock),
+        new SubscriptionController(clock, config.getSubscription(), config.getOneTimeDonations(),
+            config.getLoginPurchase(), subscriptionManager, stripeManager, braintreeManager, googlePlayBillingManager,
+            appleAppStoreManager,
+            profileBadgeConverter, bankMandateTranslator, donationPermitsManager,
+            config.getBackupConfiguration().maxTotalMediaSize()),
+        new OneTimeDonationController(clock, config.getOneTimeDonations(), stripeManager, braintreeManager,
+            payPalDonationsTranslator, zkReceiptOperations, issuedReceiptsManager, oneTimeDonationsManager,
+            donationPermitsManager),
+        new LoginPurchaseController(loginPurchaseManager, dynamicConfigurationManager)
     );
-    if (config.getSubscription() != null && config.getOneTimeDonations() != null) {
-      SubscriptionManager subscriptionManager = new SubscriptionManager(subscriptions,
-          List.of(stripeManager, braintreeManager, googlePlayBillingManager, appleAppStoreManager),
-          zkReceiptOperations, issuedReceiptsManager);
-      commonControllers.add(new SubscriptionController(clock, config.getSubscription(), config.getOneTimeDonations(),
-          subscriptionManager, stripeManager, braintreeManager, googlePlayBillingManager, appleAppStoreManager,
-          profileBadgeConverter, bankMandateTranslator, dynamicConfigurationManager));
-      commonControllers.add(new OneTimeDonationController(clock, config.getOneTimeDonations(), stripeManager, braintreeManager,
-          payPalDonationsTranslator, zkReceiptOperations, issuedReceiptsManager, oneTimeDonationsManager));
-    }
 
     for (Object controller : commonControllers) {
       environment.jersey().register(controller);
@@ -1193,8 +1364,10 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         webSocketEnvironment.getRequestLog(), Duration.ofMillis(60000));
     provisioningEnvironment.setConnectListener(new ProvisioningConnectListener(provisioningManager, asnInfoProviderSupplier, clientReleaseManager, provisioningWebsocketTimeoutExecutor, Duration.ofSeconds(90)));
     provisioningEnvironment.jersey().register(new MetricsApplicationEventListener(TrafficSource.WEBSOCKET, clientReleaseManager));
-    provisioningEnvironment.jersey().register(new KeepAliveController(redisMessageAvailabilityManager));
+    provisioningEnvironment.jersey().register(new KeepAliveController());
     provisioningEnvironment.jersey().register(new TimestampResponseFilter());
+
+    WebSocketConnection.registerDroppedErrorHook();
 
     registerExceptionMappers(environment, webSocketEnvironment, provisioningEnvironment);
 
@@ -1241,24 +1414,37 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     List.of(
         new LoggingUnhandledExceptionMapper(),
         new CompletionExceptionMapper(),
-        new GrpcStatusRuntimeExceptionMapper(),
+        new CallNotPermittedExceptionMapper(),
         new IOExceptionMapper(),
         new RateLimitExceededExceptionMapper(),
         new InvalidWebsocketAddressExceptionMapper(),
         new DeviceLimitExceededExceptionMapper(),
         new ServerRejectedExceptionMapper(),
+        new IllegalStateExceptionMapper(),
         new ImpossiblePhoneNumberExceptionMapper(),
         new NonNormalizedPhoneNumberExceptionMapper(),
         new ObsoletePhoneNumberFormatExceptionMapper(),
         new RegistrationServiceSenderExceptionMapper(),
-        new SubscriptionExceptionMapper(),
+        new PurchaseExceptionMapper(),
         new BackupExceptionMapper(),
-        new JsonMappingExceptionMapper()
+        new JsonMappingExceptionMapper(),
+        new RegistrationLockFailureExceptionMapper(),
+        new MfaFailureExceptionMapper()
     ).forEach(exceptionMapper -> {
       environment.jersey().register(exceptionMapper);
       webSocketEnvironment.jersey().register(exceptionMapper);
       provisioningEnvironment.jersey().register(exceptionMapper);
     });
+  }
+
+  private static void verifyServiceAuth(final List<ServerServiceDefinition> services, final Auth expectedAuthType) {
+    for (final ServerServiceDefinition service : services) {
+      final Auth authType = ValidatorUtils.serviceAuthExtensionValue(service).orElse(Auth.AUTH_UNSPECIFIED);
+      if (!authType.equals(expectedAuthType)) {
+        throw new IllegalStateException("gRPC service %s is annotated with %s but was registered as %s"
+            .formatted(service.getServiceDescriptor().getName(), authType, expectedAuthType));
+      }
+    }
   }
 
   public static class ExecutorServiceBuilder extends io.dropwizard.lifecycle.setup.ExecutorServiceBuilder {
@@ -1297,7 +1483,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     }
   }
 
-  public static void main(String[] args) throws Exception {
+  static void main(String[] args) throws Exception {
     new WhisperServerService().run(args);
   }
 }

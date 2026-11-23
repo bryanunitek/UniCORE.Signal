@@ -16,6 +16,7 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 import org.signal.chat.backup.GetBackupAuthCredentialsRequest;
 import org.signal.chat.backup.GetBackupAuthCredentialsResponse;
+import org.signal.chat.backup.GetBackupIdLimitsResponse;
 import org.signal.chat.backup.RedeemReceiptRequest;
 import org.signal.chat.backup.RedeemReceiptResponse;
 import org.signal.chat.backup.SetBackupIdRequest;
@@ -72,7 +73,7 @@ public class BackupsGrpcService extends SimpleBackupsGrpc.BackupsImplBase {
     final Account account = authenticatedAccount();
     final Device device = account
         .getDevice(authenticatedDevice.deviceId())
-        .orElseThrow(Status.UNAUTHENTICATED::asRuntimeException);
+        .orElseThrow(() -> GrpcExceptions.invalidCredentials("invalid credentials"));
     backupAuthManager.commitBackupId(account, device, messagesCredentialRequest, mediaCredentialRequest);
     return SetBackupIdResponse.getDefaultInstance();
   }
@@ -139,6 +140,16 @@ public class BackupsGrpcService extends SimpleBackupsGrpc.BackupsImplBase {
   }
 
   @Override
+  public GetBackupIdLimitsResponse getBackupIdLimits(final Empty request) {
+    final Account account = authenticatedAccount();
+    final BackupAuthManager.BackupIdRotationLimit limit = backupAuthManager.checkBackupIdRotationLimit(account);
+    return GetBackupIdLimitsResponse.newBuilder()
+        .setHasPermitsRemaining(limit.hasPermitsRemaining())
+        .setRetryAfterSeconds(limit.nextPermitAvailable().getSeconds())
+        .build();
+  }
+
+  @Override
   public Throwable mapException(final Throwable throwable) {
     return switch (throwable) {
       case BackupInvalidArgumentException e -> GrpcExceptions.invalidArguments(e.getMessage());
@@ -151,7 +162,7 @@ public class BackupsGrpcService extends SimpleBackupsGrpc.BackupsImplBase {
   private Account authenticatedAccount() {
     return accountManager
         .getByAccountIdentifier(AuthenticationUtil.requireAuthenticatedDevice().accountIdentifier())
-        .orElseThrow(Status.UNAUTHENTICATED::asRuntimeException);
+        .orElseThrow(() -> GrpcExceptions.invalidCredentials("invalid credentials"));
   }
 
   private interface Deserializer<T> {

@@ -11,6 +11,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.google.protobuf.ByteString;
@@ -70,6 +71,7 @@ import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.metrics.BackupMetrics;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
 class BackupsAnonymousGrpcServiceTest extends
     SimpleBaseGrpcTest<BackupsAnonymousGrpcService, BackupsAnonymousGrpc.BackupsAnonymousBlockingStub> {
@@ -146,10 +148,11 @@ class BackupsAnonymousGrpcServiceTest extends
   @Test
   void putMediaBatchSuccess() {
     final byte[][] mediaIds = {TestRandomUtil.nextBytes(15), TestRandomUtil.nextBytes(15)};
-    when(backupManager.copyToBackup(any()))
-        .thenReturn(Flux.just(
+    when(backupManager.copyToBackup(any())).thenReturn(Flux.just(
             new CopyResult(CopyResult.Outcome.SUCCESS, mediaIds[0], 1),
-            new CopyResult(CopyResult.Outcome.SUCCESS, mediaIds[1], 1)));
+            new CopyResult(CopyResult.Outcome.SUCCESS, mediaIds[1], 1))
+        // helps catch any issues with streaming concurrency (especially context propagation)
+        .publishOn(Schedulers.parallel()));
 
     final CopyMediaRequest request = CopyMediaRequest.newBuilder()
         .setSignedPresentation(signedPresentation(presentation))
@@ -288,7 +291,7 @@ class BackupsAnonymousGrpcServiceTest extends
 
     final int limit = 17;
 
-    when(backupManager.list(any(), eq(expectedCursor), eq(limit)))
+    when(backupManager.list(any(), eq(expectedCursor), eq(Optional.of(limit))))
         .thenReturn(new BackupManager.ListMediaResult(
             List.of(new BackupManager.StorageDescriptorWithLength(1, mediaId, 100)),
             returnedCursor));
@@ -459,6 +462,21 @@ class BackupsAnonymousGrpcServiceTest extends
             .setSignedPresentation(signedPresentation(presentation))
             .setLimit(count)
             .build()));
+  }
+
+  @Test
+  void listMediaUnsetLimit() throws BackupException {
+    when(backupManager.list(any(), any(), eq(Optional.empty())))
+        .thenReturn(new BackupManager.ListMediaResult(List.of(), Optional.empty()));
+
+    // should be able to list without setting a limit
+    final ListMediaResponse response = unauthenticatedServiceStub().listMedia(
+        ListMediaRequest.newBuilder()
+            .setSignedPresentation(signedPresentation(presentation))
+            .build());
+
+    assertThat(response.hasListResult()).isTrue();
+    verify(backupManager).list(any(), any(), eq(Optional.empty()));
   }
 
 
